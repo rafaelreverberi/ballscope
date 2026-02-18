@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['ball']
+
+roboflow:
+  workspace: ballscope
+  project: football-ball-detection-rejhg-bsbvx
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/ballscope/football-ball-detection-rejhg-bsbvx/dataset/1
