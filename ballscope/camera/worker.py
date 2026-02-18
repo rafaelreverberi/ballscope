@@ -18,6 +18,13 @@ def _is_linux() -> bool:
         return False
 
 
+def _is_macos() -> bool:
+    try:
+        return os.name == "posix" and os.uname().sysname.lower() == "darwin"
+    except Exception:
+        return False
+
+
 def resolve_dev_path(src: str) -> Optional[str]:
     if not _is_linux():
         return None
@@ -204,16 +211,48 @@ class CameraWorker:
                     (self.state.last_error + " | " if self.state.last_error else "") + f"Ctrl warn: {msgc}"
                 )
 
-        backend = cv2.CAP_V4L2 if _is_linux() else 0
-        try:
-            cap = cv2.VideoCapture(int(src), backend) if src.isdigit() else cv2.VideoCapture(src, backend)
-        except Exception as exc:
-            self.state.last_error = f"Open error: {exc}"
-            return None
+        src_to_open = src
+        if not _is_linux() and src.startswith("/dev/video"):
+            idx = src.replace("/dev/video", "", 1)
+            if idx.isdigit():
+                src_to_open = idx
 
-        if cap is None or not cap.isOpened():
-            self.state.last_error = f"Could not open camera source: {src}"
+        if _is_linux():
+            backend = cv2.CAP_V4L2
+        elif _is_macos() and hasattr(cv2, "CAP_AVFOUNDATION"):
+            backend = cv2.CAP_AVFOUNDATION
+        else:
+            backend = 0
+        try_sources = [src_to_open]
+        if _is_macos() and src_to_open.isdigit() and src_to_open != "0":
+            try_sources.append("0")
+
+        cap = None
+        open_err = None
+        used_src = src_to_open
+        for candidate in try_sources:
+            try:
+                cur = cv2.VideoCapture(int(candidate), backend) if candidate.isdigit() else cv2.VideoCapture(candidate, backend)
+            except Exception as exc:
+                open_err = str(exc)
+                continue
+            if cur is not None and cur.isOpened():
+                cap = cur
+                used_src = candidate
+                break
+            try:
+                if cur is not None:
+                    cur.release()
+            except Exception:
+                pass
+
+        if cap is None:
+            if open_err:
+                self.state.last_error = f"Open error: {open_err}"
+            else:
+                self.state.last_error = f"Could not open camera source: {src_to_open}"
             return None
+        self.state.src = used_src
 
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, float(V4L2_BUFFER_SIZE))
@@ -262,7 +301,8 @@ class CameraWorker:
                 cap = self._open_capture()
                 if cap is None:
                     self.state.is_open = False
-                    time.sleep(0.25)
+                    # Avoid terminal spam on unavailable sources; keep retry loop responsive enough.
+                    time.sleep(1.0)
                     continue
                 with self._lock:
                     self._cap = cap

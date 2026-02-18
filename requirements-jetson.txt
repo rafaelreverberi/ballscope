@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Jetson uses NVIDIA-specific torch wheels and optional torchvision wheels.
+# Install them via setup.sh using TORCH_WHEEL_URL / TORCHVISION_WHEEL_URL.

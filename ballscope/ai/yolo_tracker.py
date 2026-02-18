@@ -14,6 +14,7 @@ except Exception:  # pragma: no cover
 from ultralytics import YOLO
 
 from ballscope.config import AiConfig
+from ballscope.runtime_device import resolve_torch_device
 
 BALL_CLASS_ID = 0
 
@@ -42,6 +43,7 @@ class AiWorker:
 
         self._model: Optional[YOLO] = None
         self._source_frame_fn = None
+        self._device = "cpu"
 
         self._center = None
         self._last_seen_ts: Optional[float] = None
@@ -92,9 +94,10 @@ class AiWorker:
         if self._model is not None:
             return
         self._model = YOLO(self.config.model_path)
-        if torch is not None and torch.cuda.is_available() and self.config.device:
+        self._device = resolve_torch_device(self.config.device, torch)
+        if self._device != "cpu":
             try:
-                self._model.to(self.config.device)
+                self._model.to(self._device)
             except Exception:
                 pass
         try:
@@ -139,7 +142,7 @@ class AiWorker:
                 imgsz=self.config.imgsz,
                 conf=conf,
                 iou=iou,
-                device=self.config.device,
+                device=self._device,
                 verbose=False,
             )
 

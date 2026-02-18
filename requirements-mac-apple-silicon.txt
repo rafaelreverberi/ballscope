@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# PyTorch stack for Apple Silicon (M1/M2/M3/M4) with MPS support.
+torch>=2.3,<3.0
+torchvision>=0.18,<1.0
+torchaudio>=2.3,<3.0

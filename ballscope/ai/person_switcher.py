@@ -14,6 +14,7 @@ except Exception:  # pragma: no cover
 from ultralytics import YOLO
 
 from ballscope.config import AiConfig
+from ballscope.runtime_device import resolve_torch_device
 
 
 @dataclass
@@ -123,16 +124,7 @@ class PersonSwitcherWorker:
             pass
 
     def _resolve_device(self) -> str:
-        dev = (self.config.device or "").strip().lower()
-        if dev in ("", "auto"):
-            if torch is not None and torch.cuda.is_available():
-                return "cuda"
-            return "cpu"
-        if dev.startswith("cuda") or dev.isdigit():
-            if torch is not None and torch.cuda.is_available():
-                return dev
-            raise RuntimeError("CUDA requested but not available. Install CUDA-enabled PyTorch or set BALLSCOPE_AI_DEVICE=cpu.")
-        return dev
+        return resolve_torch_device(self.config.device, torch)
 
     def _update_fps(self, now: float):
         self._frame_times.append(now)

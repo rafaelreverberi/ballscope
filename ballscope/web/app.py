@@ -28,6 +28,7 @@ from ballscope.config import (
 from ballscope.camera import CameraState, CameraSettings, CameraWorker, mjpeg_stream, camera_state_dict
 from ballscope.ai import PersonSwitcherWorker, ai_mjpeg_stream
 from ballscope.recording import GstPipeRecorder, GstDeviceRecorder, GstDualRecorder, GstAudioRecorder
+from ballscope.runtime_device import resolve_torch_device, runtime_device_options
 
 
 @asynccontextmanager
@@ -231,27 +232,20 @@ def _analysis_detect_runtime_devices() -> List[dict]:
     devices = [{"id": "auto", "label": "Auto"}]
     try:
         import torch  # type: ignore
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            for i in range(torch.cuda.device_count()):
-                name = torch.cuda.get_device_name(i)
-                devices.append({"id": f"cuda:{i}", "label": f"GPU {i} ({name})"})
-        devices.append({"id": "cpu", "label": "CPU"})
+        devices = runtime_device_options(torch)
         return devices
     except Exception:
-        devices.append({"id": "cpu", "label": "CPU"})
+        devices = [{"id": "auto", "label": "Auto"}, {"id": "cpu", "label": "CPU"}]
         return devices
 
 
 def _analysis_resolve_device(device_pref: str) -> str:
-    pref = (device_pref or "auto").strip().lower()
-    if pref and pref != "auto":
-        return pref
+    pref = (device_pref or "auto")
     try:
         import torch  # type: ignore
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            return "cuda:0"
+        return resolve_torch_device(pref, torch)
     except Exception:
-        pass
+        return "cpu"
     return "cpu"
 
 
@@ -424,7 +418,15 @@ def _analysis_process_video(session_id: str, video_path: str):
                 if roi.size == 0:
                     continue
 
-                predict_device = "0" if device_use == "cuda:0" else device_use
+                if device_use.startswith("cuda"):
+                    if device_use in ("cuda", "cuda:0"):
+                        predict_device = "0"
+                    elif device_use.startswith("cuda:") and device_use.split(":", 1)[1].isdigit():
+                        predict_device = device_use.split(":", 1)[1]
+                    else:
+                        predict_device = device_use
+                else:
+                    predict_device = device_use
                 use_half = device_use.startswith("cuda")
                 results = model(roi, conf=conf, iou=iou, verbose=False, device=predict_device, half=use_half)
                 if not results or not results[0].boxes:
@@ -1888,11 +1890,11 @@ RECORD_HTML = r"""
         <div class="row" style="margin-top: 10px;">
           <div>
             <label>Source (Device)</label>
-            <input id="camSource" type="text" placeholder="/dev/video0" />
+            <input id="camSource" type="text" placeholder="/dev/video0 or 0" />
           </div>
           <div>
             <label>Apply Source Change</label>
-            <div class="status" style="margin-top: 6px; color: var(--muted);">Tip: /dev/video0 or /dev/video4</div>
+            <div class="status" style="margin-top: 6px; color: var(--muted);">Tip: Jetson: /dev/video0, Mac: 0 or 1</div>
           </div>
         </div>
         <div class="row" style="margin-top: 10px;">

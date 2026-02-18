@@ -1,32 +1,53 @@
-BallScope Architecture (Jetson Orin Nano)
+# BallScope Architecture
 
-Goals
-- Low-latency dual-camera capture (RAW frames) with AI-driven camera selection.
-- YOLO person detection on downscaled frames, crop/zoom on full-resolution frames.
-- Single final stream for preview and recording (MJPG/frames).
-- Robust handling of disconnects and safe restart of capture pipelines.
+## Scope
+BallScope is designed to run the same application logic on:
+- Apple Silicon Mac (development and analysis)
+- NVIDIA Jetson (capture and deployment)
 
-Modules
-- camera/: CameraWorker handles V4L2 capture, low-latency buffering, and MJPEG preview. It exposes the latest BGR frame for AI and status metrics (fps, resolution, errors).
-- ai/: PersonSwitcherWorker runs YOLO inference on both camera frames (downscaled), selects the active camera, applies ROI smoothing and zoom on the original frame, and publishes a final MJPEG stream.
-- recording/: SimpleRecorder writes only the final output stream (MJPG AVI or JPG frame sequence).
-- web/: FastAPI app with REST endpoints for state, camera settings, recording control, and AI control. A single-page UI displays the final preview plus camera thumbnails and exposes configuration.
+## Goals
+- Low-latency dual-camera capture.
+- Reliable object detection on live streams.
+- Automatic camera selection based on detection confidence.
+- Stable zoom/crop output for preview and recording.
+- Safe recovery from camera disconnects and runtime failures.
 
-Data Flow
-1) CameraWorker threads grab frames from /dev/video* using V4L2.
-2) AI worker reads both frames, downsamples for YOLO, then selects the most relevant camera.
-3) Crop/zoom happens on the original frame from the chosen camera.
-4) Final output is streamed via MJPEG and optionally saved via MJPG AVI or JPG frames.
+## Core Modules
+- `ballscope/camera/`
+  - Camera workers for capture, buffering, and stream state.
+- `ballscope/ai/`
+  - Detection + switching logic (`PersonSwitcherWorker`, YOLO-driven scoring).
+- `ballscope/recording/`
+  - Processed output recording and raw stream recorders.
+- `ballscope/web/`
+  - FastAPI endpoints, frontend views, and analysis APIs.
+- `ballscope/runtime_device.py`
+  - Platform and accelerator resolution (`cuda`, `mps`, `cpu`).
 
-Recording Pipeline (MJPG / Frames)
-- MJPG: OpenCV VideoWriter, AVI container, CPU-friendly for Jetson Orin Nano (no NVENC).
-- Frames: individual JPGs for debug-friendly post-processing (ffmpeg assembly offline).
+## Data Flow
+1. Camera workers acquire frames from two camera sources.
+2. AI worker processes downscaled frames for detection.
+3. Worker scores detections and selects active camera.
+4. Crop/zoom is applied on full-resolution selected frame.
+5. Final frame is streamed (MJPEG) and optionally recorded.
 
-Error Handling
-- CameraWorker reopens the device safely if read fails or settings change.
-- Recording control is idempotent (start/stop returns status).
-- AI worker can be started/stopped without restarting the web server.
+## Runtime Compatibility Strategy
+BallScope keeps behavior aligned across Mac and Jetson by:
+- using one shared application codebase
+- applying platform-specific capture backends when needed
+- resolving compute device automatically via `BALLSCOPE_AI_DEVICE=auto`
 
-Configuration
-- Environment variables control camera devices, presets, AI model, and recording defaults.
-- Runtime configuration exposed via REST; changes take effect with safe reopen where needed.
+Auto device resolution:
+- Jetson: `cuda:0` when available
+- Apple Silicon: `mps` when available
+- fallback: `cpu`
+
+## Operational Reliability
+- Camera reopen on source or preset changes.
+- Graceful worker start/stop lifecycle in app lifespan.
+- Recording start/stop endpoints are idempotent.
+- Setup and environment diagnostics are logged by installer.
+
+## Project Context
+- School project (Grade 9 upper secondary, Wasseramt Ost)
+- Authors: Rafael Reverberi, Benjamin Flury
