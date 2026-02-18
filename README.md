@@ -137,6 +137,7 @@ In the UI (Camera Tuning), you can change source values at runtime.
 - If setup fails, inspect the latest installer log in `logs/`.
 - If a camera cannot be opened on Mac, use numeric sources (`0`, `1`) instead of `/dev/videoX`.
 - If Jetson reports no CUDA, verify your Torch wheel matches your JetPack/L4T version.
+- In the analysis page, enable `Speed Up` for faster processing (reduced preview overhead, lower inference size, and detection every N frames).
 
 ## License
 MIT License (`LICENSE`)

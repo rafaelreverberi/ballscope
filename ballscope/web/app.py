@@ -87,6 +87,7 @@ ANALYSIS_DEFAULT_MODEL = "models/football-ball-detection.pt"
 ANALYSIS_TARGET_FPS = 30
 ANALYSIS_ENCODE_CRF = 14
 ANALYSIS_ENCODE_PRESET = "slow"
+ANALYSIS_ENCODE_PRESET_SPEED_UP = "medium"
 
 
 def _analysis_load_model(model_path: str):
@@ -298,6 +299,11 @@ def _analysis_process_video(session_id: str, video_path: str):
     conf = float(session.get("conf", 0.32))
     iou = float(session.get("iou", 0.35))
     zoom = float(session.get("zoom", 1.6))
+    speed_up = bool(session.get("speed_up", False))
+    # Keep normal mode unchanged; fast mode trades some temporal density for throughput.
+    detect_every = max(1, int(session.get("detect_every", 2 if speed_up else 1)))
+    infer_imgsz = max(224, min(1280, int(session.get("imgsz", 384 if speed_up else 640))))
+    preview_stride = max(1, int(session.get("preview_stride", 2 if speed_up else 1)))
     allow_switch = bool(session.get("allow_switch", False))
     device_pref = str(session.get("device", "auto"))
     device_use = _analysis_resolve_device(device_pref)
@@ -365,6 +371,12 @@ def _analysis_process_video(session_id: str, video_path: str):
     segment_frames = max(120, int(src_fps * 8))
     segment_frame_count = 0
     segment_index = 0
+    frame_idx = 0
+    stream_best_cache: Dict[int, tuple] = {}
+    stream_last_seen_ts: Dict[int, float] = {}
+    fast_cache_hold_sec = 0.35
+    fast_track_hold_sec = 0.9
+    fast_search_expand = 2.6
     segment_dir = os.path.join(ANALYSIS_RESULT_DIR, f"analysis_{session_id}_parts")
     os.makedirs(segment_dir, exist_ok=True)
     stitched_avi = os.path.join(segment_dir, f"{session_id}_stitched.avi")
@@ -380,12 +392,57 @@ def _analysis_process_video(session_id: str, video_path: str):
         ANALYSIS_SESSIONS[session_id]["progress_pct"] = 0.0
         ANALYSIS_SESSIONS[session_id]["eta_sec"] = None
         ANALYSIS_SESSIONS[session_id]["stream_count"] = len(caps)
+        ANALYSIS_SESSIONS[session_id]["speed_up"] = speed_up
+        ANALYSIS_SESSIONS[session_id]["detect_every"] = detect_every
+        ANALYSIS_SESSIONS[session_id]["imgsz"] = infer_imgsz
         ANALYSIS_SESSIONS[session_id]["output_path"] = None
         ANALYSIS_SESSIONS[session_id]["recovery_dir"] = segment_dir
+
+    def _detect_best_box(roi_img, off_x: int, off_y: int, imgsz_local: int):
+        if roi_img is None or roi_img.size == 0:
+            return None
+        results = model(
+            roi_img,
+            imgsz=imgsz_local,
+            conf=conf,
+            iou=iou,
+            verbose=False,
+            device=predict_device,
+            half=use_half,
+        )
+        best = None
+        if results and results[0].boxes:
+            for box in results[0].boxes:
+                if class_id is not None and int(box.cls[0]) != int(class_id):
+                    continue
+                score = float(box.conf[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                gx1 = off_x + x1
+                gy1 = off_y + y1
+                gx2 = off_x + x2
+                gy2 = off_y + y2
+                gcx = (gx1 + gx2) // 2
+                gcy = (gy1 + gy2) // 2
+                cand = (score, gx1, gy1, gx2, gy2, gcx, gcy)
+                if best is None or score > best[0]:
+                    best = cand
+        return best
+
+    if device_use.startswith("cuda"):
+        if device_use in ("cuda", "cuda:0"):
+            predict_device = "0"
+        elif device_use.startswith("cuda:") and device_use.split(":", 1)[1].isdigit():
+            predict_device = device_use.split(":", 1)[1]
+        else:
+            predict_device = device_use
+    else:
+        predict_device = device_use
+    use_half = device_use.startswith("cuda")
 
     try:
         while True:
             t0 = time.time()
+            frame_idx += 1
             frames = []
             any_open = False
             for cap in caps:
@@ -402,6 +459,7 @@ def _analysis_process_video(session_id: str, video_path: str):
             last_conf = 0.0
             stream_best = {}  # idx -> (score, x1, y1, x2, y2, cx, cy)
 
+            now_ts = time.time()
             for idx, frame in enumerate(frames):
                 if frame is None:
                     continue
@@ -418,33 +476,44 @@ def _analysis_process_video(session_id: str, video_path: str):
                 if roi.size == 0:
                     continue
 
-                if device_use.startswith("cuda"):
-                    if device_use in ("cuda", "cuda:0"):
-                        predict_device = "0"
-                    elif device_use.startswith("cuda:") and device_use.split(":", 1)[1].isdigit():
-                        predict_device = device_use.split(":", 1)[1]
-                    else:
-                        predict_device = device_use
+                do_full_scan = (frame_idx % detect_every) == 0
+                best_for_stream = None
+
+                if speed_up:
+                    # Smart fast-tracking: first search around last known ball area, then periodic full scan.
+                    cached = stream_best_cache.get(idx)
+                    cached_ts = stream_last_seen_ts.get(idx, 0.0)
+                    if cached is not None and (now_ts - cached_ts) <= fast_track_hold_sec:
+                        _, bx1, by1, bx2, by2, bcx, bcy = cached
+                        bw = max(8, bx2 - bx1)
+                        bh = max(8, by2 - by1)
+                        sw = max(120, int(bw * fast_search_expand))
+                        sh = max(120, int(bh * fast_search_expand))
+                        sx1 = _analysis_clamp(int(bcx - sw // 2), rx, rx + rw - 2)
+                        sy1 = _analysis_clamp(int(bcy - sh // 2), ry, ry + rh - 2)
+                        sx2 = _analysis_clamp(sx1 + sw, sx1 + 1, rx + rw)
+                        sy2 = _analysis_clamp(sy1 + sh, sy1 + 1, ry + rh)
+                        search_roi = frame[sy1:sy2, sx1:sx2]
+                        best_for_stream = _detect_best_box(search_roi, sx1, sy1, max(256, infer_imgsz - 64))
+
+                    if best_for_stream is None and do_full_scan:
+                        best_for_stream = _detect_best_box(roi, rx, ry, infer_imgsz)
                 else:
-                    predict_device = device_use
-                use_half = device_use.startswith("cuda")
-                results = model(roi, conf=conf, iou=iou, verbose=False, device=predict_device, half=use_half)
-                if not results or not results[0].boxes:
-                    continue
-                for box in results[0].boxes:
-                    if class_id is not None and int(box.cls[0]) != int(class_id):
-                        continue
-                    score = float(box.conf[0])
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    gx1 = rx + x1
-                    gy1 = ry + y1
-                    gx2 = rx + x2
-                    gy2 = ry + y2
-                    gcx = (gx1 + gx2) // 2
-                    gcy = (gy1 + gy2) // 2
-                    cur = stream_best.get(idx)
-                    if cur is None or score > cur[0]:
-                        stream_best[idx] = (score, gx1, gy1, gx2, gy2, gcx, gcy)
+                    best_for_stream = _detect_best_box(roi, rx, ry, infer_imgsz)
+
+                if best_for_stream is not None:
+                    stream_best_cache[idx] = best_for_stream
+                    stream_last_seen_ts[idx] = now_ts
+                    stream_best[idx] = best_for_stream
+                else:
+                    # Short grace reuse only; prevents stale lock-on while still smoothing misses.
+                    cached = stream_best_cache.get(idx)
+                    cached_ts = stream_last_seen_ts.get(idx, 0.0)
+                    if cached is not None and (now_ts - cached_ts) <= fast_cache_hold_sec:
+                        stream_best[idx] = cached
+                    else:
+                        stream_best_cache.pop(idx, None)
+                        stream_last_seen_ts.pop(idx, None)
 
             chosen = None
             if stream_best:
@@ -510,7 +579,6 @@ def _analysis_process_video(session_id: str, video_path: str):
             if source_frame is None:
                 continue
 
-            vis = source_frame.copy()
             fh, fw = source_frame.shape[:2]
             rx = int(float(crop.get("x", 0.0)) * fw)
             ry = int(float(crop.get("y", 0.0)) * fh)
@@ -520,19 +588,21 @@ def _analysis_process_video(session_id: str, video_path: str):
             ry = _analysis_clamp(ry, 0, fh - 1)
             rw = _analysis_clamp(rw, 1, fw - rx)
             rh = _analysis_clamp(rh, 1, fh - ry)
-            cv2.rectangle(vis, (rx, ry), (rx + rw, ry + rh), (255, 190, 40), 1)
-
-            if chosen is not None:
-                x1, y1, x2, y2 = chosen[1], chosen[2], chosen[3], chosen[4]
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 220, 0), 2)
-                cv2.putText(vis, f"BALL {last_conf:.2f}", (x1, max(16, y1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 2)
-            elif last_seen_ts and (time.time() - last_seen_ts) <= lost_hold_sec:
-                cv2.putText(vis, "BALL remembered", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-            else:
-                cv2.putText(vis, "BALL lost", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            cv2.putText(vis, f"Stream {focus_stream + 1}/{len(caps)}", (12, fh - 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 2)
+            vis = None
+            if not speed_up:
+                vis = source_frame.copy()
+                cv2.rectangle(vis, (rx, ry), (rx + rw, ry + rh), (255, 190, 40), 1)
+                if chosen is not None:
+                    x1, y1, x2, y2 = chosen[1], chosen[2], chosen[3], chosen[4]
+                    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 220, 0), 2)
+                    cv2.putText(vis, f"BALL {last_conf:.2f}", (x1, max(16, y1 - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 2)
+                elif last_seen_ts and (time.time() - last_seen_ts) <= lost_hold_sec:
+                    cv2.putText(vis, "BALL remembered", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                else:
+                    cv2.putText(vis, "BALL lost", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(vis, f"Stream {focus_stream + 1}/{len(caps)}", (12, fh - 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 2)
 
             if out_size is None:
                 out_size = (fw, fh)
@@ -548,19 +618,27 @@ def _analysis_process_video(session_id: str, video_path: str):
             crop_frame = source_frame[top:top + win_h, left:left + win_w]
             if crop_frame.size == 0:
                 crop_frame = source_frame
-            interp = cv2.INTER_LANCZOS4 if zoom_use > 1.0 else cv2.INTER_AREA
+            if speed_up:
+                interp = cv2.INTER_LINEAR
+            else:
+                interp = cv2.INTER_LANCZOS4 if zoom_use > 1.0 else cv2.INTER_AREA
             render = cv2.resize(crop_frame, (out_w, out_h), interpolation=interp)
-            # Mild unsharp mask to reduce softness from digital zoom upscaling.
-            blur = cv2.GaussianBlur(render, (0, 0), 1.0)
-            render = cv2.addWeighted(render, 1.18, blur, -0.18, 0)
+            if not speed_up:
+                # Mild unsharp mask to reduce softness from digital zoom upscaling.
+                blur = cv2.GaussianBlur(render, (0, 0), 1.0)
+                render = cv2.addWeighted(render, 1.18, blur, -0.18, 0)
 
-            # Preview mirrors final zoom framing but keeps debug overlays.
-            vis_zoom_src = vis[top:top + win_h, left:left + win_w]
-            if vis_zoom_src.size == 0:
-                vis_zoom_src = vis
-            preview_frame = cv2.resize(vis_zoom_src, (out_w, out_h), interpolation=interp)
-            cv2.putText(preview_frame, "Preview: final zoom + tracking overlay", (12, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 220, 255), 2)
+            if speed_up:
+                # Fast path: publish final render directly as preview (skip expensive debug-overlay rendering).
+                preview_frame = render
+            else:
+                # Preview mirrors final zoom framing but keeps debug overlays.
+                vis_zoom_src = vis[top:top + win_h, left:left + win_w]
+                if vis_zoom_src.size == 0:
+                    vis_zoom_src = vis
+                preview_frame = cv2.resize(vis_zoom_src, (out_w, out_h), interpolation=interp)
+                cv2.putText(preview_frame, "Preview: final zoom + tracking overlay", (12, 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 220, 255), 2)
 
             if writer is None:
                 segment_path = os.path.join(segment_dir, f"part_{segment_index:04d}.avi")
@@ -601,7 +679,8 @@ def _analysis_process_video(session_id: str, video_path: str):
                     pct = min(100.0, (done / float(total_frames)) * 100.0)
                     sess["progress_pct"] = pct
                     sess["eta_sec"] = ((float(total_frames) - done) / fps_proc) if fps_proc > 0 and done < total_frames else 0.0
-                sess["frame"] = preview_frame
+                if (frame_idx % preview_stride) == 0 or sess.get("frame") is None:
+                    sess["frame"] = preview_frame
 
             # Offline analysis: run at full speed, no realtime pacing delay.
     except Exception as exc:
@@ -617,6 +696,7 @@ def _analysis_process_video(session_id: str, video_path: str):
             writer.release()
         stitched_ok = _analysis_concat_segments(segment_paths, stitched_avi)
         if stitched_ok and shutil.which("ffmpeg"):
+            encode_preset = ANALYSIS_ENCODE_PRESET_SPEED_UP if speed_up else ANALYSIS_ENCODE_PRESET
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -631,7 +711,7 @@ def _analysis_process_video(session_id: str, video_path: str):
                 "-c:v",
                 "libx264",
                 "-preset",
-                ANALYSIS_ENCODE_PRESET,
+                encode_preset,
                 "-crf",
                 str(ANALYSIS_ENCODE_CRF),
                 "-pix_fmt",
@@ -1321,7 +1401,13 @@ ANALYSIS_HTML = r"""
             <label>Zoom Output</label>
             <input id="zoom" type="number" value="1.6" step="0.1" min="1.0" max="4.0"/>
           </div>
-          <div></div>
+          <div>
+            <label>Speed Up</label>
+            <select id="speedUp">
+              <option value="false">Off (best quality preview)</option>
+              <option value="true">On (faster analysis)</option>
+            </select>
+          </div>
         </div>
         <label>Crop X/Y/W/H (0.0 - 1.0, relativ zum Frame)</label>
         <div class="row">
@@ -1443,7 +1529,11 @@ ANALYSIS_HTML = r"""
         $("stSeg").textContent = `segments:${(j.segments_saved || 0).toFixed(0)}`;
         $("stConf").textContent = `conf:${(j.last_conf || 0).toFixed(2)}`;
         $("stSeen").textContent = `last seen:${j.last_seen_sec == null ? "-" : j.last_seen_sec.toFixed(2) + "s"}`;
-        if (j.running) $("line").textContent = `Analyse läuft ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 1} Stream(s), ${j.device_used || "auto"})`;
+        if (j.running) {
+          const speedTxt = j.speed_up ? "speed-up:on" : "speed-up:off";
+          const tuneTxt = `imgsz:${j.imgsz || "-"}, detectEvery:${j.detect_every || "-"}`;
+          $("line").textContent = `Analyse läuft ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 1} Stream(s), ${j.device_used || "auto"}, ${speedTxt}, ${tuneTxt})`;
+        }
         if (j.output_url && j.state === "done") {
           $("resultLink").href = j.output_url;
           $("resultLink").style.display = "inline-block";
@@ -1465,6 +1555,7 @@ ANALYSIS_HTML = r"""
         model_path: $("modelPath").value,
         device: $("deviceSel").value,
         zoom: $("zoom").value,
+        speed_up: $("speedUp").value,
         crop_x: $("cropX").value,
         crop_y: $("cropY").value,
         crop_w: $("cropW").value,
@@ -2243,6 +2334,7 @@ async def analysis_upload(
     model_path: str = ANALYSIS_DEFAULT_MODEL,
     device: str = "auto",
     zoom: float = 1.6,
+    speed_up: bool = False,
     crop_x: float = 0.0,
     crop_y: float = 0.0,
     crop_w: float = 1.0,
@@ -2311,6 +2403,7 @@ async def analysis_upload(
             "iou": max(0.01, min(1.0, float(iou))),
             "device": device,
             "zoom": max(1.0, min(4.0, float(zoom))),
+            "speed_up": bool(speed_up),
             "crop": crop,
             "running": False,
             "state": "queued",
@@ -2331,7 +2424,10 @@ async def analysis_upload(
 
     thread = threading.Thread(target=_analysis_process_video, args=(session_id, target_path), daemon=True)
     thread.start()
-    print(f"[analysis] job started sid={session_id} model={model_path} class_id={class_id} device={device} zoom={zoom}")
+    print(
+        f"[analysis] job started sid={session_id} model={model_path} class_id={class_id} "
+        f"device={device} zoom={zoom} speed_up={bool(speed_up)}"
+    )
     return {"ok": True, "session_id": session_id}
 
 
@@ -2354,6 +2450,9 @@ def analysis_status(session_id: str):
             "input_fps": sess.get("input_fps", 0.0),
             "stream_count": sess.get("stream_count", 0),
             "device_used": sess.get("device_used"),
+            "speed_up": bool(sess.get("speed_up", False)),
+            "detect_every": sess.get("detect_every"),
+            "imgsz": sess.get("imgsz"),
             "segments_saved": sess.get("segments_saved", 0),
             "last_conf": sess.get("last_conf", 0.0),
             "last_seen_sec": sess.get("last_seen_sec"),
