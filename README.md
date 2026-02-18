@@ -67,7 +67,7 @@ Open:
 
 ## Quick Start
 ```bash
-git clone <repo-url> && cd ballscope
+git clone https://github.com/rafaelreverberi/ballscope && cd ballscope
 git lfs install && git lfs pull
 ./setup.sh
 source .venv/bin/activate
