@@ -33,6 +33,7 @@ fi
 
 TOTAL_STEPS=7
 CURRENT_STEP=0
+AUTOSTART_RESULT="skipped"
 
 section() { printf "\n${C_BOLD}${C_BLUE}==> %s${C_RESET}\n" "$*"; }
 info() { printf "[INFO] %s\n" "$*"; }
@@ -348,18 +349,57 @@ configure_optional_autostart() {
   info "Selected autostart action: ${action}"
   if [[ "${action}" != "enable" ]]; then
     info "Autostart setup skipped."
+    AUTOSTART_RESULT="skipped"
     return 0
   fi
 
   if [[ "${PLATFORM}" == "jetson" ]]; then
-    install_autostart_linux || true
+    if install_autostart_linux; then
+      AUTOSTART_RESULT="enabled"
+    else
+      AUTOSTART_RESULT="failed"
+    fi
     return 0
   fi
   if [[ "${PLATFORM}" == "mac_apple_silicon" ]]; then
-    install_autostart_macos || true
+    if install_autostart_macos; then
+      AUTOSTART_RESULT="enabled"
+    else
+      AUTOSTART_RESULT="failed"
+    fi
     return 0
   fi
+  AUTOSTART_RESULT="unsupported"
   warn "Autostart is not supported on this platform."
+}
+
+print_final_summary() {
+  section "Summary"
+  local model_count wheel_count
+  model_count="$(count_top_level_matches "${ROOT_DIR}/models" '*.pt')"
+  wheel_count="$(count_top_level_matches "${ROOT_DIR}/wheels" '*.whl')"
+
+  info "Platform: ${PLATFORM}"
+  info "Venv: ${VENV_DIR}"
+  info "Python: $(python --version 2>&1)"
+  info "Models in ${ROOT_DIR}/models: ${model_count}"
+  info "Wheels in ${ROOT_DIR}/wheels: ${wheel_count}"
+  info "Autostart setup result: ${AUTOSTART_RESULT}"
+
+  section "Proof / Checks"
+  if [[ "${PLATFORM}" == "jetson" ]] && command -v systemctl >/dev/null 2>&1; then
+    info "Run these checks on Jetson:"
+    printf "  systemctl is-enabled ballscope.service\n"
+    printf "  systemctl is-active ballscope.service\n"
+    printf "  systemctl status ballscope.service --no-pager\n"
+  elif [[ "${PLATFORM}" == "mac_apple_silicon" ]]; then
+    local check_user check_uid
+    check_user="${SUDO_USER:-$(id -un)}"
+    check_uid="$(id -u "${check_user}" 2>/dev/null || true)"
+    info "Run these checks on macOS:"
+    printf "  launchctl print gui/%s/com.ballscope.start\n" "${check_uid:-<uid>}"
+    printf "  ls -l ~/Library/LaunchAgents/com.ballscope.start.plist\n"
+  fi
 }
 
 ensure_hf_folder_files() {
@@ -720,4 +760,5 @@ printf "  source .venv/bin/activate\n"
 printf "  python main.py\n"
 printf "\nOr use the one-liner from project root:\n"
 printf "  ./start.sh\n"
+print_final_summary
 info "Full log: ${LOG_FILE}"
