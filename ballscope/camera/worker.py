@@ -51,6 +51,31 @@ def normalize_linux_source(src: str) -> Optional[str]:
     return None
 
 
+_NO_CAMERA_NOTICE_LOCK = threading.Lock()
+_NO_CAMERA_NOTICE_SHOWN = False
+
+
+def log_no_camera_notice_once() -> None:
+    global _NO_CAMERA_NOTICE_SHOWN
+    with _NO_CAMERA_NOTICE_LOCK:
+        if _NO_CAMERA_NOTICE_SHOWN:
+            return
+        _NO_CAMERA_NOTICE_SHOWN = True
+    print("[WARN] No camera detected. Please connect a camera (Linux: /dev/videoX, macOS: 0/1).")
+
+
+def list_linux_video_devices() -> list[str]:
+    if not _is_linux():
+        return []
+    try:
+        entries = os.listdir("/dev")
+    except Exception:
+        return []
+    devices = [f"/dev/{name}" for name in entries if re.fullmatch(r"video\d+", name)]
+    devices.sort()
+    return devices
+
+
 def run_v4l2(args: list[str]) -> Tuple[bool, str]:
     try:
         p = subprocess.run(
@@ -214,6 +239,12 @@ class CameraWorker:
         w, h, fps = preset["w"], preset["h"], preset["fps"]
 
         if _is_linux():
+            video_devices = list_linux_video_devices()
+            if not video_devices:
+                self.state.last_error = "No Linux camera device found. Please connect a camera."
+                log_no_camera_notice_once()
+                return None
+
             normalized = normalize_linux_source(src)
             if normalized is None:
                 self.state.last_error = (
@@ -225,6 +256,10 @@ class CameraWorker:
                 src = normalized
 
         dev = resolve_dev_path(src)
+        if dev is not None and _is_linux() and not os.path.exists(dev):
+            self.state.last_error = f"Camera source not present: {dev}. Please connect a camera."
+            log_no_camera_notice_once()
+            return None
         if dev is not None:
             ok, msg = driver_set_format(dev, w, h, fps, PREFERRED_PIXFMT)
             if not ok:
