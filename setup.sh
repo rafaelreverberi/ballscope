@@ -143,15 +143,21 @@ choose_existing_install_action() {
   fi
 
   printf "\n"
-  printf "Existing setup artifacts were detected.\n"
+  printf "${C_BOLD}Action required:${C_RESET} Existing setup artifacts were detected.\n"
   printf "Choose how to continue:\n"
-  printf "  [1] Continue with current setup files (default-safe)\n"
+  printf "  [1] Continue with current setup files (default)\n"
+  printf "      Use this if you only want to update/check setup.\n"
   printf "  [2] Reinstall clean (delete setup artifacts and rebuild)\n"
+  printf "      Deletes: .venv, models/*.pt, wheels/*.whl\n"
   printf "  [3] Abort now\n"
-  printf "Enter 1/2/3: "
+  printf "      Exit without changing anything.\n"
+  printf "Input now: 1 / 2 / 3 (default 1): "
 
   local choice
   read -r choice
+  if [[ -z "${choice}" ]]; then
+    choice="1"
+  fi
   case "${choice}" in
     1) echo "continue" ;;
     2) echo "reinstall" ;;
@@ -289,15 +295,21 @@ choose_jetson_torch_mode() {
   fi
 
   printf "\n"
-  printf "Jetson needs CUDA-enabled PyTorch before other Python dependencies.\n"
+  printf "${C_BOLD}Action required:${C_RESET} Jetson needs CUDA-enabled PyTorch before other Python dependencies.\n"
   printf "Choose setup mode:\n"
-  printf "  [1] I will install PyTorch manually in .venv (setup exits after venv)\n"
+  printf "  [1] I will install PyTorch manually in .venv\n"
+  printf "      Setup exits after venv creation/activation instructions.\n"
   printf "  [2] Download and install PyTorch wheels from Hugging Face (recommended)\n"
-  printf "  [3] PyTorch is already installed in .venv (verify CUDA and continue)\n"
-  printf "Enter 1/2/3: "
+  printf "      Wheels are downloaded to wheels/ and installed automatically.\n"
+  printf "  [3] PyTorch is already installed in .venv\n"
+  printf "      Setup verifies CUDA and then continues.\n"
+  printf "Input now: 1 / 2 / 3 (default 2): "
 
   local choice
   read -r choice
+  if [[ -z "${choice}" ]]; then
+    choice="2"
+  fi
   case "${choice}" in
     1) echo "manual" ;;
     2) echo "hf" ;;
