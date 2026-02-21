@@ -10,6 +10,11 @@ LOG_FILE="${LOG_DIR}/setup_$(date +%Y%m%d_%H%M%S).log"
 touch "${LOG_FILE}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
+HF_MODELS_REPO="RafaelReverberi/ballscope-assets"
+HF_MODELS_FOLDER="models"
+HF_JETSON_WHEELS_REPO="RafaelReverberi/ballscope-jetson-wheels"
+HF_JETSON_WHEELS_FOLDER="wheels"
+
 if [[ -t 1 ]]; then
   C_RESET="\033[0m"
   C_BOLD="\033[1m"
@@ -26,11 +31,26 @@ else
   C_RED=""
 fi
 
+TOTAL_STEPS=7
+CURRENT_STEP=0
+
 section() { printf "\n${C_BOLD}${C_BLUE}==> %s${C_RESET}\n" "$*"; }
 info() { printf "[INFO] %s\n" "$*"; }
 ok() { printf "${C_GREEN}[OK]${C_RESET} %s\n" "$*"; }
 warn() { printf "${C_YELLOW}[WARN]${C_RESET} %s\n" "$*"; }
 fail() { printf "${C_RED}[ERROR]${C_RESET} %s\n" "$*" >&2; exit 1; }
+
+step_section() {
+  local title="$1"
+  CURRENT_STEP=$((CURRENT_STEP + 1))
+  local pct=$((CURRENT_STEP * 100 / TOTAL_STEPS))
+  local filled=$((pct / 5))
+  local empty=$((20 - filled))
+  local fill_bar empty_bar
+  fill_bar="$(printf '%*s' "${filled}" '' | tr ' ' '#')"
+  empty_bar="$(printf '%*s' "${empty}" '' | tr ' ' '-')"
+  section "[${CURRENT_STEP}/${TOTAL_STEPS}] ${title} [${fill_bar}${empty_bar}] ${pct}%"
+}
 
 on_error() {
   local exit_code=$?
@@ -93,24 +113,225 @@ describe_host() {
   printf "unsupported host\n"
 }
 
-show_jetson_wheel_help_and_exit() {
-  warn "Jetson detected, but no CUDA-enabled Torch wheel is configured."
-  warn "Torch wheels are NOT bundled in this repository."
-  printf "\nPlaceholders for now (implement auto-download later):\n"
-  printf "  1) Copy %s/jetson_torch_wheels.example.env to %s/jetson_torch_wheels.env\n" "${ROOT_DIR}" "${ROOT_DIR}"
-  printf "  2) Fill in TORCH_WHEEL_URL (and optional TORCHVISION_WHEEL_URL)\n"
-  printf "  3) Run ./setup.sh again\n\n"
-  exit 2
+count_top_level_matches() {
+  local dir="$1"
+  local pattern="$2"
+  if [[ ! -d "${dir}" ]]; then
+    echo "0"
+    return
+  fi
+  find "${dir}" -maxdepth 1 -type f -name "${pattern}" | wc -l | tr -d ' '
 }
 
-section "BallScope Installer"
+choose_existing_install_action() {
+  if [[ -n "${BALLSCOPE_EXISTING_INSTALL_ACTION:-}" ]]; then
+    case "${BALLSCOPE_EXISTING_INSTALL_ACTION}" in
+      continue|reinstall|abort)
+        echo "${BALLSCOPE_EXISTING_INSTALL_ACTION}"
+        return 0
+        ;;
+      *)
+        fail "Invalid BALLSCOPE_EXISTING_INSTALL_ACTION='${BALLSCOPE_EXISTING_INSTALL_ACTION}'. Use: continue | reinstall | abort"
+        ;;
+    esac
+  fi
+
+  if [[ ! -t 0 ]]; then
+    warn "Non-interactive shell detected. Existing install action defaults to: continue"
+    echo "continue"
+    return 0
+  fi
+
+  printf "\n"
+  printf "Existing setup artifacts were detected.\n"
+  printf "Choose how to continue:\n"
+  printf "  [1] Continue with current setup files (default-safe)\n"
+  printf "  [2] Reinstall clean (delete setup artifacts and rebuild)\n"
+  printf "  [3] Abort now\n"
+  printf "Enter 1/2/3: "
+
+  local choice
+  read -r choice
+  case "${choice}" in
+    1) echo "continue" ;;
+    2) echo "reinstall" ;;
+    3) echo "abort" ;;
+    *) fail "Invalid choice '${choice}'. Please run ./setup.sh again and enter 1, 2, or 3." ;;
+  esac
+}
+
+cleanup_setup_artifacts() {
+  warn "Reinstall selected. Removing setup artifacts now..."
+  rm -rf "${VENV_DIR}"
+  find "${ROOT_DIR}/models" -maxdepth 1 -type f -name '*.pt' -delete 2>/dev/null || true
+  find "${ROOT_DIR}/wheels" -maxdepth 1 -type f -name '*.whl' -delete 2>/dev/null || true
+  ok "Clean reinstall state prepared (.venv removed, models/*.pt and wheels/*.whl removed)"
+}
+
+ensure_hf_folder_files() {
+  local repo_id="$1"
+  local remote_folder="$2"
+  local suffix="$3"
+  local dest_dir="$4"
+  local label="$5"
+
+  mkdir -p "${dest_dir}"
+
+  python - "$repo_id" "$remote_folder" "$suffix" "$dest_dir" "$label" <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+repo_id, remote_folder, suffix, dest_dir, label = sys.argv[1:6]
+api_url = f"https://huggingface.co/api/models/{repo_id}/tree/main/{remote_folder}?recursive=1"
+
+try:
+    with urllib.request.urlopen(api_url) as response:
+        entries = json.load(response)
+except urllib.error.URLError as exc:
+    print(f"[ERROR] Failed to query Hugging Face API: {exc}", file=sys.stderr)
+    sys.exit(2)
+
+files = [
+    entry["path"]
+    for entry in entries
+    if entry.get("type") == "file" and entry.get("path", "").endswith(suffix)
+]
+
+if not files:
+    print(f"[ERROR] No '{suffix}' files found in {repo_id}/{remote_folder}", file=sys.stderr)
+    sys.exit(3)
+
+files.sort()
+print(f"[INFO] {label}: found {len(files)} file(s) in {repo_id}/{remote_folder}")
+
+for index, rel_path in enumerate(files, start=1):
+    filename = os.path.basename(rel_path)
+    out_path = os.path.join(dest_dir, filename)
+    encoded_path = urllib.parse.quote(rel_path, safe='/')
+    file_url = f"https://huggingface.co/{repo_id}/resolve/main/{encoded_path}?download=true"
+
+    try:
+      with urllib.request.urlopen(file_url) as response:
+          total = int(response.headers.get("Content-Length", "0"))
+          done = 0
+          with open(out_path, "wb") as fh:
+              while True:
+                  chunk = response.read(1024 * 1024)
+                  if not chunk:
+                      break
+                  fh.write(chunk)
+                  done += len(chunk)
+                  if total > 0:
+                      pct = int(done * 100 / total)
+                      bar_len = 20
+                      filled = int(bar_len * done / total)
+                      bar = "#" * filled + "-" * (bar_len - filled)
+                      print(f"\r[INFO] [{index}/{len(files)}] {filename} [{bar}] {pct}%", end="", flush=True)
+                  else:
+                      print(f"\r[INFO] [{index}/{len(files)}] {filename} ({done} bytes)", end="", flush=True)
+          print()
+    except urllib.error.URLError as exc:
+      print(f"[ERROR] Failed to download {rel_path}: {exc}", file=sys.stderr)
+      sys.exit(4)
+
+print(f"[OK] {label}: downloaded to {dest_dir}")
+PY
+}
+
+download_models_from_hf() {
+  step_section "Download Models"
+  info "Downloading .pt files from https://huggingface.co/${HF_MODELS_REPO}/tree/main/${HF_MODELS_FOLDER}"
+  ensure_hf_folder_files "${HF_MODELS_REPO}" "${HF_MODELS_FOLDER}" ".pt" "${ROOT_DIR}/models" "Model assets"
+  ok "Model download completed"
+}
+
+verify_torch_cuda() {
+  python - <<'PY'
+import sys
+import torch
+
+print('torch:', torch.__version__)
+print('cuda available:', torch.cuda.is_available())
+if not torch.cuda.is_available():
+    sys.exit(8)
+PY
+}
+
+choose_jetson_torch_mode() {
+  if [[ -n "${BALLSCOPE_JETSON_TORCH_MODE:-}" ]]; then
+    case "${BALLSCOPE_JETSON_TORCH_MODE}" in
+      manual|hf|preinstalled)
+        echo "${BALLSCOPE_JETSON_TORCH_MODE}"
+        return 0
+        ;;
+      *)
+        fail "Invalid BALLSCOPE_JETSON_TORCH_MODE='${BALLSCOPE_JETSON_TORCH_MODE}'. Use: manual | hf | preinstalled"
+        ;;
+    esac
+  fi
+
+  if [[ ! -t 0 ]]; then
+    warn "Non-interactive shell detected. Defaulting to BALLSCOPE_JETSON_TORCH_MODE=hf"
+    echo "hf"
+    return 0
+  fi
+
+  printf "\n"
+  printf "Jetson needs CUDA-enabled PyTorch before other Python dependencies.\n"
+  printf "Choose setup mode:\n"
+  printf "  [1] I will install PyTorch manually in .venv (setup exits after venv)\n"
+  printf "  [2] Download and install PyTorch wheels from Hugging Face (recommended)\n"
+  printf "  [3] PyTorch is already installed in .venv (verify CUDA and continue)\n"
+  printf "Enter 1/2/3: "
+
+  local choice
+  read -r choice
+  case "${choice}" in
+    1) echo "manual" ;;
+    2) echo "hf" ;;
+    3) echo "preinstalled" ;;
+    *) fail "Invalid choice '${choice}'. Please run ./setup.sh again and enter 1, 2, or 3." ;;
+  esac
+}
+
+install_jetson_torch_from_hf_wheels() {
+  step_section "Install Jetson PyTorch (HF Wheels)"
+  info "Downloading .whl files from https://huggingface.co/${HF_JETSON_WHEELS_REPO}/tree/main/${HF_JETSON_WHEELS_FOLDER}"
+  ensure_hf_folder_files "${HF_JETSON_WHEELS_REPO}" "${HF_JETSON_WHEELS_FOLDER}" ".whl" "${ROOT_DIR}/wheels" "Jetson wheel assets"
+
+  local torch_wheel torchvision_wheel
+  torch_wheel="$(find "${ROOT_DIR}/wheels" -maxdepth 1 -type f -name 'torch-*.whl' | sort | head -n 1 || true)"
+  torchvision_wheel="$(find "${ROOT_DIR}/wheels" -maxdepth 1 -type f -name 'torchvision-*.whl' | sort | head -n 1 || true)"
+
+  [[ -n "${torch_wheel}" ]] || fail "No torch-*.whl found in ${ROOT_DIR}/wheels after download"
+
+  info "Installing torch wheel first: $(basename "${torch_wheel}")"
+  python -m pip install "${torch_wheel}"
+
+  if [[ -n "${torchvision_wheel}" ]]; then
+    info "Installing torchvision wheel: $(basename "${torchvision_wheel}")"
+    python -m pip install "${torchvision_wheel}"
+  else
+    warn "No torchvision-*.whl found in ${ROOT_DIR}/wheels (optional)."
+  fi
+
+  if ! verify_torch_cuda; then
+    fail "PyTorch installed but CUDA is not available. Verify JetPack/L4T-compatible wheels."
+  fi
+  ok "Jetson PyTorch + CUDA verified"
+}
+
+step_section "BallScope Installer"
 info "Log file: ${LOG_FILE}"
 
 PLATFORM="$(detect_platform)"
 if [[ "${PLATFORM}" == "unsupported" ]]; then
   fail "Supported platforms: Apple Silicon macOS + NVIDIA Jetson (Linux/aarch64). Intel Mac is intentionally not supported."
 fi
-
 ok "Device detected: $(describe_host "${PLATFORM}")"
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
@@ -118,8 +339,52 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
 fi
 ok "Python found: $("${PYTHON_BIN}" --version 2>&1)"
 
+EXISTING_VENV=0
+EXISTING_MODELS_COUNT="$(count_top_level_matches "${ROOT_DIR}/models" '*.pt')"
+EXISTING_WHEELS_COUNT="$(count_top_level_matches "${ROOT_DIR}/wheels" '*.whl')"
+if [[ -d "${VENV_DIR}" ]]; then
+  EXISTING_VENV=1
+fi
+
+if [[ "${EXISTING_VENV}" -eq 1 || "${EXISTING_MODELS_COUNT}" -gt 0 || "${EXISTING_WHEELS_COUNT}" -gt 0 ]]; then
+  section "Existing Installation Detected"
+  if [[ "${EXISTING_VENV}" -eq 1 ]]; then
+    warn "Found existing virtual environment: ${VENV_DIR}"
+  fi
+  if [[ "${EXISTING_MODELS_COUNT}" -gt 0 ]]; then
+    warn "Found existing model files: ${EXISTING_MODELS_COUNT} file(s) in ${ROOT_DIR}/models"
+  fi
+  if [[ "${EXISTING_WHEELS_COUNT}" -gt 0 ]]; then
+    warn "Found existing wheel files: ${EXISTING_WHEELS_COUNT} file(s) in ${ROOT_DIR}/wheels"
+  fi
+
+  EXISTING_ACTION="$(choose_existing_install_action)"
+  info "Selected existing-install action: ${EXISTING_ACTION}"
+  case "${EXISTING_ACTION}" in
+    continue)
+      info "Continuing with existing setup artifacts."
+      ;;
+    reinstall)
+      cleanup_setup_artifacts
+      ;;
+    abort)
+      warn "Setup aborted by user."
+      exit 0
+      ;;
+    *)
+      fail "Unsupported existing-install action: ${EXISTING_ACTION}"
+      ;;
+  esac
+fi
+
 if [[ "${PLATFORM}" == "jetson" ]]; then
-  section "Jetson System Dependencies"
+  TOTAL_STEPS=9
+else
+  TOTAL_STEPS=7
+fi
+
+if [[ "${PLATFORM}" == "jetson" ]]; then
+  step_section "Jetson System Dependencies"
   if command -v apt-get >/dev/null 2>&1; then
     info "Installing apt packages (sudo required)..."
     sudo apt-get update
@@ -141,7 +406,7 @@ if [[ "${PLATFORM}" == "jetson" ]]; then
 fi
 
 if [[ "${PLATFORM}" == "mac_apple_silicon" ]]; then
-  section "macOS Dependencies"
+  step_section "macOS Dependencies"
   if command -v brew >/dev/null 2>&1; then
     info "Installing Homebrew packages (ffmpeg, portaudio)..."
     brew install ffmpeg portaudio || true
@@ -151,7 +416,7 @@ if [[ "${PLATFORM}" == "mac_apple_silicon" ]]; then
   fi
 fi
 
-section "Python Environment"
+step_section "Python Environment"
 if [[ ! -d "${VENV_DIR}" ]]; then
   info "Creating virtual environment at ${VENV_DIR}"
   "${PYTHON_BIN}" -m venv "${VENV_DIR}"
@@ -165,49 +430,51 @@ source "${VENV_DIR}/bin/activate"
 python -m pip install --upgrade pip setuptools wheel
 ok "pip/setuptools/wheel upgraded"
 
-if [[ "${PLATFORM}" == "mac_apple_silicon" ]]; then
-  section "Install Python Packages (Mac Apple Silicon)"
-  python -m pip install -r "${ROOT_DIR}/requirements-mac-apple-silicon.txt"
-  ok "Python packages installed for Apple Silicon"
-fi
-
 if [[ "${PLATFORM}" == "jetson" ]]; then
-  section "Jetson Torch Wheel"
+  step_section "Jetson PyTorch Choice"
+  JETSON_TORCH_MODE="$(choose_jetson_torch_mode)"
+  info "Selected mode: ${JETSON_TORCH_MODE}"
 
-  if [[ -f "${ROOT_DIR}/jetson_torch_wheels.env" ]]; then
-    info "Loading wheel config from jetson_torch_wheels.env"
-    # shellcheck disable=SC1091
-    source "${ROOT_DIR}/jetson_torch_wheels.env"
-  else
-    warn "No jetson_torch_wheels.env found."
-  fi
+  case "${JETSON_TORCH_MODE}" in
+    manual)
+      warn "Setup stops now so you can install CUDA-enabled PyTorch manually in .venv."
+      printf "\nNext steps:\n"
+      printf "  1) source .venv/bin/activate\n"
+      printf "  2) Install torch/torchvision manually (Jetson CUDA wheels)\n"
+      printf "  3) Run ./setup.sh again and choose option [3] to continue\n\n"
+      info "No models or extra dependencies were installed in manual mode."
+      info "Full log: ${LOG_FILE}"
+      exit 0
+      ;;
+    hf)
+      install_jetson_torch_from_hf_wheels
+      ;;
+    preinstalled)
+      step_section "Verify Existing Jetson PyTorch"
+      if ! verify_torch_cuda; then
+        fail "PyTorch in .venv has no CUDA. Install Jetson-compatible CUDA wheels, then run setup again."
+      fi
+      ok "Existing PyTorch + CUDA verified"
+      ;;
+    *)
+      fail "Unsupported Jetson torch mode: ${JETSON_TORCH_MODE}"
+      ;;
+  esac
 
-  if [[ -n "${TORCH_WHEEL_URL:-}" ]]; then
-    info "Installing torch wheel from TORCH_WHEEL_URL"
-    python -m pip install "${TORCH_WHEEL_URL}"
-  elif [[ -n "${TORCH_WHEEL_PATH:-}" ]]; then
-    info "Installing torch wheel from TORCH_WHEEL_PATH"
-    python -m pip install "${TORCH_WHEEL_PATH}"
-  else
-    show_jetson_wheel_help_and_exit
-  fi
-
-  if [[ -n "${TORCHVISION_WHEEL_URL:-}" ]]; then
-    info "Installing torchvision wheel from TORCHVISION_WHEEL_URL"
-    python -m pip install "${TORCHVISION_WHEEL_URL}"
-  elif [[ -n "${TORCHVISION_WHEEL_PATH:-}" ]]; then
-    info "Installing torchvision wheel from TORCHVISION_WHEEL_PATH"
-    python -m pip install "${TORCHVISION_WHEEL_PATH}"
-  else
-    warn "No torchvision wheel configured (optional)."
-  fi
-
-  section "Install Python Packages (Jetson)"
+  step_section "Install Python Packages (Jetson)"
   python -m pip install -r "${ROOT_DIR}/requirements-jetson.txt"
   ok "Python packages installed for Jetson"
 fi
 
-section "Verification"
+if [[ "${PLATFORM}" == "mac_apple_silicon" ]]; then
+  step_section "Install Python Packages (Mac Apple Silicon)"
+  python -m pip install -r "${ROOT_DIR}/requirements-mac-apple-silicon.txt"
+  ok "Python packages installed for Apple Silicon"
+fi
+
+download_models_from_hf
+
+step_section "Verification"
 python - <<'PY'
 import cv2
 import fastapi
@@ -227,7 +494,7 @@ print('ultralytics:', ultralytics.__version__)
 PY
 ok "Verification successful"
 
-section "Done"
+step_section "Done"
 ok "Setup completed successfully"
 info "Activate env: source .venv/bin/activate"
 info "Start app: python main.py"

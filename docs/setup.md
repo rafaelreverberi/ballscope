@@ -16,23 +16,33 @@ cd ballscope
 ```
 
 ### NVIDIA Jetson (Linux aarch64)
-1. Prepare wheel config:
-```bash
-cp jetson_torch_wheels.example.env jetson_torch_wheels.env
-```
-2. Fill `TORCH_WHEEL_URL` (or `TORCH_WHEEL_PATH`) in `jetson_torch_wheels.env`
-3. Optional: fill torchvision wheel values
-4. Run installer:
+Run:
 ```bash
 ./setup.sh
 ```
+The installer asks for a PyTorch mode before Jetson Python dependencies:
+1. Manual install mode: creates/uses `.venv`, then exits so you can install CUDA PyTorch manually.
+2. Hugging Face wheel mode: downloads `.whl` files from
+   `https://huggingface.co/RafaelReverberi/ballscope-jetson-wheels/tree/main/wheels`
+   into `wheels/` and installs them.
+3. Preinstalled mode: verifies existing `torch` in `.venv` has CUDA and continues.
 
-Note: CUDA Torch wheels are not bundled in this repository.
+If CUDA is unavailable, setup fails with guidance.
+
+### Model Download (both Mac and Jetson)
+`setup.sh` downloads all `.pt` files from:
+- `https://huggingface.co/RafaelReverberi/ballscope-assets/tree/main/models`
+into local:
+- `models/`
 
 ## 3) Start BallScope
 ```bash
 source .venv/bin/activate
 python main.py
+```
+Or from project root:
+```bash
+./start.sh
 ```
 
 Web UI:

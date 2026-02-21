@@ -5,15 +5,16 @@ Quick operational notes for BallScope on Jetson.
 ## Installation
 From repo root:
 ```bash
-cp jetson_torch_wheels.example.env jetson_torch_wheels.env
-# Fill wheel URLs/paths in the file
 ./setup.sh
 ```
 
 The installer will:
 - create/use `.venv`
+- ask how to provide PyTorch first (manual, Hugging Face wheels, or preinstalled)
+- verify CUDA availability when continuing
 - install shared Python dependencies
 - install Jetson system dependencies (`ffmpeg`, `v4l-utils`, `gstreamer`)
+- download model files to `models/` from Hugging Face assets
 - validate imports and report runtime device status
 
 ## Camera Mapping
@@ -40,6 +41,10 @@ Update sources in Web UI:
 ```bash
 source .venv/bin/activate
 python main.py
+```
+Or from project root:
+```bash
+./start.sh
 ```
 
 Open in browser:

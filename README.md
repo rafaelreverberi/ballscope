@@ -30,32 +30,12 @@ git clone https://github.com/rafaelreverberi/ballscope
 cd ballscope
 ```
 
-### 2) Install Git LFS (required for model weights)
-This project uses Git LFS for large model files (`*.pt`), including files in `models/`.
-
-If `git lfs` is not installed:
-
-```bash
-# macOS (Homebrew)
-brew install git-lfs
-
-# Ubuntu/Jetson
-sudo apt update && sudo apt install -y git-lfs
-```
-
-Then enable it and fetch model files:
-
-```bash
-git lfs install
-git lfs pull
-```
-
-### 3) Run platform installer
+### 2) Run platform installer
 ```bash
 ./setup.sh
 ```
 
-### 4) Activate virtual environment and start app
+### 3) Activate virtual environment and start app
 ```bash
 source .venv/bin/activate
 python main.py
@@ -68,37 +48,33 @@ Open:
 ## Quick Start
 ```bash
 git clone https://github.com/rafaelreverberi/ballscope && cd ballscope
-git lfs install && git lfs pull
 ./setup.sh
-source .venv/bin/activate
-python main.py
+./start.sh
 ```
 
 ## Installation Model
 Dependencies are split by role:
 - `requirements.txt`: shared Python dependencies
 - `requirements-mac-apple-silicon.txt`: shared + Apple Silicon PyTorch (MPS)
-- `requirements-jetson.txt`: shared dependencies for Jetson (Torch wheel is installed separately)
+- `requirements-jetson.txt`: shared dependencies for Jetson (installed after PyTorch is ready)
 
 `setup.sh` does all of this:
 - Detects platform (Apple Silicon Mac vs Jetson)
 - Creates/uses `.venv`
 - Installs platform-specific dependencies
+- Downloads model files (`models/*.pt`) from Hugging Face:
+  - `https://huggingface.co/RafaelReverberi/ballscope-assets/tree/main/models`
+- On Jetson: ensures PyTorch CUDA is installed before other Python packages
 - Verifies key imports and runtime device resolution
 - Writes install logs to `logs/setup_*.log`
 
-## Jetson Torch Wheel Requirement
-Jetson requires CUDA-enabled Torch wheels that are **not stored in this repository**.
-
-1. Copy placeholder config:
-```bash
-cp jetson_torch_wheels.example.env jetson_torch_wheels.env
-```
-2. Fill wheel URLs or local paths in `jetson_torch_wheels.env`
-3. Run setup:
-```bash
-./setup.sh
-```
+## Jetson PyTorch Flow
+On Jetson, `setup.sh` asks how to provide PyTorch first:
+- Manual mode: setup stops after `.venv` so you can install CUDA PyTorch manually.
+- Hugging Face wheel mode: downloads `.whl` files from
+  `https://huggingface.co/RafaelReverberi/ballscope-jetson-wheels/tree/main/wheels`
+  into local `wheels/` and installs them.
+- Preinstalled mode: verifies existing PyTorch in `.venv` has CUDA enabled and continues.
 
 ## Runtime Device Behavior
 Default is `BALLSCOPE_AI_DEVICE=auto`.
