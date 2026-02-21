@@ -124,6 +124,7 @@ count_top_level_matches() {
 }
 
 choose_existing_install_action() {
+  prompt() { printf "%s" "$*" >&2; }
   if [[ -n "${BALLSCOPE_EXISTING_INSTALL_ACTION:-}" ]]; then
     case "${BALLSCOPE_EXISTING_INSTALL_ACTION}" in
       continue|reinstall|abort)
@@ -142,16 +143,16 @@ choose_existing_install_action() {
     return 0
   fi
 
-  printf "\n"
-  printf "${C_BOLD}Action required:${C_RESET} Existing setup artifacts were detected.\n"
-  printf "Choose how to continue:\n"
-  printf "  [1] Continue with current setup files (default)\n"
-  printf "      Use this if you only want to update/check setup.\n"
-  printf "  [2] Reinstall clean (delete setup artifacts and rebuild)\n"
-  printf "      Deletes: .venv, models/*.pt, wheels/*.whl\n"
-  printf "  [3] Abort now\n"
-  printf "      Exit without changing anything.\n"
-  printf "Input now: 1 / 2 / 3 (default 1): "
+  prompt "\n"
+  prompt "${C_BOLD}Action required:${C_RESET} Existing setup artifacts were detected.\n"
+  prompt "Choose how to continue:\n"
+  prompt "  [1] Continue with current setup files (default)\n"
+  prompt "      Use this if you only want to update/check setup.\n"
+  prompt "  [2] Reinstall clean (delete setup artifacts and rebuild)\n"
+  prompt "      Deletes: .venv, models/*.pt, wheels/*.whl\n"
+  prompt "  [3] Abort now\n"
+  prompt "      Exit without changing anything.\n"
+  prompt "Input now: 1 / 2 / 3 (default 1): "
 
   local choice
   read -r choice
@@ -276,6 +277,7 @@ PY
 }
 
 choose_jetson_torch_mode() {
+  prompt() { printf "%s" "$*" >&2; }
   if [[ -n "${BALLSCOPE_JETSON_TORCH_MODE:-}" ]]; then
     case "${BALLSCOPE_JETSON_TORCH_MODE}" in
       manual|hf|preinstalled)
@@ -294,16 +296,16 @@ choose_jetson_torch_mode() {
     return 0
   fi
 
-  printf "\n"
-  printf "${C_BOLD}Action required:${C_RESET} Jetson needs CUDA-enabled PyTorch before other Python dependencies.\n"
-  printf "Choose setup mode:\n"
-  printf "  [1] I will install PyTorch manually in .venv\n"
-  printf "      Setup exits after venv creation/activation instructions.\n"
-  printf "  [2] Download and install PyTorch wheels from Hugging Face (recommended)\n"
-  printf "      Wheels are downloaded to wheels/ and installed automatically.\n"
-  printf "  [3] PyTorch is already installed in .venv\n"
-  printf "      Setup verifies CUDA and then continues.\n"
-  printf "Input now: 1 / 2 / 3 (default 2): "
+  prompt "\n"
+  prompt "${C_BOLD}Action required:${C_RESET} Jetson needs CUDA-enabled PyTorch before other Python dependencies.\n"
+  prompt "Choose setup mode:\n"
+  prompt "  [1] I will install PyTorch manually in .venv\n"
+  prompt "      Setup exits after venv creation/activation instructions.\n"
+  prompt "  [2] Download and install PyTorch wheels from Hugging Face (recommended)\n"
+  prompt "      Wheels are downloaded to wheels/ and installed automatically.\n"
+  prompt "  [3] PyTorch is already installed in .venv\n"
+  prompt "      Setup verifies CUDA and then continues.\n"
+  prompt "Input now: 1 / 2 / 3 (default 2): "
 
   local choice
   read -r choice
