@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import subprocess
+import re
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Tuple
 from collections import deque
@@ -32,6 +33,21 @@ def resolve_dev_path(src: str) -> Optional[str]:
         return f"/dev/video{int(src)}"
     if src.startswith("/dev/video"):
         return src
+    return None
+
+
+def normalize_linux_source(src: str) -> Optional[str]:
+    s = (src or "").strip()
+    if s.isdigit():
+        return s
+    if s.startswith("/dev/video"):
+        return s
+    m = re.search(r"/dev/video(\d+)", s)
+    if m:
+        return f"/dev/video{int(m.group(1))}"
+    m = re.fullmatch(r"video(\d+)", s, flags=re.IGNORECASE)
+    if m:
+        return f"/dev/video{int(m.group(1))}"
     return None
 
 
@@ -196,6 +212,17 @@ class CameraWorker:
         src = self.state.src
         preset = QUALITY_PRESETS.get(self.state.settings.preset, QUALITY_PRESETS[DEFAULT_PRESET])
         w, h, fps = preset["w"], preset["h"], preset["fps"]
+
+        if _is_linux():
+            normalized = normalize_linux_source(src)
+            if normalized is None:
+                self.state.last_error = (
+                    f"Invalid Linux camera source: '{src}'. Use '/dev/videoX' or numeric index like '0'."
+                )
+                return None
+            if normalized != src:
+                self.state.src = normalized
+                src = normalized
 
         dev = resolve_dev_path(src)
         if dev is not None:
