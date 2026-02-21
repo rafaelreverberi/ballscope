@@ -180,6 +180,7 @@ ensure_hf_folder_files() {
   python - "$repo_id" "$remote_folder" "$suffix" "$dest_dir" "$label" <<'PY'
 import json
 import os
+import ssl
 import sys
 import urllib.error
 import urllib.parse
@@ -189,10 +190,17 @@ repo_id, remote_folder, suffix, dest_dir, label = sys.argv[1:6]
 api_url = f"https://huggingface.co/api/models/{repo_id}/tree/main/{remote_folder}?recursive=1"
 
 try:
-    with urllib.request.urlopen(api_url) as response:
+    import certifi  # type: ignore
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+except Exception:
+    ssl_context = ssl.create_default_context()
+
+try:
+    with urllib.request.urlopen(api_url, context=ssl_context) as response:
         entries = json.load(response)
 except urllib.error.URLError as exc:
     print(f"[ERROR] Failed to query Hugging Face API: {exc}", file=sys.stderr)
+    print("[ERROR] TLS certificate validation failed. On macOS, ensure Python trust store is configured.", file=sys.stderr)
     sys.exit(2)
 
 files = [
@@ -215,7 +223,7 @@ for index, rel_path in enumerate(files, start=1):
     file_url = f"https://huggingface.co/{repo_id}/resolve/main/{encoded_path}?download=true"
 
     try:
-      with urllib.request.urlopen(file_url) as response:
+      with urllib.request.urlopen(file_url, context=ssl_context) as response:
           total = int(response.headers.get("Content-Length", "0"))
           done = 0
           with open(out_path, "wb") as fh:
