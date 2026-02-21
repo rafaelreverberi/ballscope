@@ -18,7 +18,7 @@ cd ballscope
 ### NVIDIA Jetson (Linux aarch64)
 Run:
 ```bash
-./setup.sh
+sudo ./setup.sh
 ```
 The installer asks for a PyTorch mode before Jetson Python dependencies:
 1. Manual install mode: creates/uses `.venv`, then exits so you can install CUDA PyTorch manually.
@@ -28,6 +28,7 @@ The installer asks for a PyTorch mode before Jetson Python dependencies:
 3. Preinstalled mode: verifies existing `torch` in `.venv` has CUDA and continues.
 
 If CUDA is unavailable, setup fails with guidance.
+When run with `sudo`, setup resets repository ownership back to the invoking user at the end.
 
 ### Model Download (both Mac and Jetson)
 `setup.sh` downloads all `.pt` files from:
@@ -43,6 +44,10 @@ python main.py
 Or from project root:
 ```bash
 ./start.sh
+```
+Jetson (if camera/device permission issues occur):
+```bash
+sudo ./start.sh
 ```
 
 Web UI:
@@ -65,3 +70,8 @@ Every setup run writes a log file:
 - `logs/setup_YYYYMMDD_HHMMSS.log`
 
 Use this file for debugging failed installs.
+
+## 6) Optional Autostart
+At the end of setup, you can choose autostart:
+- Jetson: creates/overwrites `ballscope.service` and enables it (`systemd`)
+- macOS: creates/overwrites `com.ballscope.start.plist` (`launchd`)

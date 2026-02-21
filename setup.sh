@@ -175,6 +175,193 @@ cleanup_setup_artifacts() {
   ok "Clean reinstall state prepared (.venv removed, models/*.pt and wheels/*.whl removed)"
 }
 
+choose_autostart_action() {
+  prompt() { printf "%s" "$*" >&2; }
+  if [[ -n "${BALLSCOPE_AUTOSTART_ACTION:-}" ]]; then
+    case "${BALLSCOPE_AUTOSTART_ACTION}" in
+      enable|skip)
+        echo "${BALLSCOPE_AUTOSTART_ACTION}"
+        return 0
+        ;;
+      *)
+        fail "Invalid BALLSCOPE_AUTOSTART_ACTION='${BALLSCOPE_AUTOSTART_ACTION}'. Use: enable | skip"
+        ;;
+    esac
+  fi
+
+  if [[ ! -t 0 ]]; then
+    warn "Non-interactive shell detected. Autostart action defaults to: skip"
+    echo "skip"
+    return 0
+  fi
+
+  prompt "\n"
+  prompt "${C_BOLD}Action required:${C_RESET} Configure system autostart for BallScope?\n"
+  prompt "Choose:\n"
+  prompt "  [1] Yes, enable autostart (overwrites existing BallScope autostart service)\n"
+  prompt "  [2] No, skip (default)\n"
+  prompt "Input now: 1 / 2 (default 2): "
+
+  local choice
+  read -r choice
+  if [[ -z "${choice}" ]]; then
+    choice="2"
+  fi
+
+  case "${choice}" in
+    1) echo "enable" ;;
+    2) echo "skip" ;;
+    *) fail "Invalid choice '${choice}'. Please run ./setup.sh again and enter 1 or 2." ;;
+  esac
+}
+
+normalize_repo_permissions_if_sudo() {
+  if [[ "${EUID}" -ne 0 || -z "${SUDO_USER:-}" || "${SUDO_USER}" == "root" ]]; then
+    return 0
+  fi
+  if [[ "${BALLSCOPE_SKIP_CHOWN:-0}" == "1" ]]; then
+    warn "Skipping ownership normalization because BALLSCOPE_SKIP_CHOWN=1"
+    return 0
+  fi
+
+  local target_user target_group
+  target_user="${SUDO_USER}"
+  target_group="$(id -gn "${target_user}" 2>/dev/null || echo "${target_user}")"
+  info "Normalizing repository ownership to ${target_user}:${target_group} (sudo run detected)"
+  chown -R "${target_user}:${target_group}" "${ROOT_DIR}"
+  ok "Repository ownership normalized for ${target_user}"
+}
+
+install_autostart_linux() {
+  local service_name service_path run_user run_group
+  service_name="ballscope.service"
+  service_path="/etc/systemd/system/${service_name}"
+  run_user="${SUDO_USER:-$(id -un)}"
+  run_group="$(id -gn "${run_user}" 2>/dev/null || echo "${run_user}")"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemctl not found; skipping Linux autostart setup."
+    return 1
+  fi
+
+  if [[ "${EUID}" -ne 0 ]]; then
+    warn "Linux autostart setup requires sudo/root. Run setup with sudo to install systemd autostart."
+    return 1
+  fi
+
+  cat > "${service_path}" <<EOF
+[Unit]
+Description=BallScope Autostart Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${run_user}
+Group=${run_group}
+WorkingDirectory=${ROOT_DIR}
+ExecStart=${ROOT_DIR}/start.sh
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now "${service_name}"
+  ok "Linux autostart enabled via systemd (${service_name})"
+  return 0
+}
+
+install_autostart_macos() {
+  local label target_user target_uid target_home agent_dir plist_path
+  label="com.ballscope.start"
+  target_user="${SUDO_USER:-$(id -un)}"
+  target_uid="$(id -u "${target_user}" 2>/dev/null || true)"
+  target_home="$(eval echo "~${target_user}")"
+
+  if [[ -z "${target_uid}" || ! -d "${target_home}" ]]; then
+    warn "Could not resolve macOS user context for autostart. Skipping."
+    return 1
+  fi
+
+  agent_dir="${target_home}/Library/LaunchAgents"
+  plist_path="${agent_dir}/${label}.plist"
+  mkdir -p "${agent_dir}"
+
+  cat > "${plist_path}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>-lc</string>
+      <string>cd "${ROOT_DIR}" &amp;&amp; ./start.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${ROOT_DIR}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${ROOT_DIR}/logs/autostart_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>${ROOT_DIR}/logs/autostart_stderr.log</string>
+  </dict>
+</plist>
+EOF
+
+  chown "${target_user}":"$(id -gn "${target_user}" 2>/dev/null || echo staff)" "${plist_path}" || true
+
+  if [[ "${EUID}" -eq 0 ]]; then
+    launchctl bootout "gui/${target_uid}/${label}" >/dev/null 2>&1 || true
+    if launchctl bootstrap "gui/${target_uid}" "${plist_path}" >/dev/null 2>&1; then
+      launchctl enable "gui/${target_uid}/${label}" >/dev/null 2>&1 || true
+      ok "macOS autostart enabled via LaunchAgent (${label}) for user ${target_user}"
+      return 0
+    fi
+  else
+    launchctl bootout "gui/${target_uid}/${label}" >/dev/null 2>&1 || true
+    if launchctl bootstrap "gui/${target_uid}" "${plist_path}" >/dev/null 2>&1; then
+      launchctl enable "gui/${target_uid}/${label}" >/dev/null 2>&1 || true
+      ok "macOS autostart enabled via LaunchAgent (${label})"
+      return 0
+    fi
+  fi
+
+  warn "Autostart plist was written, but launchctl could not bootstrap it in this session."
+  warn "You can load it manually later: launchctl bootstrap gui/${target_uid} ${plist_path}"
+  return 1
+}
+
+configure_optional_autostart() {
+  step_section "Autostart (Optional)"
+  local action
+  action="$(choose_autostart_action)"
+  info "Selected autostart action: ${action}"
+  if [[ "${action}" != "enable" ]]; then
+    info "Autostart setup skipped."
+    return 0
+  fi
+
+  if [[ "${PLATFORM}" == "jetson" ]]; then
+    install_autostart_linux || true
+    return 0
+  fi
+  if [[ "${PLATFORM}" == "mac_apple_silicon" ]]; then
+    install_autostart_macos || true
+    return 0
+  fi
+  warn "Autostart is not supported on this platform."
+}
+
 ensure_hf_folder_files() {
   local repo_id="$1"
   local remote_folder="$2"
@@ -355,6 +542,9 @@ if [[ "${PLATFORM}" == "unsupported" ]]; then
   fail "Supported platforms: Apple Silicon macOS + NVIDIA Jetson (Linux/aarch64). Intel Mac is intentionally not supported."
 fi
 ok "Device detected: $(describe_host "${PLATFORM}")"
+if [[ "${PLATFORM}" == "jetson" && "${EUID}" -ne 0 ]]; then
+  warn "Jetson setup is recommended with sudo: sudo ./setup.sh"
+fi
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   fail "${PYTHON_BIN} not found. Install Python 3.10+ first."
@@ -400,9 +590,9 @@ if [[ "${EXISTING_VENV}" -eq 1 || "${EXISTING_MODELS_COUNT}" -gt 0 || "${EXISTIN
 fi
 
 if [[ "${PLATFORM}" == "jetson" ]]; then
-  TOTAL_STEPS=9
+  TOTAL_STEPS=10
 else
-  TOTAL_STEPS=7
+  TOTAL_STEPS=8
 fi
 
 if [[ "${PLATFORM}" == "jetson" ]]; then
@@ -515,6 +705,9 @@ print('fastapi:', fastapi.__version__)
 print('ultralytics:', ultralytics.__version__)
 PY
 ok "Verification successful"
+
+configure_optional_autostart
+normalize_repo_permissions_if_sudo
 
 step_section "Done"
 ok "Setup completed successfully"

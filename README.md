@@ -34,11 +34,24 @@ cd ballscope
 ```bash
 ./setup.sh
 ```
+Jetson note:
+```bash
+sudo ./setup.sh
+```
+(`setup.sh` normalizes repository ownership back to your user at the end when run via `sudo`.)
 
 ### 3) Activate virtual environment and start app
 ```bash
 source .venv/bin/activate
 python main.py
+```
+Or from project root:
+```bash
+./start.sh
+```
+Jetson note (if device permissions require it):
+```bash
+sudo ./start.sh
 ```
 
 Open:
@@ -65,6 +78,8 @@ Dependencies are split by role:
 - Downloads model files (`models/*.pt`) from Hugging Face:
   - `https://huggingface.co/RafaelReverberi/ballscope-assets/tree/main/models`
 - On Jetson: ensures PyTorch CUDA is installed before other Python packages
+- At the end: optional autostart setup (`systemd` on Jetson, `launchd` on macOS)
+- If run with `sudo`: resets repository ownership back to the invoking user
 - Verifies key imports and runtime device resolution
 - Writes install logs to `logs/setup_*.log`
 
@@ -75,6 +90,11 @@ On Jetson, `setup.sh` asks how to provide PyTorch first:
   `https://huggingface.co/RafaelReverberi/ballscope-jetson-wheels/tree/main/wheels`
   into local `wheels/` and installs them.
 - Preinstalled mode: verifies existing PyTorch in `.venv` has CUDA enabled and continues.
+
+## Optional Autostart
+At the end of `setup.sh`, you can enable autostart:
+- Jetson: installs/overwrites `ballscope.service` (`systemd`) and enables it
+- macOS: installs/overwrites `com.ballscope.start.plist` (`launchd`)
 
 ## Runtime Device Behavior
 Default is `BALLSCOPE_AI_DEVICE=auto`.

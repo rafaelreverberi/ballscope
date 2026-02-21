@@ -5,7 +5,7 @@ Quick operational notes for BallScope on Jetson.
 ## Installation
 From repo root:
 ```bash
-./setup.sh
+sudo ./setup.sh
 ```
 
 The installer will:
@@ -16,6 +16,9 @@ The installer will:
 - install Jetson system dependencies (`ffmpeg`, `v4l-utils`, `gstreamer`)
 - download model files to `models/` from Hugging Face assets
 - validate imports and report runtime device status
+- optionally install/overwrite a `systemd` autostart service at the end
+
+When setup is run with `sudo`, it normalizes repository ownership back to your user at the end.
 
 ## Camera Mapping
 List V4L2 devices:
