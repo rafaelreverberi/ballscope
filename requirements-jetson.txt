@@ -2,3 +2,7 @@
 
 # Jetson uses NVIDIA-specific torch wheels and optional torchvision wheels.
 # Install them via setup.sh using TORCH_WHEEL_URL / TORCHVISION_WHEEL_URL.
+
+# Jetson Torch/Ultralytics stacks commonly require NumPy 1.x ABI.
+# Keep NumPy below 2.0 to avoid runtime ABI warnings/errors.
+numpy>=1.24,<2.0

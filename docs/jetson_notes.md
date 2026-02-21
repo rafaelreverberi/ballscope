@@ -56,5 +56,6 @@ Open in browser:
 
 ## Troubleshooting
 - If CUDA is not used, verify Torch wheel compatibility with your JetPack/L4T version.
+- If you see NumPy ABI warnings on startup, recreate the venv with `./setup.sh` and keep Jetson on `numpy<2` (already enforced by `requirements-jetson.txt`).
 - If cameras fail to open, confirm source mapping with `v4l2-ctl`.
 - Check installer logs in `logs/`.
