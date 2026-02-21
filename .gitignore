@@ -211,7 +211,12 @@ __marimo__/
 # Ignore contents but keep folder
 uploads/*
 recordings/*
+models/*
+wheels/*
 
 # But keep placeholder file
 !uploads/.gitkeep
 !recordings/.gitkeep
+!models/.gitkeep
+!wheels/
+!wheels/.gitkeep
