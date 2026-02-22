@@ -95,6 +95,7 @@ On Jetson, `setup.sh` asks how to provide PyTorch first:
 ## Optional Autostart
 At the end of `setup.sh`, you can enable autostart:
 - Jetson: installs/overwrites `ballscope.service` (`systemd`) and enables it
+  (also installs a `sudoers` rule for BallScope power-control API endpoints: reboot/shutdown)
 - macOS: installs/overwrites `com.ballscope.start.plist` (`launchd`)
 
 ## Runtime Device Behavior

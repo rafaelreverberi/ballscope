@@ -1366,6 +1366,13 @@ def _schedule_power_action(action: str) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
+    run_cmd = list(cmd)
+    try:
+        if platform.system() == "Linux" and hasattr(os, "geteuid") and os.geteuid() != 0 and shutil.which("sudo"):
+            run_cmd = ["sudo", "-n", *cmd]
+    except Exception:
+        run_cmd = list(cmd)
+
     # Stop runtime components first to reduce file/stream corruption risk.
     try:
         AI_WORKER.stop()
@@ -1380,7 +1387,7 @@ def _schedule_power_action(action: str) -> dict:
     def _run():
         time.sleep(1.0)
         try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(run_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
 
@@ -1391,6 +1398,7 @@ def _schedule_power_action(action: str) -> dict:
         "scheduled": True,
         "delay_sec": 1.0,
         "requires_privileges": True,
+        "command": run_cmd[0] if run_cmd else None,
         "note": "If the process lacks permission, the OS power action may fail.",
     }
 

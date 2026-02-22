@@ -75,4 +75,5 @@ Use this file for debugging failed installs.
 ## 6) Optional Autostart
 At the end of setup, you can choose autostart:
 - Jetson: creates/overwrites `ballscope.service` and enables it (`systemd`)
+  and installs a `sudoers` rule so BallScope can call the reboot/shutdown API endpoints without running the whole app as root
 - macOS: creates/overwrites `com.ballscope.start.plist` (`launchd`)

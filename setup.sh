@@ -276,6 +276,36 @@ EOF
   return 0
 }
 
+install_power_sudoers_linux() {
+  local run_user sudoers_path tmpfile
+  run_user="${SUDO_USER:-$(id -un)}"
+  sudoers_path="/etc/sudoers.d/ballscope-power"
+
+  if [[ "${EUID}" -ne 0 ]]; then
+    warn "Power-control sudoers setup requires root; skipping."
+    return 1
+  fi
+
+  tmpfile="$(mktemp)"
+  cat > "${tmpfile}" <<EOF
+# BallScope power-control permissions (installed by setup.sh)
+${run_user} ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff, /bin/systemctl reboot, /bin/systemctl poweroff, /sbin/shutdown -r now, /sbin/shutdown -h now, /usr/sbin/shutdown -r now, /usr/sbin/shutdown -h now
+EOF
+
+  if command -v visudo >/dev/null 2>&1; then
+    if ! visudo -cf "${tmpfile}" >/dev/null; then
+      rm -f "${tmpfile}"
+      warn "Power-control sudoers validation failed; skipping."
+      return 1
+    fi
+  fi
+
+  install -o root -g root -m 0440 "${tmpfile}" "${sudoers_path}"
+  rm -f "${tmpfile}"
+  ok "Linux power-control sudoers installed (${sudoers_path}) for user ${run_user}"
+  return 0
+}
+
 install_autostart_macos() {
   local label target_user target_uid target_home agent_dir plist_path
   label="com.ballscope.start"
@@ -355,6 +385,9 @@ configure_optional_autostart() {
 
   if [[ "${PLATFORM}" == "jetson" ]]; then
     if install_autostart_linux; then
+      if ! install_power_sudoers_linux; then
+        warn "Autostart enabled, but power-control sudoers setup failed."
+      fi
       AUTOSTART_RESULT="enabled"
     else
       AUTOSTART_RESULT="failed"
