@@ -2438,6 +2438,24 @@ LIVE_HTML = r"""
         linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,0)),
         var(--panel-2);
       padding: 10px;
+      position: relative;
+    }
+    .mobile-fs-close {
+      display: none;
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 4;
+      appearance: none;
+      border-radius: 999px;
+      border: 1px solid var(--stroke-strong);
+      padding: 8px 12px;
+      color: var(--text);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.20), rgba(255,255,255,.04)),
+        var(--panel-2);
+      backdrop-filter: blur(14px) saturate(140%);
+      font: 600 12px/1 "Rubik", sans-serif;
     }
     .frame {
       border-radius: 14px; overflow:hidden; border:1px solid var(--stroke);
@@ -2484,6 +2502,36 @@ LIVE_HTML = r"""
       .row, .row3 { grid-template-columns: 1fr; }
       .btn-row .btn { width: 100%; justify-content: center; }
     }
+    body.mobile-live-overlay-open { overflow: hidden; }
+    @media (max-width: 900px) {
+      .stage.mobile-fs {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        border-radius: 0;
+        border: 0;
+        padding: max(10px, env(safe-area-inset-top)) 10px max(10px, env(safe-area-inset-bottom));
+        background:
+          radial-gradient(700px 360px at 12% -10%, rgba(104,215,255,0.16), transparent),
+          radial-gradient(620px 440px at 92% -12%, rgba(255,180,84,0.14), transparent),
+          color-mix(in srgb, var(--bg) 88%, black 12%);
+        display: flex;
+        align-items: center;
+      }
+      .stage.mobile-fs .mobile-fs-close { display: inline-flex; align-items: center; justify-content: center; }
+      .stage.mobile-fs .frame.main {
+        width: 100%;
+        height: min(100dvh - max(20px, env(safe-area-inset-top)) - max(20px, env(safe-area-inset-bottom)), 78svh);
+        aspect-ratio: auto;
+      }
+      .stage.mobile-fs .frame.main img {
+        object-fit: contain;
+        background: rgba(0,0,0,.28);
+      }
+      .stage.mobile-fs .label-chip {
+        top: calc(max(10px, env(safe-area-inset-top)) + 6px);
+      }
+    }
   </style>
 </head>
 <body>
@@ -2508,6 +2556,7 @@ LIVE_HTML = r"""
           </div>
 
           <div class="stage" id="liveStage">
+            <button type="button" class="mobile-fs-close" id="mobileFsClose">Done</button>
             <div class="frame main">
               <span class="label-chip" id="previewLabel">Final / Auto Zoom</span>
               <img id="liveMainImg" class="fit" src="" alt="Live preview">
@@ -2726,6 +2775,25 @@ LIVE_HTML = r"""
     let viewMode = "auto";
     let currentPreviewKey = "";
     let streamNonce = 0;
+    let mobilePseudoFs = false;
+    let mobilePseudoFsScrollY = 0;
+
+    const mobileEnvInfo = () => {
+      const ua = navigator.userAgent || "";
+      const mobileMq = window.matchMedia ? window.matchMedia("(max-width: 900px), (pointer: coarse)") : null;
+      const isMobileUi = !!(mobileMq && mobileMq.matches);
+      const isIOS = /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+      const isSafari = /Safari/i.test(ua) && !/CriOS|FxiOS|EdgiOS|OPiOS|Chrome|Android/i.test(ua);
+      return { isMobileUi, isIOS, isSafari };
+    };
+
+    const openStandaloneCurrentStream = () => {
+      const spec = streamForView(viewMode);
+      streamNonce += 1;
+      const sep = spec.url.includes("?") ? "&" : "?";
+      const url = `${spec.url}${sep}v=${streamNonce}`;
+      window.location.assign(url);
+    };
 
     const streamForView = (mode) => {
       const profile = $("previewQuality")?.value || "balanced";
@@ -2990,11 +3058,48 @@ LIVE_HTML = r"""
 
     $("fsBtn").onclick = async () => {
       const el = $("liveStage");
+      const { isMobileUi, isIOS, isSafari } = mobileEnvInfo();
+      const setPseudoFs = (on) => {
+        mobilePseudoFs = !!on;
+        document.body.classList.toggle("mobile-live-overlay-open", mobilePseudoFs);
+        el.classList.toggle("mobile-fs", mobilePseudoFs);
+        $("fsBtn").textContent = mobilePseudoFs ? "Exit Fullscreen" : "Fullscreen";
+        if (mobilePseudoFs) {
+          mobilePseudoFsScrollY = window.scrollY || window.pageYOffset || 0;
+          window.scrollTo(0, 0);
+        } else {
+          window.scrollTo(0, mobilePseudoFsScrollY || 0);
+        }
+      };
       try {
         if (document.fullscreenElement) await document.exitFullscreen();
+        else if (isMobileUi && isIOS && isSafari) openStandaloneCurrentStream();
+        else if (isMobileUi && isIOS) setPseudoFs(!mobilePseudoFs);
         else if (el.requestFullscreen) await el.requestFullscreen();
-      } catch (e) {}
+        else if (isMobileUi) setPseudoFs(!mobilePseudoFs);
+      } catch (e) {
+        if (isMobileUi && isIOS && isSafari) openStandaloneCurrentStream();
+        else if (isMobileUi) setPseudoFs(!mobilePseudoFs);
+      }
     };
+
+    $("mobileFsClose").onclick = () => {
+      mobilePseudoFs = false;
+      document.body.classList.remove("mobile-live-overlay-open");
+      $("liveStage").classList.remove("mobile-fs");
+      $("fsBtn").textContent = "Fullscreen";
+      window.scrollTo(0, mobilePseudoFsScrollY || 0);
+    };
+
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape" || !mobilePseudoFs) return;
+      $("mobileFsClose").click();
+    });
+
+    document.addEventListener("fullscreenchange", () => {
+      if (!document.fullscreenElement) $("fsBtn").textContent = "Fullscreen";
+      else $("fsBtn").textContent = "Exit Fullscreen";
+    });
 
     applyViewMode("auto");
     loadModels();
