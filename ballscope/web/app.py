@@ -1518,9 +1518,7 @@ HOME_HTML = r"""
     .icon-btn {
       appearance: none;
       border: 1px solid var(--stroke);
-      background:
-        linear-gradient(180deg, rgba(255,255,255,0.14), rgba(255,255,255,0.02)),
-        var(--pill-bg);
+      background: color-mix(in srgb, var(--panel) 88%, transparent);
       color: var(--text);
       width: 40px;
       height: 40px;
@@ -1529,15 +1527,14 @@ HOME_HTML = r"""
       align-items: center;
       justify-content: center;
       cursor: pointer;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 8px 18px rgba(0,0,0,0.08);
-      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+      box-shadow: none;
+      transition: border-color .16s ease, background-color .16s ease;
       font-size: 18px;
       line-height: 1;
     }
     .icon-btn:hover {
-      transform: translateY(-1px);
       border-color: var(--stroke-strong);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.10), 0 10px 20px rgba(0,0,0,0.12);
+      background: color-mix(in srgb, var(--panel-2) 92%, var(--accent2) 8%);
     }
     .icon-btn:focus-visible {
       outline: 2px solid var(--accent2);
@@ -1581,7 +1578,7 @@ HOME_HTML = r"""
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: linear-gradient(180deg, var(--accent2), var(--accent));
+      background: #22c55e;
       box-shadow: 0 0 0 4px rgba(255,255,255,0.04);
     }
     .hero {
@@ -1614,7 +1611,7 @@ HOME_HTML = r"""
       padding: 16px;
       background:
         linear-gradient(180deg, rgba(255,255,255,0.09), rgba(255,255,255,0.00) 40%),
-        linear-gradient(120deg, rgba(103,214,255,0.05), rgba(255,180,84,0.03)),
+        linear-gradient(120deg, rgba(103,214,255,0.07), rgba(42,99,215,0.05)),
         var(--panel-2);
       text-decoration: none;
       color: var(--text);
@@ -1625,7 +1622,7 @@ HOME_HTML = r"""
     }
     .card:hover {
       transform: translateY(-4px);
-      border-color: color-mix(in srgb, var(--accent) 45%, var(--stroke));
+      border-color: color-mix(in srgb, var(--accent2) 52%, var(--stroke));
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.1), 0 16px 28px rgba(0,0,0,0.14);
     }
     .card:focus-visible {
@@ -1762,25 +1759,25 @@ HOME_HTML = r"""
     </div>
     <div class="hero">
       <h1>BallScope System</h1>
-      <p>Choose a workspace: recording, post-analysis, or Live later. The app behavior stays the same, only the design has been refined.</p>
+      <p>Choose a workspace: recording, post-analysis, or Live.</p>
     </div>
     <section class="cards">
       <a class="card" href="/record">
         <small>01 / RECORD</small>
         <h2>Record</h2>
-        <p>Use the existing recording and control interface with the new visual theme.</p>
+        <p>Record video from one or both cameras. Use this when you want to save footage.</p>
         <span class="pill">Open</span>
       </a>
       <a class="card" href="/analysis">
         <small>02 / AI ANALYSIS</small>
         <h2>Analysis</h2>
-        <p>Upload recorded videos, define crop/ROI, and run post-match ball tracking.</p>
+        <p>Upload a video file and run ball tracking after recording. Best for reviewing clips later.</p>
         <span class="pill">Open</span>
       </a>
       <a class="card" href="/live">
         <small>03 / LIVE</small>
         <h2>Live</h2>
-        <p>Live dual-camera ball tracking in the browser with auto camera selection and zoom.</p>
+        <p>Watch the cameras live in the browser. BallScope follows the ball and zooms in automatically.</p>
         <span class="pill">Open</span>
       </a>
     </section>
@@ -1900,26 +1897,23 @@ ANALYSIS_HTML = r"""
       color:var(--text);
       text-decoration:none;
       border:1px solid var(--stroke);
-      border-radius:12px;
-      padding:9px 12px;
+      border-radius:14px;
+      padding:10px 13px;
       font-size:13px;
       font-weight:600;
-      background:
-        linear-gradient(180deg, rgba(255,255,255,.16), rgba(255,255,255,.03)),
-        var(--panel-2);
+      background: color-mix(in srgb, var(--panel-2) 92%, transparent);
       cursor: pointer;
-      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+      transition: border-color .16s ease, background-color .16s ease;
       display:inline-flex;
       align-items:center;
       justify-content:center;
       gap:8px;
-      backdrop-filter: blur(12px) saturate(135%);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,.08);
+      backdrop-filter: none;
+      box-shadow: none;
     }
     .nav-btn:hover, .top a:hover {
-      transform: translateY(-1px);
       border-color: var(--stroke-strong);
-      box-shadow: 0 8px 16px rgba(0,0,0,.10);
+      background: color-mix(in srgb, var(--panel-2) 84%, var(--accent-2) 16%);
     }
     .nav-btn:focus-visible, .top a:focus-visible {
       outline: 2px solid var(--accent-2);
@@ -1959,23 +1953,20 @@ ANALYSIS_HTML = r"""
       width:100%;
       margin-top:12px;
       padding:11px 12px;
-      border-radius:12px;
-      border:1px solid rgba(255,180,84,.52);
-      background:
-        linear-gradient(180deg, rgba(255,255,255,.20), rgba(255,255,255,0)),
-        linear-gradient(180deg, rgba(255,180,84,.80), rgba(255,180,84,.30));
+      border-radius:14px;
+      border:1px solid color-mix(in srgb, var(--accent-2) 58%, var(--stroke) 42%);
+      background: color-mix(in srgb, var(--accent-2) 72%, #2a63d7 28%);
       color:var(--btn-text);
       font-weight:700;
       letter-spacing:.01em;
       cursor:pointer;
-      box-shadow: 0 8px 18px rgba(255,180,84,.16);
-      transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
-      backdrop-filter: blur(12px) saturate(130%);
+      box-shadow: none;
+      transition: border-color .16s ease, background-color .16s ease, opacity .16s ease;
+      backdrop-filter: none;
     }
     button:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 10px 22px rgba(255,180,84,.22);
-      border-color: rgba(255,180,84,.75);
+      border-color: color-mix(in srgb, var(--accent-2) 72%, var(--stroke-strong) 28%);
+      background: color-mix(in srgb, var(--accent-2) 80%, #2459c8 20%);
     }
     button:focus-visible {
       outline: 2px solid var(--accent-2);
@@ -2008,14 +1999,12 @@ ANALYSIS_HTML = r"""
       text-decoration: none;
       font-weight: 600;
       border: 1px solid var(--stroke);
-      background:
-        linear-gradient(180deg, rgba(255,255,255,.14), rgba(255,255,255,.03)),
-        var(--panel-2);
-      padding: 8px 10px;
-      border-radius: 12px;
-      backdrop-filter: blur(12px) saturate(135%);
+      background: color-mix(in srgb, var(--panel-2) 92%, transparent);
+      padding: 9px 11px;
+      border-radius: 14px;
+      backdrop-filter: none;
     }
-    .result-link:hover { border-color: var(--stroke-strong); }
+    .result-link:hover { border-color: var(--stroke-strong); background: color-mix(in srgb, var(--panel-2) 84%, var(--accent-2) 16%); }
     @media (max-width: 980px) {
       .grid { grid-template-columns:1fr; }
       .top { align-items:flex-start; flex-direction: column; }
@@ -2373,16 +2362,14 @@ LIVE_HTML = r"""
     .top-actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     .nav-btn {
       appearance:none; border:1px solid var(--stroke); color:var(--text); text-decoration:none; cursor:pointer;
-      border-radius:12px; padding:9px 12px; font-size:13px; font-weight:600;
-      background:
-        linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0.03)),
-        var(--panel-2);
-      backdrop-filter: blur(12px) saturate(135%);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
-      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+      border-radius:14px; padding:10px 13px; font-size:13px; font-weight:600;
+      background: color-mix(in srgb, var(--panel-2) 92%, transparent);
+      backdrop-filter: none;
+      box-shadow: none;
+      transition: border-color .16s ease, background-color .16s ease;
       display:inline-flex; align-items:center; gap:8px;
     }
-    .nav-btn:hover { transform: translateY(-1px); border-color: var(--stroke-strong); box-shadow: inset 0 1px 0 rgba(255,255,255,0.1), 0 8px 16px rgba(0,0,0,0.10); }
+    .nav-btn:hover { border-color: var(--stroke-strong); background: color-mix(in srgb, var(--panel-2) 84%, var(--accent-2) 16%); }
     .nav-btn:focus-visible { outline:2px solid var(--accent-2); outline-offset:2px; }
     .badge { display:inline-flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
     .dot { width:10px; height:10px; border-radius:50%; background:var(--warn); }
@@ -2409,26 +2396,22 @@ LIVE_HTML = r"""
     }
     .btn-row { display:flex; gap:8px; flex-wrap:wrap; }
     .btn {
-      appearance:none; cursor:pointer; border-radius:12px; border:1px solid var(--stroke); padding:10px 12px;
+      appearance:none; cursor:pointer; border-radius:14px; border:1px solid var(--stroke); padding:10px 12px;
       color: var(--text);
-      background:
-        linear-gradient(180deg, rgba(255,255,255,.14), rgba(255,255,255,.03)),
-        var(--panel-2);
-      backdrop-filter: blur(12px) saturate(130%);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,.07);
+      background: color-mix(in srgb, var(--panel-2) 92%, transparent);
+      backdrop-filter: none;
+      box-shadow: none;
       font: 600 13px/1 "Rubik", sans-serif;
-      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+      transition: border-color .16s ease, background-color .16s ease;
     }
-    .btn:hover { transform: translateY(-1px); border-color: var(--stroke-strong); box-shadow: inset 0 1px 0 rgba(255,255,255,.1), 0 8px 16px rgba(0,0,0,.08); }
+    .btn:hover { border-color: var(--stroke-strong); background: color-mix(in srgb, var(--panel-2) 84%, var(--accent-2) 16%); }
     .btn.primary {
-      border-color: rgba(255,180,84,.52);
-      background:
-        linear-gradient(180deg, rgba(255,255,255,.22), rgba(255,255,255,0)),
-        linear-gradient(180deg, rgba(255,180,84,.80), rgba(255,180,84,.30));
+      border-color: color-mix(in srgb, var(--accent-2) 58%, var(--stroke) 42%);
+      background: color-mix(in srgb, var(--accent-2) 72%, #2a63d7 28%);
       color: #fffaf1;
-      box-shadow: 0 10px 20px rgba(255,180,84,.16);
+      box-shadow: none;
     }
-    .btn.primary:hover { border-color: rgba(255,180,84,.75); box-shadow: 0 12px 24px rgba(255,180,84,.22); }
+    .btn.primary:hover { border-color: color-mix(in srgb, var(--accent-2) 72%, var(--stroke-strong) 28%); background: color-mix(in srgb, var(--accent-2) 80%, #2459c8 20%); }
     .btn:focus-visible { outline:2px solid var(--accent-2); outline-offset:2px; }
 
     .stage {
@@ -3194,27 +3177,24 @@ RECORD_HTML = r"""
     .nav-btn {
       appearance:none;
       border: 1px solid var(--stroke);
-      background:
-        linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0.03)),
-        var(--panel-solid);
+      background: color-mix(in srgb, var(--panel-solid) 92%, transparent);
       color: var(--text);
       text-decoration: none;
-      border-radius: 12px;
-      padding: 9px 12px;
+      border-radius: 14px;
+      padding: 10px 13px;
       font-size: 13px;
       font-weight: 600;
       display:inline-flex;
       align-items:center;
       justify-content:center;
       cursor:pointer;
-      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
-      backdrop-filter: blur(12px) saturate(135%);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+      transition: border-color .16s ease, background-color .16s ease;
+      backdrop-filter: none;
+      box-shadow: none;
     }
     .nav-btn:hover {
-      transform: translateY(-1px);
       border-color: var(--stroke-strong);
-      box-shadow: 0 8px 16px rgba(0,0,0,0.10);
+      background: color-mix(in srgb, var(--panel-solid) 84%, var(--accent-2) 16%);
     }
     .nav-btn:focus-visible {
       outline: 2px solid var(--accent-2);
@@ -3334,38 +3314,33 @@ RECORD_HTML = r"""
     }
     button {
       padding: 10px 14px;
-      border-radius: 12px;
+      border-radius: 14px;
       border: 1px solid var(--stroke);
-      background:
-        linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0.03)),
-        var(--panel-solid);
+      background: color-mix(in srgb, var(--panel-solid) 92%, transparent);
       color: var(--text);
       font-weight: 600;
       cursor: pointer;
-      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease, background .16s ease;
-      backdrop-filter: blur(12px) saturate(130%);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.07);
+      transition: border-color .16s ease, background-color .16s ease, opacity .16s ease;
+      backdrop-filter: none;
+      box-shadow: none;
     }
     button:hover {
-      transform: translateY(-1px);
       border-color: var(--stroke-strong);
-      box-shadow: 0 8px 16px rgba(0,0,0,0.10);
+      background: color-mix(in srgb, var(--panel-solid) 84%, var(--accent-2) 16%);
     }
     button:focus-visible {
       outline: 2px solid var(--accent-2);
       outline-offset: 2px;
     }
     button.primary {
-      background:
-        linear-gradient(180deg, rgba(255,255,255,.22), rgba(255,255,255,0)),
-        linear-gradient(180deg, rgba(255,180,84,0.78), rgba(255,180,84,0.28));
-      border-color: rgba(255,180,84,0.56);
+      background: color-mix(in srgb, var(--accent-2) 72%, #2a63d7 28%);
+      border-color: color-mix(in srgb, var(--accent-2) 58%, var(--stroke) 42%);
       color: var(--btn-text);
-      box-shadow: 0 10px 22px rgba(255,180,84,0.18);
+      box-shadow: none;
     }
     button.primary:hover {
-      border-color: rgba(255,180,84,0.76);
-      box-shadow: 0 12px 24px rgba(255,180,84,0.24);
+      border-color: color-mix(in srgb, var(--accent-2) 72%, var(--stroke-strong) 28%);
+      background: color-mix(in srgb, var(--accent-2) 80%, #2459c8 20%);
     }
     button.ghost { background: transparent; }
     .status {
