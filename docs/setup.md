@@ -14,6 +14,7 @@ cd ballscope
 ```bash
 ./setup.sh
 ```
+`setup.sh` installs Homebrew dependencies for BallScope on macOS, including `ffmpeg`, `gstreamer`, and common GStreamer plugins used by recording/audio features.
 
 ### NVIDIA Jetson (Linux aarch64)
 Run:

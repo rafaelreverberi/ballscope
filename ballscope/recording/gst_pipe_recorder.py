@@ -8,6 +8,8 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+from .audio_source import gst_audio_source_elements
+from .gst_exec import gst_launch_bin
 
 @dataclass
 class RecordingStatus:
@@ -58,7 +60,7 @@ class GstPipeRecorder:
         w, h = frame_size
         if use_mkv:
             pipeline = [
-                "gst-launch-1.0",
+                gst_launch_bin(),
                 "-e",
                 "matroskamux",
                 "name=mux",
@@ -81,7 +83,7 @@ class GstPipeRecorder:
             ]
         else:
             pipeline = [
-                "gst-launch-1.0",
+                gst_launch_bin(),
                 "-e",
                 "fdsrc",
                 "do-timestamp=true",
@@ -101,10 +103,7 @@ class GstPipeRecorder:
 
         if audio_device:
             pipeline += [
-                "alsasrc",
-                f"device={audio_device}",
-                "do-timestamp=true",
-                "!",
+                *gst_audio_source_elements(audio_device),
                 "audioconvert",
                 "!",
                 "audioresample",

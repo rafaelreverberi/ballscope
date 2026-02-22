@@ -6,6 +6,9 @@ import threading
 from dataclasses import dataclass, asdict
 from typing import Optional
 
+from .audio_source import gst_audio_source_elements
+from .gst_exec import gst_launch_bin
+from .video_source import gst_camera_source_elements
 
 @dataclass
 class GstDualStatus:
@@ -50,46 +53,30 @@ class GstDualRecorder:
         os.makedirs(output_dir, exist_ok=True)
         ts = ts or time.strftime("%Y%m%d_%H%M%S")
         both_path = os.path.join(output_dir, f"both_{ts}.mkv")
-
-        devL = device_left
-        devR = device_right
-        if str(devL).isdigit():
-            devL = f"/dev/video{int(devL)}"
-        if str(devR).isdigit():
-            devR = f"/dev/video{int(devR)}"
-
-        if not os.path.exists(devL) or not os.path.exists(devR):
+        cam_src_l, err_l = gst_camera_source_elements(device_left, w, h, fps)
+        if cam_src_l is None:
             with self._lock:
-                self._status.last_error = f"Device not found: {devL if not os.path.exists(devL) else devR}"
+                self._status.last_error = err_l or "Left camera source error"
+            return self.status_dict()
+        cam_src_r, err_r = gst_camera_source_elements(device_right, w, h, fps)
+        if cam_src_r is None:
+            with self._lock:
+                self._status.last_error = err_r or "Right camera source error"
             return self.status_dict()
 
         pipeline = [
-            "gst-launch-1.0",
+            gst_launch_bin(),
             "-e",
             "matroskamux",
             "name=mux",
             "!",
             "filesink",
             f"location={both_path}",
-            "v4l2src",
-            f"device={devL}",
-            "do-timestamp=true",
-            "!",
-            f"image/jpeg,width={w},height={h},framerate={int(fps)}/1",
-            "!",
-            "jpegparse",
-            "!",
+            *cam_src_l,
             "queue",
             "!",
             "mux.",
-            "v4l2src",
-            f"device={devR}",
-            "do-timestamp=true",
-            "!",
-            f"image/jpeg,width={w},height={h},framerate={int(fps)}/1",
-            "!",
-            "jpegparse",
-            "!",
+            *cam_src_r,
             "queue",
             "!",
             "mux.",
@@ -97,10 +84,7 @@ class GstDualRecorder:
 
         if audio_device:
             pipeline += [
-                "alsasrc",
-                f"device={audio_device}",
-                "do-timestamp=true",
-                "!",
+                *gst_audio_source_elements(audio_device),
                 "audioconvert",
                 "!",
                 "audioresample",

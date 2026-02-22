@@ -6,6 +6,9 @@ import threading
 from dataclasses import dataclass, asdict
 from typing import Optional
 
+from .audio_source import gst_audio_source_elements
+from .gst_exec import gst_launch_bin
+from .video_source import gst_camera_source_elements
 
 @dataclass
 class GstRecordingStatus:
@@ -50,39 +53,26 @@ class GstDeviceRecorder:
         ts = ts or time.strftime("%Y%m%d_%H%M%S")
         ext = "mkv" if audio_device else "avi"
         path = os.path.join(output_dir, f"{self._name}_{ts}.{ext}")
-        dev = device
-        if str(dev).isdigit():
-            dev = f"/dev/video{int(dev)}"
-
-        if not os.path.exists(dev):
+        cam_src, cam_err = gst_camera_source_elements(device, w, h, fps)
+        if cam_src is None:
             with self._lock:
-                self._status.last_error = f"Device not found: {dev}"
+                self._status.last_error = cam_err or "Camera source error"
             return self.status_dict()
 
         if audio_device:
             pipeline = [
-                "gst-launch-1.0",
+                gst_launch_bin(),
                 "-e",
                 "matroskamux",
                 "name=mux",
                 "!",
                 "filesink",
                 f"location={path}",
-                "v4l2src",
-                f"device={dev}",
-                "do-timestamp=true",
-                "!",
-                f"image/jpeg,width={w},height={h},framerate={int(fps)}/1",
-                "!",
-                "jpegparse",
-                "!",
+                *cam_src,
                 "queue",
                 "!",
                 "mux.",
-                "alsasrc",
-                f"device={audio_device}",
-                "do-timestamp=true",
-                "!",
+                *gst_audio_source_elements(audio_device),
                 "audioconvert",
                 "!",
                 "audioresample",
@@ -96,14 +86,9 @@ class GstDeviceRecorder:
             ]
         else:
             pipeline = [
-                "gst-launch-1.0",
+                gst_launch_bin(),
                 "-e",
-                "v4l2src",
-                f"device={dev}",
-                "do-timestamp=true",
-                "!",
-                f"image/jpeg,width={w},height={h},framerate={int(fps)}/1",
-                "!",
+                *cam_src,
                 "avimux",
                 "!",
                 "filesink",

@@ -6,6 +6,8 @@ import threading
 from dataclasses import dataclass, asdict
 from typing import Optional
 
+from .audio_source import gst_audio_source_elements
+from .gst_exec import gst_launch_bin
 
 @dataclass
 class AudioRecordingStatus:
@@ -41,12 +43,9 @@ class GstAudioRecorder:
         path = os.path.join(output_dir, f"{self._name}_{ts}.mp3")
 
         pipeline = [
-            "gst-launch-1.0",
+            gst_launch_bin(),
             "-e",
-            "alsasrc",
-            f"device={audio_device}",
-            "do-timestamp=true",
-            "!",
+            *gst_audio_source_elements(audio_device),
             "audioconvert",
             "!",
             "audioresample",

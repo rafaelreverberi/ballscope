@@ -75,6 +75,7 @@ Dependencies are split by role:
 - Detects platform (Apple Silicon Mac vs Jetson)
 - Creates/uses `.venv`
 - Installs platform-specific dependencies
+  - macOS: Homebrew packages including `ffmpeg`, `gstreamer` and common GStreamer plugins (used for recording/audio device support)
 - Downloads model files (`models/*.pt`) from Hugging Face:
   - `https://huggingface.co/RafaelReverberi/ballscope-assets/tree/main/models`
 - On Jetson: ensures PyTorch CUDA is installed before other Python packages

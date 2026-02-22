@@ -659,12 +659,48 @@ fi
 
 if [[ "${PLATFORM}" == "mac_apple_silicon" ]]; then
   step_section "macOS Dependencies"
+  BREW_BIN=""
   if command -v brew >/dev/null 2>&1; then
-    info "Installing Homebrew packages (ffmpeg, portaudio)..."
-    brew install ffmpeg portaudio || true
-    ok "Homebrew package step completed"
+    BREW_BIN="$(command -v brew)"
+  elif [[ -x /opt/homebrew/bin/brew ]]; then
+    BREW_BIN="/opt/homebrew/bin/brew"
+  elif [[ -x /usr/local/bin/brew ]]; then
+    BREW_BIN="/usr/local/bin/brew"
+  fi
+
+  if [[ -n "${BREW_BIN}" ]]; then
+    info "Installing Homebrew packages (ffmpeg, gstreamer, plugins, portaudio)..."
+    if [[ "${EUID}" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+      info "macOS setup is running with sudo; executing Homebrew install as ${SUDO_USER}"
+      if sudo -u "${SUDO_USER}" -H "${BREW_BIN}" install \
+        ffmpeg \
+        gstreamer \
+        gst-plugins-base \
+        gst-plugins-good \
+        gst-plugins-bad \
+        gst-plugins-ugly \
+        portaudio; then
+        ok "Homebrew package step completed"
+      else
+        warn "Homebrew package install failed. Check the log above."
+      fi
+    elif [[ "${EUID}" -eq 0 ]]; then
+      warn "Running as root without SUDO_USER; cannot safely run Homebrew install automatically."
+      warn "Run without sudo on macOS or install Homebrew packages manually."
+    elif "${BREW_BIN}" install \
+      ffmpeg \
+      gstreamer \
+      gst-plugins-base \
+      gst-plugins-good \
+      gst-plugins-bad \
+      gst-plugins-ugly \
+      portaudio; then
+      ok "Homebrew package step completed"
+    else
+      warn "Homebrew package install failed. Check the log above."
+    fi
   else
-    warn "Homebrew not found. If needed, install ffmpeg and portaudio manually."
+    warn "Homebrew not found. If needed, install ffmpeg, gstreamer (+ plugins), and portaudio manually."
   fi
 fi
 

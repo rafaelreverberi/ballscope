@@ -3,6 +3,7 @@ import time
 import re
 import json
 import shutil
+import platform
 import subprocess
 import threading
 import uuid
@@ -248,6 +249,93 @@ def _analysis_resolve_device(device_pref: str) -> str:
     except Exception:
         return "cpu"
     return "cpu"
+
+
+def _clamp_int(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+def _parse_preview_profile(request: Request) -> dict:
+    q = request.query_params
+    profile = (q.get("profile") or "balanced").strip().lower()
+    presets = {
+        "high": {"max_w": 0, "fps": 24, "jpeg_q": 84},
+        "balanced": {"max_w": 960, "fps": 15, "jpeg_q": 76},
+        "fast": {"max_w": 640, "fps": 10, "jpeg_q": 66},
+    }
+    cfg = dict(presets.get(profile, presets["balanced"]))
+    if q.get("max_w"):
+        try:
+            cfg["max_w"] = _clamp_int(int(q.get("max_w")), 0, 1920)
+        except Exception:
+            pass
+    if q.get("fps"):
+        try:
+            cfg["fps"] = _clamp_int(int(float(q.get("fps"))), 1, 60)
+        except Exception:
+            pass
+    if q.get("q"):
+        try:
+            cfg["jpeg_q"] = _clamp_int(int(q.get("q")), 30, 95)
+        except Exception:
+            pass
+    return cfg
+
+
+def _mjpeg_from_frame_getter(frame_getter, seq_getter, wait_for_new, max_w: int, fps: int, jpeg_q: int):
+    last_seq = -1
+    min_dt = 1.0 / float(max(1, fps))
+    last_emit = 0.0
+    while True:
+        try:
+            wait_for_new(last_seq, timeout=1.0)
+        except Exception:
+            time.sleep(0.05)
+            continue
+
+        now = time.time()
+        dt = now - last_emit
+        if dt < min_dt:
+            time.sleep(min_dt - dt)
+
+        frame = None
+        try:
+            frame = frame_getter()
+        except Exception:
+            frame = None
+
+        if frame is None:
+            time.sleep(0.02)
+            continue
+
+        frame_seq = None
+        try:
+            _jpeg_unused, frame_seq = seq_getter()
+        except Exception:
+            frame_seq = None
+
+        try:
+            h, w = frame.shape[:2]
+            if max_w and w > max_w:
+                scale = max_w / float(max(1, w))
+                nh = max(1, int(h * scale))
+                frame = cv2.resize(frame, (max_w, nh), interpolation=cv2.INTER_LINEAR)
+            ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_q)])
+            if not ok:
+                time.sleep(0.02)
+                continue
+            last_emit = time.time()
+            if frame_seq is not None:
+                last_seq = frame_seq
+            chunk = (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n"
+            )
+            yield chunk
+        except GeneratorExit:
+            return
+        except Exception:
+            time.sleep(0.02)
 
 
 def _analysis_concat_segments(segment_paths: List[str], stitched_path: str) -> bool:
@@ -826,6 +914,53 @@ def list_alsa_devices() -> list[dict]:
     return devices
 
 
+def list_macos_audio_devices() -> list[dict]:
+    devices = [{"id": "", "label": "None"}, {"id": "default", "label": "default"}]
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return devices
+
+    # AVFoundation device listing is printed to stderr and usually exits with a non-zero code.
+    cmd = [ffmpeg, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        text = (res.stderr or "") + "\n" + (res.stdout or "")
+    except Exception:
+        return devices
+
+    in_audio_section = False
+    seen_ids = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        low = line.lower()
+        if "avfoundation video devices" in low:
+            in_audio_section = False
+            continue
+        if "avfoundation audio devices" in low:
+            in_audio_section = True
+            continue
+        if not in_audio_section:
+            continue
+
+        m = re.search(r"\[(\d+)\]\s+(.+)$", line)
+        if not m:
+            continue
+        dev_id = str(int(m.group(1)))
+        name = m.group(2).strip()
+        if not name or dev_id in seen_ids:
+            continue
+        seen_ids.add(dev_id)
+        devices.append({"id": dev_id, "label": f"{name} (avfoundation:{dev_id})"})
+    return devices
+
+
+def list_audio_devices() -> list[dict]:
+    system = platform.system()
+    if system == "Darwin":
+        return list_macos_audio_devices()
+    return list_alsa_devices()
+
+
 @app.get("/video/cam/{camera_id}.mjpg")
 def video_mjpg(camera_id: str):
     if camera_id not in CAMERA_WORKERS:
@@ -840,6 +975,41 @@ def video_mjpg(camera_id: str):
 def final_preview():
     return StreamingResponse(
         ai_mjpeg_stream(AI_WORKER),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/video/live/cam/{camera_id}.mjpg")
+def live_video_mjpg(camera_id: str, request: Request):
+    if camera_id not in CAMERA_WORKERS:
+        raise HTTPException(status_code=404, detail="Unknown camera_id")
+    cfg = _parse_preview_profile(request)
+    worker = CAMERA_WORKERS[camera_id]
+    return StreamingResponse(
+        _mjpeg_from_frame_getter(
+            worker.get_latest_frame_bgr,
+            worker.get_latest_jpeg_and_seq,
+            worker.wait_for_new_frame,
+            max_w=cfg["max_w"],
+            fps=cfg["fps"],
+            jpeg_q=cfg["jpeg_q"],
+        ),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/video/live/final.mjpg")
+def live_final_preview(request: Request):
+    cfg = _parse_preview_profile(request)
+    return StreamingResponse(
+        _mjpeg_from_frame_getter(
+            AI_WORKER.get_latest_frame,
+            AI_WORKER.get_latest_jpeg_and_seq,
+            AI_WORKER.wait_for_new_frame,
+            max_w=cfg["max_w"],
+            fps=cfg["fps"],
+            jpeg_q=cfg["jpeg_q"],
+        ),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
@@ -865,7 +1035,7 @@ def api_state():
 
 @app.get("/api/audio/devices")
 def api_audio_devices():
-    return {"devices": list_alsa_devices()}
+    return {"devices": list_audio_devices()}
 
 
 @app.post("/api/settings/{camera_id}")
@@ -1086,6 +1256,8 @@ async def start_ai(request: Request):
     AI_WORKER.set_manual_camera(active_camera)
     AI_WORKER.config.conf = float(body.get("conf", AI_WORKER.config.conf))
     AI_WORKER.config.iou = float(body.get("iou", AI_WORKER.config.iou))
+    AI_WORKER.config.device = str(body.get("device", AI_WORKER.config.device))
+    AI_WORKER.config.imgsz = int(body.get("imgsz", AI_WORKER.config.imgsz))
     AI_WORKER.config.zoom = float(body.get("zoom", AI_WORKER.config.zoom))
     AI_WORKER.config.smooth = float(body.get("smooth", AI_WORKER.config.smooth))
     AI_WORKER.config.lost_hold_sec = float(body.get("lost_hold_sec", AI_WORKER.config.lost_hold_sec))
@@ -1119,6 +1291,8 @@ async def start_system(request: Request):
     AI_WORKER.set_manual_camera(active_camera)
     AI_WORKER.config.conf = float(body.get("conf", AI_WORKER.config.conf))
     AI_WORKER.config.iou = float(body.get("iou", AI_WORKER.config.iou))
+    AI_WORKER.config.device = str(body.get("device", AI_WORKER.config.device))
+    AI_WORKER.config.imgsz = int(body.get("imgsz", AI_WORKER.config.imgsz))
     AI_WORKER.config.zoom = float(body.get("zoom", AI_WORKER.config.zoom))
     AI_WORKER.config.smooth = float(body.get("smooth", AI_WORKER.config.smooth))
     AI_WORKER.config.lost_hold_sec = float(body.get("lost_hold_sec", AI_WORKER.config.lost_hold_sec))
@@ -1166,6 +1340,71 @@ def stop_system():
     return {"ai": AI_WORKER.status_dict(), "recording": RECORDER.status_dict()}
 
 
+def _power_command(action: str) -> List[str]:
+    system = platform.system()
+    if system == "Darwin":
+        if action == "reboot":
+            return ["/sbin/shutdown", "-r", "now"]
+        if action == "shutdown":
+            return ["/sbin/shutdown", "-h", "now"]
+    if system == "Linux":
+        if shutil.which("systemctl"):
+            if action == "reboot":
+                return ["systemctl", "reboot"]
+            if action == "shutdown":
+                return ["systemctl", "poweroff"]
+        if action == "reboot":
+            return ["/sbin/shutdown", "-r", "now"]
+        if action == "shutdown":
+            return ["/sbin/shutdown", "-h", "now"]
+    raise RuntimeError(f"Unsupported platform/action: {system}/{action}")
+
+
+def _schedule_power_action(action: str) -> dict:
+    try:
+        cmd = _power_command(action)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # Stop runtime components first to reduce file/stream corruption risk.
+    try:
+        AI_WORKER.stop()
+        RECORDER.stop()
+        AUDIO_RECORDER.stop()
+        for recorder in RAW_RECORDERS.values():
+            recorder.stop()
+        RAW_DUAL.stop()
+    except Exception:
+        pass
+
+    def _run():
+        time.sleep(1.0)
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {
+        "ok": True,
+        "action": action,
+        "scheduled": True,
+        "delay_sec": 1.0,
+        "requires_privileges": True,
+        "note": "If the process lacks permission, the OS power action may fail.",
+    }
+
+
+@app.post("/api/system/reboot")
+def api_system_reboot():
+    return _schedule_power_action("reboot")
+
+
+@app.post("/api/system/shutdown")
+def api_system_shutdown():
+    return _schedule_power_action("shutdown")
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "ts": time.time()}
@@ -1173,7 +1412,7 @@ def health():
 
 HOME_HTML = r"""
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -1181,24 +1420,50 @@ HOME_HTML = r"""
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Rubik:wght@400;600;700&family=JetBrains+Mono:wght@500&display=swap');
     :root {
-      --bg: #0d1218;
-      --panel: rgba(18, 25, 38, 0.72);
+      color-scheme: dark;
+      --bg: #0c1117;
+      --bg-2: #101925;
+      --panel: rgba(17, 24, 38, 0.78);
+      --panel-2: rgba(10, 15, 24, 0.72);
       --stroke: rgba(255,255,255,0.10);
+      --stroke-strong: rgba(255,255,255,0.18);
       --text: #f7f8ff;
       --muted: rgba(247,248,255,0.68);
       --accent: #ffb454;
       --accent2: #67d6ff;
+      --accent-ink: #271303;
+      --shadow: 0 22px 60px rgba(0,0,0,0.36);
       --disabled: #627188;
+      --pill-bg: rgba(255,255,255,0.03);
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --bg: #eef4fb;
+      --bg-2: #dfe9f7;
+      --panel: rgba(255,255,255,0.86);
+      --panel-2: rgba(245,249,255,0.86);
+      --stroke: rgba(20, 33, 53, 0.12);
+      --stroke-strong: rgba(20, 33, 53, 0.22);
+      --text: #0f1724;
+      --muted: rgba(15, 23, 36, 0.66);
+      --accent: #df7b17;
+      --accent2: #0d84cc;
+      --accent-ink: #ffffff;
+      --shadow: 0 24px 60px rgba(23, 34, 56, 0.14);
+      --disabled: #8492a5;
+      --pill-bg: rgba(255,255,255,0.7);
     }
     * { box-sizing: border-box; }
+    html, body { transition: background-color .25s ease, color .25s ease; }
     body {
       margin: 0;
       min-height: 100vh;
       font-family: "Rubik", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(850px 520px at -10% -20%, rgba(103,214,255,0.26), transparent),
-        radial-gradient(700px 460px at 110% -10%, rgba(255,180,84,0.24), transparent),
+        radial-gradient(900px 560px at -8% -18%, rgba(103,214,255,0.22), transparent),
+        radial-gradient(800px 520px at 108% -8%, rgba(255,180,84,0.20), transparent),
+        linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)),
         var(--bg);
       display: flex;
       align-items: center;
@@ -1207,35 +1472,157 @@ HOME_HTML = r"""
     }
     .shell {
       width: min(1020px, 100%);
-      background: var(--panel);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01)),
+        var(--panel);
       border: 1px solid var(--stroke);
-      border-radius: 20px;
-      backdrop-filter: blur(8px);
-      padding: 28px;
-      box-shadow: 0 18px 44px rgba(0,0,0,0.35);
+      border-radius: 24px;
+      backdrop-filter: blur(18px) saturate(140%);
+      padding: 22px;
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow: hidden;
     }
-    h1 { margin: 0; font-size: 33px; letter-spacing: -0.02em; }
-    p { margin: 10px 0 0; color: var(--muted); }
+    .shell::before {
+      content: "";
+      position: absolute;
+      inset: -30% auto auto -10%;
+      width: 260px;
+      height: 260px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(103,214,255,0.18), transparent 70%);
+      pointer-events: none;
+    }
+    .topbar {
+      display: flex;
+      justify-content: flex-start;
+      align-items: flex-start;
+      gap: 12px;
+      position: relative;
+      z-index: 1;
+    }
+    .global-settings {
+      position: fixed;
+      top: 14px;
+      right: 14px;
+      z-index: 40;
+    }
+    .icon-btn {
+      appearance: none;
+      border: 1px solid var(--stroke);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.14), rgba(255,255,255,0.02)),
+        var(--pill-bg);
+      color: var(--text);
+      width: 40px;
+      height: 40px;
+      border-radius: 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 8px 18px rgba(0,0,0,0.08);
+      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .icon-btn:hover {
+      transform: translateY(-1px);
+      border-color: var(--stroke-strong);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.10), 0 10px 20px rgba(0,0,0,0.12);
+    }
+    .icon-btn:focus-visible {
+      outline: 2px solid var(--accent2);
+      outline-offset: 2px;
+    }
+    .settings-menu {
+      position: relative;
+    }
+    .settings-pop {
+      position: absolute;
+      right: 0;
+      top: calc(100% + 10px);
+      width: min(340px, calc(100vw - 40px));
+      border: 1px solid var(--stroke);
+      border-radius: 16px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02)),
+        var(--panel-2);
+      backdrop-filter: blur(18px) saturate(140%);
+      box-shadow: 0 18px 40px rgba(0,0,0,0.18);
+      padding: 12px;
+      display: none;
+    }
+    .settings-pop[open] { display: block; }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--stroke);
+      background: var(--pill-bg);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      color: var(--muted);
+      font-family: "JetBrains Mono", monospace;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+    }
+    .eyebrow::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: linear-gradient(180deg, var(--accent2), var(--accent));
+      box-shadow: 0 0 0 4px rgba(255,255,255,0.04);
+    }
+    .hero {
+      margin-top: 18px;
+      position: relative;
+      z-index: 1;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 3.8vw, 38px);
+      letter-spacing: -0.03em;
+      line-height: 1.05;
+    }
+    .hero p {
+      margin: 10px 0 0;
+      color: var(--muted);
+      max-width: 62ch;
+    }
     .cards {
       margin-top: 22px;
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 14px;
+      position: relative;
+      z-index: 1;
     }
     .card {
-      border-radius: 16px;
+      border-radius: 18px;
       border: 1px solid var(--stroke);
       padding: 16px;
-      background: rgba(12, 17, 26, 0.75);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.09), rgba(255,255,255,0.00) 40%),
+        linear-gradient(120deg, rgba(103,214,255,0.05), rgba(255,180,84,0.03)),
+        var(--panel-2);
       text-decoration: none;
       color: var(--text);
-      transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease;
+      transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease, background .2s ease;
       display: block;
+      backdrop-filter: blur(14px) saturate(130%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.07);
     }
     .card:hover {
-      transform: translateY(-3px);
-      border-color: rgba(255,180,84,0.5);
-      box-shadow: 0 10px 22px rgba(0,0,0,0.25);
+      transform: translateY(-4px);
+      border-color: color-mix(in srgb, var(--accent) 45%, var(--stroke));
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.1), 0 16px 28px rgba(0,0,0,0.14);
+    }
+    .card:focus-visible {
+      outline: 2px solid var(--accent2);
+      outline-offset: 2px;
     }
     .card h2 { margin: 0 0 8px; font-size: 20px; }
     .card small {
@@ -1255,45 +1642,192 @@ HOME_HTML = r"""
       border-radius: 999px;
       padding: 5px 10px;
       font-size: 12px;
-      border: 1px solid rgba(255,255,255,0.14);
+      border: 1px solid var(--stroke);
       color: var(--muted);
+      background: var(--pill-bg);
     }
     .pill.coming {
-      color: #d2d9e8;
+      color: var(--text);
       border-color: rgba(98, 113, 136, 0.9);
       background: rgba(98, 113, 136, 0.22);
     }
+    .settings-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .settings-head h3 {
+      margin: 0;
+      font-size: 13px;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .settings-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+    .field label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .field select {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid var(--stroke);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02)),
+        var(--panel);
+      color: var(--text);
+      padding: 10px 12px;
+      font: 600 13px/1.2 "Rubik", sans-serif;
+      transition: border-color .16s ease, box-shadow .16s ease;
+    }
+    .field select:focus {
+      outline: none;
+      border-color: color-mix(in srgb, var(--accent2) 55%, var(--stroke));
+      box-shadow: 0 0 0 4px rgba(103,214,255,0.16);
+    }
+    html[data-theme="light"] .field select:focus {
+      box-shadow: 0 0 0 4px rgba(13,132,204,0.14);
+    }
+    .settings-copy {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+    .settings-copy strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+    .settings-copy {
+      padding-top: 2px;
+    }
     @media (max-width: 860px) {
       .cards { grid-template-columns: 1fr; }
-      h1 { font-size: 28px; }
+      .shell { padding: 18px; }
+      .topbar { align-items: center; }
+      .global-settings {
+        top: 10px;
+        right: 10px;
+      }
+      .settings-pop {
+        right: -2px;
+        width: min(320px, calc(100vw - 30px));
+      }
     }
   </style>
 </head>
 <body>
+  <div class="global-settings">
+    <div class="settings-menu">
+      <button type="button" class="icon-btn" id="settingsBtn" aria-label="Open settings" aria-haspopup="dialog" aria-expanded="false">⚙</button>
+      <section class="settings-pop" id="settingsPop" aria-label="Interface settings">
+        <div class="settings-head">
+          <h3>Settings</h3>
+        </div>
+        <div class="settings-grid">
+          <div class="field">
+            <label for="themePref">Theme</label>
+            <select id="themePref">
+              <option value="system">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </div>
+          <div class="settings-copy">
+            <strong>System</strong> follows your browser/device color scheme automatically. You can override it here any time.
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
   <main class="shell">
-    <h1>BallScope System</h1>
-    <p>Wähle den Bereich aus: Aufnahme, Analyse oder später Live.</p>
+    <div class="topbar">
+      <div class="eyebrow">BallScope Control</div>
+    </div>
+    <div class="hero">
+      <h1>BallScope System</h1>
+      <p>Choose a workspace: recording, post-analysis, or Live later. The app behavior stays the same, only the design has been refined.</p>
+    </div>
     <section class="cards">
       <a class="card" href="/record">
         <small>01 / RECORD</small>
-        <h2>Aufnehmen</h2>
-        <p>Eure aktuelle Aufnahme- und Steuerungsoberfläche unverändert nutzen.</p>
-        <span class="pill">Öffnen</span>
+        <h2>Record</h2>
+        <p>Use the existing recording and control interface with the new visual theme.</p>
+        <span class="pill">Open</span>
       </a>
       <a class="card" href="/analysis">
-        <small>02 / AI ANALYSE</small>
-        <h2>Nachbearbeitung</h2>
-        <p>Aufgenommene Videos hochladen, ROI/Crop setzen und Balltracking ausführen.</p>
-        <span class="pill">Öffnen</span>
+        <small>02 / AI ANALYSIS</small>
+        <h2>Analysis</h2>
+        <p>Upload recorded videos, define crop/ROI, and run post-match ball tracking.</p>
+        <span class="pill">Open</span>
       </a>
-      <div class="card live" aria-disabled="true">
+      <a class="card" href="/live">
         <small>03 / LIVE</small>
         <h2>Live</h2>
-        <p>Direktes Live-Tracking ist geplant, aber noch nicht freigeschaltet.</p>
-        <span class="pill coming">Coming soon</span>
-      </div>
+        <p>Live dual-camera ball tracking in the browser with auto camera selection and zoom.</p>
+        <span class="pill">Open</span>
+      </a>
     </section>
   </main>
+  <script>
+    (() => {
+      const KEY = "ballscope-theme";
+      const root = document.documentElement;
+      const select = document.getElementById("themePref");
+      const settingsBtn = document.getElementById("settingsBtn");
+      const settingsPop = document.getElementById("settingsPop");
+      const media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+      const normalize = (value) => (value === "light" || value === "dark" || value === "system") ? value : "system";
+      const getPref = () => normalize(localStorage.getItem(KEY));
+      const resolve = (pref) => pref === "system" ? ((media && media.matches) ? "light" : "dark") : pref;
+      const apply = () => {
+        const pref = getPref();
+        const actual = resolve(pref);
+        root.setAttribute("data-theme", actual);
+        root.setAttribute("data-theme-pref", pref);
+        if (select) select.value = pref;
+      };
+      if (!localStorage.getItem(KEY)) localStorage.setItem(KEY, "system");
+      apply();
+      select?.addEventListener("change", (ev) => {
+        localStorage.setItem(KEY, normalize(ev.target.value));
+        apply();
+      });
+      if (media) {
+        const onMediaChange = () => {
+          if (getPref() === "system") apply();
+        };
+        if (typeof media.addEventListener === "function") media.addEventListener("change", onMediaChange);
+        else if (typeof media.addListener === "function") media.addListener(onMediaChange);
+      }
+      const closeSettings = () => {
+        settingsPop?.removeAttribute("open");
+        settingsBtn?.setAttribute("aria-expanded", "false");
+      };
+      const openSettings = () => {
+        settingsPop?.setAttribute("open", "");
+        settingsBtn?.setAttribute("aria-expanded", "true");
+      };
+      settingsBtn?.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (settingsPop?.hasAttribute("open")) closeSettings();
+        else openSettings();
+      });
+      settingsPop?.addEventListener("click", (ev) => ev.stopPropagation());
+      document.addEventListener("click", closeSettings);
+      document.addEventListener("keydown", (ev) => {
+        if (ev.key === "Escape") closeSettings();
+      });
+    })();
+  </script>
 </body>
 </html>
 """
@@ -1301,16 +1835,46 @@ HOME_HTML = r"""
 
 ANALYSIS_HTML = r"""
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>BallScope - AI Analyse</title>
+  <title>BallScope - AI Analysis</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Rubik:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
     :root {
-      --bg:#0d131a; --panel:rgba(16,24,36,0.75); --stroke:rgba(255,255,255,.09);
-      --text:#f4f7ff; --muted:rgba(244,247,255,.66); --accent:#ffb454;
+      color-scheme: dark;
+      --bg:#0d131a;
+      --panel:rgba(16,24,36,0.78);
+      --panel-2:rgba(10,16,24,0.72);
+      --stroke:rgba(255,255,255,.09);
+      --stroke-strong:rgba(255,255,255,.18);
+      --text:#f4f7ff;
+      --muted:rgba(244,247,255,.66);
+      --accent:#ffb454;
+      --accent-2:#67d6ff;
+      --ring: rgba(103,214,255,.35);
+      --shadow: 0 18px 34px rgba(0,0,0,.22);
+      --input-bg: rgba(9,14,22,.95);
+      --chip-bg: rgba(255,255,255,.02);
+      --btn-text: #fffaf1;
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --bg:#edf3fb;
+      --panel:rgba(255,255,255,0.88);
+      --panel-2:rgba(249,252,255,0.95);
+      --stroke:rgba(17,29,48,.12);
+      --stroke-strong:rgba(17,29,48,.22);
+      --text:#101826;
+      --muted:rgba(16,24,38,.66);
+      --accent:#dd7b1b;
+      --accent-2:#0b84c8;
+      --ring: rgba(11,132,200,.25);
+      --shadow: 0 14px 30px rgba(20,31,55,.10);
+      --input-bg: rgba(255,255,255,.96);
+      --chip-bg: rgba(255,255,255,.7);
+      --btn-text: #fff;
     }
     * { box-sizing: border-box; }
     body {
@@ -1322,54 +1886,160 @@ ANALYSIS_HTML = r"""
     }
     .wrap { max-width:1180px; margin:0 auto; padding:22px 16px 40px; }
     .top { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; }
-    .top a {
-      color:var(--text); text-decoration:none; border:1px solid var(--stroke); border-radius:10px;
-      padding:8px 10px; font-size:13px;
+    .top-actions { display:flex; align-items:center; gap:10px; flex-wrap: wrap; }
+    .nav-btn, .top a {
+      appearance:none;
+      color:var(--text);
+      text-decoration:none;
+      border:1px solid var(--stroke);
+      border-radius:12px;
+      padding:9px 12px;
+      font-size:13px;
+      font-weight:600;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.16), rgba(255,255,255,.03)),
+        var(--panel-2);
+      cursor: pointer;
+      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:8px;
+      backdrop-filter: blur(12px) saturate(135%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.08);
+    }
+    .nav-btn:hover, .top a:hover {
+      transform: translateY(-1px);
+      border-color: var(--stroke-strong);
+      box-shadow: 0 8px 16px rgba(0,0,0,.10);
+    }
+    .nav-btn:focus-visible, .top a:focus-visible {
+      outline: 2px solid var(--accent-2);
+      outline-offset: 2px;
     }
     .grid { display:grid; gap:14px; grid-template-columns: 360px 1fr; }
     .card {
-      background:var(--panel); border:1px solid var(--stroke); border-radius:14px; padding:14px;
-      box-shadow: 0 10px 24px rgba(0,0,0,.2);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.10), rgba(255,255,255,.00) 38%),
+        linear-gradient(120deg, rgba(103,214,255,.05), rgba(255,180,84,.03)),
+        var(--panel);
+      border:1px solid var(--stroke);
+      border-radius:18px;
+      padding:14px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(16px) saturate(135%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.06), var(--shadow);
     }
     .card h3 { margin:0 0 10px; font-size:13px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); }
     label { display:block; font-size:12px; color:var(--muted); margin:10px 0 6px; }
-    input, select { width:100%; border-radius:10px; border:1px solid var(--stroke); background:rgba(9,14,22,.95); color:var(--text); padding:8px 10px; }
+    input, select {
+      width:100%;
+      border-radius:12px;
+      border:1px solid var(--stroke);
+      background:var(--input-bg);
+      color:var(--text);
+      padding:9px 11px;
+      transition: border-color .16s ease, box-shadow .16s ease, background-color .16s ease;
+    }
+    input:focus, select:focus {
+      outline:none;
+      border-color: color-mix(in srgb, var(--accent-2) 55%, var(--stroke));
+      box-shadow: 0 0 0 4px var(--ring);
+    }
     .row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
     button {
-      width:100%; margin-top:12px; padding:10px 12px; border-radius:10px; border:1px solid rgba(255,180,84,.6);
-      background:linear-gradient(180deg, rgba(255,180,84,.65), rgba(255,180,84,.28)); color:var(--text); font-weight:700; cursor:pointer;
+      width:100%;
+      margin-top:12px;
+      padding:11px 12px;
+      border-radius:12px;
+      border:1px solid rgba(255,180,84,.52);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.20), rgba(255,255,255,0)),
+        linear-gradient(180deg, rgba(255,180,84,.80), rgba(255,180,84,.30));
+      color:var(--btn-text);
+      font-weight:700;
+      letter-spacing:.01em;
+      cursor:pointer;
+      box-shadow: 0 8px 18px rgba(255,180,84,.16);
+      transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
+      backdrop-filter: blur(12px) saturate(130%);
+    }
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 22px rgba(255,180,84,.22);
+      border-color: rgba(255,180,84,.75);
+    }
+    button:focus-visible {
+      outline: 2px solid var(--accent-2);
+      outline-offset: 2px;
     }
     .status { font-family:"JetBrains Mono", monospace; font-size:12px; color:var(--muted); margin-top:10px; min-height:16px; }
     .preview {
-      border-radius:12px; overflow:hidden; border:1px solid var(--stroke); background:#0a0f15; aspect-ratio:16/9;
+      border-radius:16px; overflow:hidden; border:1px solid var(--stroke); background:
+      linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,0)),
+      var(--panel-2); aspect-ratio:16/9;
       display:flex; align-items:center; justify-content:center;
     }
     .preview img { width:100%; height:100%; object-fit:contain; display:none; }
     .preview span { color:var(--muted); font-size:14px; }
     .stats { margin-top:10px; display:grid; grid-template-columns:repeat(2,1fr); gap:8px; }
-    .chip { border:1px solid var(--stroke); border-radius:999px; padding:6px 8px; font-size:12px; text-align:center; font-family:"JetBrains Mono", monospace; }
-    @media (max-width: 980px) { .grid { grid-template-columns:1fr; } }
+    .chip {
+      border:1px solid var(--stroke);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,0)),
+        var(--chip-bg);
+      border-radius:999px;
+      padding:6px 8px;
+      font-size:12px;
+      text-align:center;
+      font-family:"JetBrains Mono", monospace;
+    }
+    .result-link {
+      display:none;
+      color: var(--accent-2);
+      text-decoration: none;
+      font-weight: 600;
+      border: 1px solid var(--stroke);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.14), rgba(255,255,255,.03)),
+        var(--panel-2);
+      padding: 8px 10px;
+      border-radius: 12px;
+      backdrop-filter: blur(12px) saturate(135%);
+    }
+    .result-link:hover { border-color: var(--stroke-strong); }
+    @media (max-width: 980px) {
+      .grid { grid-template-columns:1fr; }
+      .top { align-items:flex-start; flex-direction: column; }
+    }
+    @media (max-width: 680px) {
+      .row { grid-template-columns: 1fr; }
+      .stats { grid-template-columns: 1fr; }
+      .card { padding: 12px; }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="top">
       <div>
-        <h1 style="margin:0;font-size:26px;">AI Analyse</h1>
-        <div style="color:var(--muted);font-size:13px;">Video hochladen, Crop setzen und Balltracking im Nachhinein laufen lassen.</div>
+        <h1 style="margin:0;font-size:26px;">AI Analysis</h1>
+        <div style="color:var(--muted);font-size:13px;">Upload a video, define crop/ROI, and run ball tracking after recording.</div>
       </div>
-      <a href="/">Zur Startseite</a>
+      <div class="top-actions">
+        <a class="nav-btn" href="/">Back to Home</a>
+      </div>
     </div>
     <section class="grid">
       <div class="card">
         <h3>Upload + Crop</h3>
-        <label>Video Datei</label>
+        <label>Video File</label>
         <input id="videoFile" type="file" accept="video/*"/>
         <div class="row">
           <div>
             <label>Class</label>
             <select id="classId">
-              <option value="">Auto (kein Filter)</option>
+              <option value="">Auto (no filter)</option>
             </select>
           </div>
           <div>
@@ -1409,7 +2079,7 @@ ANALYSIS_HTML = r"""
             </select>
           </div>
         </div>
-        <label>Crop X/Y/W/H (0.0 - 1.0, relativ zum Frame)</label>
+        <label>Crop X/Y/W/H (0.0 - 1.0, relative to frame)</label>
         <div class="row">
           <input id="cropX" type="number" value="0.00" step="0.01" min="0" max="1"/>
           <input id="cropY" type="number" value="0.00" step="0.01" min="0" max="1"/>
@@ -1418,12 +2088,12 @@ ANALYSIS_HTML = r"""
           <input id="cropW" type="number" value="1.00" step="0.01" min="0.05" max="1"/>
           <input id="cropH" type="number" value="1.00" step="0.01" min="0.05" max="1"/>
         </div>
-        <button id="startBtn">Analyse Starten</button>
+        <button id="startBtn">Start Analysis</button>
         <div class="status" id="line">idle</div>
       </div>
       <div class="card">
         <h3>Tracking Preview</h3>
-        <div class="preview"><img id="stream" alt="analysis stream"/><span id="streamHint">Noch keine Session gestartet</span></div>
+        <div class="preview"><img id="stream" alt="analysis stream"/><span id="streamHint">No session started yet</span></div>
         <div class="stats">
           <div class="chip" id="stState">state:-</div>
           <div class="chip" id="stProg">progress:0%</div>
@@ -1437,12 +2107,33 @@ ANALYSIS_HTML = r"""
           <div class="chip" id="stSeen">last seen:-</div>
         </div>
         <div style="margin-top:12px;">
-          <a id="resultLink" href="#" style="display:none;color:#9fe2ff;">Ergebnis MP4 herunterladen</a>
+          <a id="resultLink" class="result-link" href="#">Download Result MP4</a>
         </div>
       </div>
     </section>
   </div>
   <script>
+    (() => {
+      const KEY = "ballscope-theme";
+      const root = document.documentElement;
+      const media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+      const normalize = (value) => (value === "light" || value === "dark" || value === "system") ? value : "system";
+      const getPref = () => normalize(localStorage.getItem(KEY));
+      const resolve = (pref) => pref === "system" ? ((media && media.matches) ? "light" : "dark") : pref;
+      const apply = () => {
+        const pref = getPref();
+        root.setAttribute("data-theme", resolve(pref));
+        root.setAttribute("data-theme-pref", pref);
+      };
+      if (!localStorage.getItem(KEY)) localStorage.setItem(KEY, "system");
+      apply();
+      if (media) {
+        const onMediaChange = () => { if (getPref() === "system") apply(); };
+        if (typeof media.addEventListener === "function") media.addEventListener("change", onMediaChange);
+        else if (typeof media.addListener === "function") media.addListener(onMediaChange);
+      }
+    })();
+
     const $ = (id) => document.getElementById(id);
     let sid = null;
     let timer = null;
@@ -1458,7 +2149,7 @@ ANALYSIS_HTML = r"""
         sel.innerHTML = "";
         const autoOpt = document.createElement("option");
         autoOpt.value = "";
-        autoOpt.textContent = "Auto (kein Filter)";
+        autoOpt.textContent = "Auto (no filter)";
         sel.appendChild(autoOpt);
         const classes = j.classes || [];
         let sportsBallId = "";
@@ -1532,12 +2223,12 @@ ANALYSIS_HTML = r"""
         if (j.running) {
           const speedTxt = j.speed_up ? "speed-up:on" : "speed-up:off";
           const tuneTxt = `imgsz:${j.imgsz || "-"}, detectEvery:${j.detect_every || "-"}`;
-          $("line").textContent = `Analyse läuft ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 1} Stream(s), ${j.device_used || "auto"}, ${speedTxt}, ${tuneTxt})`;
+          $("line").textContent = `Analysis running ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 1} stream(s), ${j.device_used || "auto"}, ${speedTxt}, ${tuneTxt})`;
         }
         if (j.output_url && j.state === "done") {
           $("resultLink").href = j.output_url;
           $("resultLink").style.display = "inline-block";
-          $("line").textContent = "Analyse fertig - MP4 bereit";
+          $("line").textContent = "Analysis finished - MP4 ready";
         }
         if (j.last_error) $("line").textContent = `error: ${j.last_error}`;
       } catch (e) {}
@@ -1546,7 +2237,7 @@ ANALYSIS_HTML = r"""
     $("startBtn").onclick = async () => {
       const file = $("videoFile").files[0];
       if (!file) {
-        $("line").textContent = "Bitte zuerst ein Video auswählen.";
+        $("line").textContent = "Please select a video first.";
         return;
       }
       const params = new URLSearchParams({
@@ -1562,7 +2253,7 @@ ANALYSIS_HTML = r"""
         crop_h: $("cropH").value,
       });
       if ($("classId").value !== "") params.set("class_id", $("classId").value);
-      $("line").textContent = `Upload läuft ... (0 / ${Math.round(file.size / (1024 * 1024))} MB)`;
+      $("line").textContent = `Uploading ... (0 / ${Math.round(file.size / (1024 * 1024))} MB)`;
       try {
         const j = await new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
@@ -1574,7 +2265,7 @@ ANALYSIS_HTML = r"""
             if (!ev.lengthComputable) return;
             const up = Math.round(ev.loaded / (1024 * 1024));
             const total = Math.max(1, Math.round(ev.total / (1024 * 1024)));
-            $("line").textContent = `Upload läuft ... (${up} / ${total} MB)`;
+            $("line").textContent = `Uploading ... (${up} / ${total} MB)`;
           };
           xhr.onerror = () => reject(new Error("network error"));
           xhr.onload = () => {
@@ -1591,17 +2282,716 @@ ANALYSIS_HTML = r"""
         $("stream").src = `/video/analysis/${sid}.mjpg`;
         $("stream").style.display = "block";
         $("streamHint").style.display = "none";
-        $("line").textContent = `Analyse gestartet (${sid})`;
+        $("line").textContent = `Analysis started (${sid})`;
         if (timer) clearInterval(timer);
         timer = setInterval(poll, 350);
       } catch (e) {
-        $("line").textContent = "Upload/Start fehlgeschlagen.";
+        $("line").textContent = "Upload/start failed.";
       }
     };
 
     $("modelPath").onchange = loadClasses;
     loadModels();
     loadDevices();
+  </script>
+</body>
+</html>
+"""
+
+
+LIVE_HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>BallScope - Live</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Rubik:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+    :root {
+      color-scheme: dark;
+      --bg: #0c1218;
+      --panel: rgba(17,24,39,0.72);
+      --panel-2: rgba(10,15,24,0.78);
+      --stroke: rgba(255,255,255,0.09);
+      --stroke-strong: rgba(255,255,255,0.18);
+      --text: #f6f8ff;
+      --muted: rgba(246,248,255,0.66);
+      --accent: #ffb454;
+      --accent-2: #68d7ff;
+      --ok: #7dffb3;
+      --warn: #ffcf5d;
+      --ring: rgba(104,215,255,0.28);
+      --shadow: 0 16px 34px rgba(0,0,0,0.2);
+      --input-bg: rgba(8,12,18,0.92);
+      --chip-bg: rgba(255,255,255,0.03);
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --bg: #ecf3fb;
+      --panel: rgba(255,255,255,0.88);
+      --panel-2: rgba(247,251,255,0.95);
+      --stroke: rgba(20,32,52,0.12);
+      --stroke-strong: rgba(20,32,52,0.22);
+      --text: #101826;
+      --muted: rgba(16,24,38,0.66);
+      --accent: #dd7c1c;
+      --accent-2: #0b86cc;
+      --ok: #149c62;
+      --warn: #c58b16;
+      --ring: rgba(11,134,204,0.22);
+      --shadow: 0 12px 28px rgba(20,31,55,0.10);
+      --input-bg: rgba(255,255,255,0.96);
+      --chip-bg: rgba(255,255,255,0.8);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Rubik", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(900px 520px at 10% -12%, rgba(104,215,255,0.18), transparent),
+        radial-gradient(800px 560px at 92% -20%, rgba(255,180,84,0.14), transparent),
+        linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)),
+        var(--bg);
+    }
+    .wrap { max-width: 1320px; margin: 0 auto; padding: 22px 14px 40px; }
+    .top {
+      display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px;
+    }
+    .brand h1 { margin: 0; font-size: 28px; letter-spacing: -0.02em; }
+    .brand .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .top-actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .nav-btn {
+      appearance:none; border:1px solid var(--stroke); color:var(--text); text-decoration:none; cursor:pointer;
+      border-radius:12px; padding:9px 12px; font-size:13px; font-weight:600;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0.03)),
+        var(--panel-2);
+      backdrop-filter: blur(12px) saturate(135%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+      display:inline-flex; align-items:center; gap:8px;
+    }
+    .nav-btn:hover { transform: translateY(-1px); border-color: var(--stroke-strong); box-shadow: inset 0 1px 0 rgba(255,255,255,0.1), 0 8px 16px rgba(0,0,0,0.10); }
+    .nav-btn:focus-visible { outline:2px solid var(--accent-2); outline-offset:2px; }
+    .badge { display:inline-flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
+    .dot { width:10px; height:10px; border-radius:50%; background:var(--warn); }
+    .dot.ok { background: var(--ok); }
+
+    .layout { display:grid; grid-template-columns: minmax(0, 1.6fr) minmax(340px, .9fr); gap: 14px; }
+    .stack { display:grid; gap:14px; }
+    .card {
+      border:1px solid var(--stroke);
+      border-radius:18px;
+      padding:14px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0) 38%),
+        linear-gradient(120deg, rgba(104,215,255,0.05), rgba(255,180,84,0.03)),
+        var(--panel);
+      backdrop-filter: blur(16px) saturate(135%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), var(--shadow);
+    }
+    .card h3 {
+      margin: 0 0 10px; font-size: 12px; letter-spacing: .18em; text-transform: uppercase; color: var(--muted);
+    }
+    .stage-head {
+      display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap;
+    }
+    .btn-row { display:flex; gap:8px; flex-wrap:wrap; }
+    .btn {
+      appearance:none; cursor:pointer; border-radius:12px; border:1px solid var(--stroke); padding:10px 12px;
+      color: var(--text);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.14), rgba(255,255,255,.03)),
+        var(--panel-2);
+      backdrop-filter: blur(12px) saturate(130%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.07);
+      font: 600 13px/1 "Rubik", sans-serif;
+      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+    }
+    .btn:hover { transform: translateY(-1px); border-color: var(--stroke-strong); box-shadow: inset 0 1px 0 rgba(255,255,255,.1), 0 8px 16px rgba(0,0,0,.08); }
+    .btn.primary {
+      border-color: rgba(255,180,84,.52);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.22), rgba(255,255,255,0)),
+        linear-gradient(180deg, rgba(255,180,84,.80), rgba(255,180,84,.30));
+      color: #fffaf1;
+      box-shadow: 0 10px 20px rgba(255,180,84,.16);
+    }
+    .btn.primary:hover { border-color: rgba(255,180,84,.75); box-shadow: 0 12px 24px rgba(255,180,84,.22); }
+    .btn:focus-visible { outline:2px solid var(--accent-2); outline-offset:2px; }
+
+    .stage {
+      border-radius: 16px;
+      border: 1px solid var(--stroke);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,0)),
+        var(--panel-2);
+      padding: 10px;
+    }
+    .frame {
+      border-radius: 14px; overflow:hidden; border:1px solid var(--stroke);
+      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,0)), var(--panel-2);
+      position: relative;
+    }
+    .frame.main { aspect-ratio: 16/9; }
+    .frame.side { aspect-ratio: 16/9; }
+    .frame img { width:100%; height:100%; object-fit: cover; display:block; }
+    .frame img.fit { object-fit: contain; }
+    .label-chip {
+      position:absolute; top:8px; left:8px; z-index:2;
+      border-radius:999px; padding:5px 8px; font-size:11px;
+      border:1px solid var(--stroke);
+      background: linear-gradient(180deg, rgba(255,255,255,.14), rgba(255,255,255,.03)), var(--chip-bg);
+      backdrop-filter: blur(10px) saturate(130%);
+      color: var(--text);
+      font-family: "JetBrains Mono", monospace;
+    }
+    .meta { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+    .chip {
+      border:1px solid var(--stroke);
+      background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,0)), var(--chip-bg);
+      border-radius:999px; padding:5px 9px; font-size:11px; color:var(--muted);
+      font-family: "JetBrains Mono", monospace;
+    }
+    .statusline { margin-top: 10px; color: var(--muted); font-size: 12px; min-height: 18px; font-family: "JetBrains Mono", monospace; }
+
+    label { display:block; font-size:12px; color:var(--muted); margin-bottom:6px; }
+    input, select {
+      width:100%; padding:9px 11px; border-radius:12px; border:1px solid var(--stroke);
+      background: var(--input-bg); color:var(--text); font-size:13px;
+      transition: border-color .16s ease, box-shadow .16s ease;
+    }
+    input:focus, select:focus { outline:none; border-color: color-mix(in srgb, var(--accent-2) 55%, var(--stroke)); box-shadow: 0 0 0 4px var(--ring); }
+    .row { display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px; }
+    .row3 { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:10px; }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+
+    @media (max-width: 1120px) { .layout { grid-template-columns: 1fr; } }
+    @media (max-width: 720px) {
+      .wrap { padding: 14px 10px 30px; }
+      .top { align-items: flex-start; flex-direction: column; }
+      .row, .row3 { grid-template-columns: 1fr; }
+      .btn-row .btn { width: 100%; justify-content: center; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">
+        <h1>BallScope Live</h1>
+        <div class="sub">Live browser preview with ball tracking, auto camera selection, and zoom. No recording.</div>
+      </div>
+      <div class="top-actions">
+        <a class="nav-btn" href="/">Back to Home</a>
+        <div class="badge"><span class="dot" id="systemDot"></span><span id="systemStatus">Booting</span></div>
+      </div>
+    </div>
+
+    <section class="layout">
+      <div class="stack">
+        <div class="card">
+          <div class="stage-head">
+            <h3 style="margin:0;">Live Preview</h3>
+            <span class="chip" id="previewModeChip">preview:auto-zoom</span>
+          </div>
+
+          <div class="stage" id="liveStage">
+            <div class="frame main">
+              <span class="label-chip" id="previewLabel">Final / Auto Zoom</span>
+              <img id="liveMainImg" class="fit" src="" alt="Live preview">
+            </div>
+          </div>
+
+          <div class="btn-row" style="margin-top:10px;">
+            <button type="button" class="btn primary" id="liveStart">Start Live Tracking</button>
+            <button type="button" class="btn" id="liveStop">Stop Live</button>
+            <button type="button" class="btn" id="fsBtn">Fullscreen</button>
+          </div>
+          <div class="statusline" id="liveStatusLine">idle</div>
+          <div class="meta">
+            <div class="chip" id="aiState">state:-</div>
+            <div class="chip" id="aiMode">mode:-</div>
+            <div class="chip" id="aiActive">active:-</div>
+            <div class="chip" id="aiFps">fps:0.0</div>
+            <div class="chip" id="aiConfStat">conf:0.00</div>
+            <div class="chip" id="aiSeen">last_seen:-</div>
+            <div class="chip" id="camLStatus">camL:-</div>
+            <div class="chip" id="camRStatus">camR:-</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="stack">
+        <div class="card">
+          <h3>Live AI Controls</h3>
+          <div class="row">
+            <div>
+              <label>Camera Selection</label>
+              <select id="aiActiveInput">
+                <option value="auto">Auto (pick best)</option>
+                <option value="camL">Force Left</option>
+                <option value="camR">Force Right</option>
+              </select>
+            </div>
+            <div>
+              <label>Model</label>
+              <select id="modelPath"></select>
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div>
+              <label>Class</label>
+              <select id="classId">
+                <option value="">Auto (no filter)</option>
+              </select>
+            </div>
+            <div>
+              <label>Device</label>
+              <select id="deviceSel"><option value="auto">Auto</option></select>
+            </div>
+          </div>
+          <div class="row3" style="margin-top:10px;">
+            <div>
+              <label>Confidence</label>
+              <input id="aiConfInput" type="number" step="0.01" min="0" max="1" value="0.35"/>
+            </div>
+            <div>
+              <label>IOU</label>
+              <input id="aiIouInput" type="number" step="0.01" min="0" max="1" value="0.5"/>
+            </div>
+            <div>
+              <label>Image Size</label>
+              <input id="aiImgsz" type="number" step="32" min="256" max="1280" value="640"/>
+            </div>
+          </div>
+          <div class="row3" style="margin-top:10px;">
+            <div>
+              <label>Zoom</label>
+              <input id="aiZoomInput" type="number" step="0.1" min="1" max="5" value="1.6"/>
+            </div>
+            <div>
+              <label>Smooth</label>
+              <input id="aiSmoothInput" type="number" step="0.05" min="0" max="0.99" value="0.85"/>
+            </div>
+            <div>
+              <label>Lost Hold (sec)</label>
+              <input id="aiLostHold" type="number" step="0.1" min="0" max="10" value="1.5"/>
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div>
+              <label>Detect Every N Frames</label>
+              <input id="aiDetectEvery" type="number" min="1" max="30" value="1"/>
+            </div>
+            <div>
+              <label>View Mode</label>
+              <select id="viewModeSelect">
+                <option value="auto">Auto Zoom</option>
+                <option value="left">Left Camera</option>
+                <option value="right">Right Camera</option>
+              </select>
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div>
+              <label>Preview Quality</label>
+              <select id="previewQuality">
+                <option value="high">High (sharper)</option>
+                <option value="balanced" selected>Balanced</option>
+                <option value="fast">Fast (higher UI FPS)</option>
+              </select>
+            </div>
+            <div>
+              <label>Preview Source</label>
+              <div class="hint" style="margin-top:8px;">Affects browser preview only</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Camera Tuning</h3>
+          <div class="row">
+            <div>
+              <label>Camera</label>
+              <select id="camSelect">
+                <option value="camL">Camera Left</option>
+                <option value="camR">Camera Right</option>
+              </select>
+            </div>
+            <div>
+              <label>Preset</label>
+              <select id="camPreset"></select>
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div>
+              <label>Source (Device)</label>
+              <input id="camSource" type="text" placeholder="/dev/video0 or 0"/>
+            </div>
+            <div>
+              <label>Apply</label>
+              <div class="hint" style="margin-top:8px;">Use `0/1` on Mac, `/dev/video*` on Jetson</div>
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div>
+              <label>Brightness</label>
+              <input id="camBrightness" type="number"/>
+            </div>
+            <div>
+              <label>Contrast</label>
+              <input id="camContrast" type="number"/>
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div>
+              <label>Saturation</label>
+              <input id="camSaturation" type="number"/>
+            </div>
+            <div>
+              <label>Gain</label>
+              <input id="camGain" type="number"/>
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div>
+              <label>Auto WB</label>
+              <select id="camAutoWb">
+                <option value="">Keep</option>
+                <option value="true">On</option>
+                <option value="false">Off</option>
+              </select>
+            </div>
+            <div>
+              <label>Auto Exposure</label>
+              <select id="camAutoExp">
+                <option value="">Keep</option>
+                <option value="true">On</option>
+                <option value="false">Off</option>
+              </select>
+            </div>
+          </div>
+          <div class="btn-row" style="margin-top:10px;">
+            <button type="button" class="btn" id="camApply">Apply Camera Settings</button>
+          </div>
+          <div class="statusline" id="camStatusLine">idle</div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    (() => {
+      const KEY = "ballscope-theme";
+      const root = document.documentElement;
+      const media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+      const normalize = (value) => (value === "light" || value === "dark" || value === "system") ? value : "system";
+      const getPref = () => normalize(localStorage.getItem(KEY));
+      const resolve = (pref) => pref === "system" ? ((media && media.matches) ? "light" : "dark") : pref;
+      const apply = () => {
+        const pref = getPref();
+        root.setAttribute("data-theme", resolve(pref));
+        root.setAttribute("data-theme-pref", pref);
+      };
+      if (!localStorage.getItem(KEY)) localStorage.setItem(KEY, "system");
+      apply();
+      if (media) {
+        const onMediaChange = () => { if (getPref() === "system") apply(); };
+        if (typeof media.addEventListener === "function") media.addEventListener("change", onMediaChange);
+        else if (typeof media.addListener === "function") media.addListener(onMediaChange);
+      }
+    })();
+
+    const $ = (id) => document.getElementById(id);
+    const fetchJSON = async (url, opts = {}) => {
+      const res = await fetch(url, Object.assign({ headers: { "Content-Type": "application/json" } }, opts));
+      if (!res.ok) throw new Error(await res.text());
+      return await res.json();
+    };
+
+    let lastState = null;
+    let pollTimer = null;
+    let viewMode = "auto";
+    let currentPreviewKey = "";
+    let streamNonce = 0;
+
+    const streamForView = (mode) => {
+      const profile = $("previewQuality")?.value || "balanced";
+      const qp = `profile=${encodeURIComponent(profile)}`;
+      const aiRunning = !!(lastState && lastState.ai && lastState.ai.running);
+
+      if (mode === "left") {
+        return {
+          url: `/video/live/cam/camL.mjpg?${qp}`,
+          label: "Camera Left",
+          fit: false,
+          chip: `preview:left/${profile}`,
+        };
+      }
+      if (mode === "right") {
+        return {
+          url: `/video/live/cam/camR.mjpg?${qp}`,
+          label: "Camera Right",
+          fit: false,
+          chip: `preview:right/${profile}`,
+        };
+      }
+
+      if (aiRunning) {
+        return {
+          url: `/video/live/final.mjpg?${qp}`,
+          label: "Final / Auto Zoom",
+          fit: true,
+          chip: `preview:auto-zoom/${profile}`,
+        };
+      }
+
+      const fallbackCam = ($("aiActiveInput")?.value === "camR") ? "camR" : "camL";
+      return {
+        url: `/video/live/cam/${fallbackCam}.mjpg?${qp}`,
+        label: `Preview (${fallbackCam === "camR" ? "Camera Right" : "Camera Left"}) / AI Off`,
+        fit: false,
+        chip: `preview:camera/${profile}`,
+      };
+    };
+
+    const refreshMainStream = (force = false) => {
+      const img = $("liveMainImg");
+      if (!img) return;
+      const spec = streamForView(viewMode);
+      $("previewLabel").textContent = spec.label;
+      $("previewModeChip").textContent = spec.chip;
+      img.classList.toggle("fit", !!spec.fit);
+      const nextKey = `${spec.url}|${spec.fit ? "fit" : "cover"}`;
+      if (!force && nextKey === currentPreviewKey) return;
+      currentPreviewKey = nextKey;
+      img.src = "";
+      streamNonce += 1;
+      const sep = spec.url.includes("?") ? "&" : "?";
+      img.src = `${spec.url}${sep}v=${streamNonce}`;
+    };
+
+    const applyViewMode = (mode) => {
+      viewMode = (mode === "left" || mode === "right") ? mode : "auto";
+      $("viewModeSelect").value = viewMode;
+      refreshMainStream();
+    };
+
+    const loadModels = async () => {
+      try {
+        const r = await fetch("/api/analysis/models");
+        if (!r.ok) return;
+        const j = await r.json();
+        const sel = $("modelPath");
+        sel.innerHTML = "";
+        for (const m of (j.models || [])) {
+          const opt = document.createElement("option");
+          opt.value = m;
+          opt.textContent = m;
+          sel.appendChild(opt);
+        }
+        if (j.default && [...sel.options].some(o => o.value === j.default)) sel.value = j.default;
+        await loadClasses();
+      } catch (e) {}
+    };
+
+    const loadClasses = async () => {
+      const modelPath = $("modelPath").value || "models/football-ball-detection.pt";
+      try {
+        const r = await fetch(`/api/analysis/classes?model_path=${encodeURIComponent(modelPath)}`);
+        if (!r.ok) return;
+        const j = await r.json();
+        const sel = $("classId");
+        const cur = sel.value;
+        sel.innerHTML = "";
+        const autoOpt = document.createElement("option");
+        autoOpt.value = "";
+        autoOpt.textContent = "Auto (no filter)";
+        sel.appendChild(autoOpt);
+        let sportsBallId = "";
+        for (const c of (j.classes || [])) {
+          const opt = document.createElement("option");
+          opt.value = String(c.id);
+          opt.textContent = `${c.id}: ${c.label}`;
+          if ((c.label || "").toLowerCase() === "sports ball") sportsBallId = String(c.id);
+          sel.appendChild(opt);
+        }
+        if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+        else if (sportsBallId) sel.value = sportsBallId;
+      } catch (e) {}
+    };
+
+    const loadDevices = async () => {
+      try {
+        const r = await fetch("/api/analysis/devices");
+        if (!r.ok) return;
+        const j = await r.json();
+        const sel = $("deviceSel");
+        const cur = sel.value;
+        sel.innerHTML = "";
+        for (const d of (j.devices || [])) {
+          const opt = document.createElement("option");
+          opt.value = d.id;
+          opt.textContent = d.label;
+          sel.appendChild(opt);
+        }
+        if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+        else if ([...sel.options].some(o => o.value === (j.default || "auto"))) sel.value = (j.default || "auto");
+      } catch (e) {}
+    };
+
+    const updateState = (st) => {
+      lastState = st;
+      $("systemDot").className = "dot ok";
+      $("systemStatus").textContent = "Online";
+
+      if ($("camPreset").options.length === 0) {
+        for (const k of Object.keys(st.presets || {})) {
+          const opt = document.createElement("option");
+          opt.value = k;
+          opt.textContent = k;
+          $("camPreset").appendChild(opt);
+        }
+        $("camPreset").value = st.defaults.preset || "1080p60";
+      }
+
+      const camL = st.cameras?.camL;
+      const camR = st.cameras?.camR;
+      if (camL) $("camLStatus").textContent = camL.is_open ? `camL:${camL.fps.toFixed(1)}fps` : "camL:offline";
+      if (camR) $("camRStatus").textContent = camR.is_open ? `camR:${camR.fps.toFixed(1)}fps` : "camR:offline";
+
+      const ai = st.ai || {};
+      $("aiState").textContent = `state:${ai.state || "idle"}`;
+      $("aiMode").textContent = `mode:${ai.mode || "auto"}`;
+      $("aiActive").textContent = `active:${ai.active_camera || "-"}`;
+      $("aiFps").textContent = `fps:${(ai.fps || 0).toFixed(1)}`;
+      $("aiConfStat").textContent = `conf:${(ai.last_conf || 0).toFixed(2)}`;
+      $("aiSeen").textContent = `last_seen:${ai.last_seen_sec == null ? "-" : Number(ai.last_seen_sec).toFixed(2) + "s"}`;
+
+      const aiCfg = st.ai_config || {};
+      const setIfInit = (id, value) => {
+        const el = $(id);
+        if (!el || el.dataset.init) return;
+        if (value != null && value !== "") el.value = value;
+        el.dataset.init = "1";
+      };
+      setIfInit("aiConfInput", aiCfg.conf);
+      setIfInit("aiIouInput", aiCfg.iou);
+      setIfInit("aiZoomInput", aiCfg.zoom);
+      setIfInit("aiSmoothInput", aiCfg.smooth);
+      setIfInit("aiLostHold", aiCfg.lost_hold_sec);
+      setIfInit("aiDetectEvery", aiCfg.detect_every);
+      setIfInit("aiImgsz", aiCfg.imgsz);
+      setIfInit("deviceSel", aiCfg.device || "auto");
+      if (!$("camSource").dataset.init) {
+        const selCam = $("camSelect").value || "camL";
+        const camState = st.cameras[selCam];
+        if (camState) $("camSource").value = camState.src || "";
+        $("camSource").dataset.init = "1";
+      }
+
+      const running = !!ai.running;
+      $("liveStatusLine").textContent = running
+        ? `live tracking running | active=${ai.active_camera || "-"} | state=${ai.state || "-"} | fps=${(ai.fps || 0).toFixed(1)}`
+        : "live stopped";
+      refreshMainStream();
+    };
+
+    const pollState = async () => {
+      try {
+        const st = await fetchJSON("/api/state");
+        updateState(st);
+      } catch (e) {}
+    };
+
+    const startLoop = () => {
+      if (pollTimer) clearInterval(pollTimer);
+      pollState();
+      pollTimer = setInterval(pollState, 1000);
+    };
+
+    $("liveStart").onclick = async () => {
+      const payload = {
+        active_camera: $("aiActiveInput").value,
+        conf: $("aiConfInput").value,
+        iou: $("aiIouInput").value,
+        device: $("deviceSel").value,
+        imgsz: $("aiImgsz").value,
+        zoom: $("aiZoomInput").value,
+        smooth: $("aiSmoothInput").value,
+        lost_hold_sec: $("aiLostHold").value,
+        detect_every: $("aiDetectEvery").value,
+        model_path: $("modelPath").value,
+      };
+      if ($("classId").value !== "") payload.class_id = $("classId").value;
+      try {
+        await fetchJSON("/api/ai/start", { method: "POST", body: JSON.stringify(payload) });
+        $("liveStatusLine").textContent = "starting live tracking ...";
+        await pollState();
+      } catch (e) {
+        $("liveStatusLine").textContent = "live start failed";
+      }
+    };
+
+    $("liveStop").onclick = async () => {
+      try {
+        await fetchJSON("/api/ai/stop", { method: "POST" });
+        $("liveStatusLine").textContent = "live stopped";
+      } catch (e) {
+        $("liveStatusLine").textContent = "live stop failed";
+      }
+    };
+
+    $("camApply").onclick = async () => {
+      const camId = $("camSelect").value;
+      const payload = {
+        src: $("camSource").value,
+        preset: $("camPreset").value,
+        brightness: $("camBrightness").value ? parseInt($("camBrightness").value) : null,
+        contrast: $("camContrast").value ? parseInt($("camContrast").value) : null,
+        saturation: $("camSaturation").value ? parseInt($("camSaturation").value) : null,
+        gain: $("camGain").value ? parseInt($("camGain").value) : null,
+      };
+      if ($("camAutoWb").value !== "") payload.auto_wb = $("camAutoWb").value === "true";
+      if ($("camAutoExp").value !== "") payload.auto_exposure = $("camAutoExp").value === "true";
+      try {
+        await fetchJSON(`/api/settings/${camId}`, { method: "POST", body: JSON.stringify(payload) });
+        $("camStatusLine").textContent = "camera settings applied";
+      } catch (e) {
+        $("camStatusLine").textContent = "camera settings failed";
+      }
+    };
+
+    $("camSelect").onchange = () => {
+      if (!lastState) return;
+      const camState = lastState.cameras?.[$("camSelect").value];
+      if (camState) $("camSource").value = camState.src || "";
+    };
+
+    $("modelPath").onchange = loadClasses;
+
+    $("viewModeSelect").onchange = (ev) => applyViewMode(ev.target.value);
+    $("previewQuality").onchange = () => refreshMainStream(true);
+    $("aiActiveInput").onchange = () => {
+      if (!(lastState && lastState.ai && lastState.ai.running) && viewMode === "auto") refreshMainStream(true);
+    };
+
+    $("fsBtn").onclick = async () => {
+      const el = $("liveStage");
+      try {
+        if (document.fullscreenElement) await document.exitFullscreen();
+        else if (el.requestFullscreen) await el.requestFullscreen();
+      } catch (e) {}
+    };
+
+    applyViewMode("auto");
+    loadModels();
+    loadDevices();
+    startLoop();
   </script>
 </body>
 </html>
@@ -1618,15 +3008,46 @@ RECORD_HTML = r"""
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Rubik:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
     :root {
+      color-scheme: dark;
       --bg: #0c1217;
+      --bg-2: #0f1821;
       --panel: rgba(17, 24, 39, 0.7);
+      --panel-solid: rgba(12, 17, 26, 0.82);
       --stroke: rgba(255,255,255,0.08);
+      --stroke-strong: rgba(255,255,255,0.16);
       --accent: #ffb454;
       --accent-2: #68d7ff;
       --text: #f5f7ff;
       --muted: rgba(245,247,255,0.65);
       --ok: #7dffb3;
       --warn: #ffcf5d;
+      --danger: #ff8f8f;
+      --shadow: 0 12px 30px rgba(0,0,0,0.22);
+      --ring: rgba(104,215,255,0.32);
+      --input-bg: rgba(9, 12, 18, 0.9);
+      --chip-bg: rgba(255,255,255,0.02);
+      --btn-text: #fffaf1;
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --bg: #edf4fb;
+      --bg-2: #dfeaf8;
+      --panel: rgba(255, 255, 255, 0.88);
+      --panel-solid: rgba(251, 253, 255, 0.95);
+      --stroke: rgba(20, 32, 52, 0.11);
+      --stroke-strong: rgba(20, 32, 52, 0.22);
+      --accent: #dd7c1c;
+      --accent-2: #0b86cc;
+      --text: #101826;
+      --muted: rgba(16, 24, 38, 0.64);
+      --ok: #149c62;
+      --warn: #c58b16;
+      --danger: #d14b4b;
+      --shadow: 0 10px 26px rgba(20,31,55,0.10);
+      --ring: rgba(11, 134, 204, 0.22);
+      --input-bg: rgba(255,255,255,0.96);
+      --chip-bg: rgba(255,255,255,0.8);
+      --btn-text: #ffffff;
     }
     * { box-sizing: border-box; }
     body {
@@ -1635,7 +3056,8 @@ RECORD_HTML = r"""
       color: var(--text);
       background: radial-gradient(900px 500px at 15% -10%, rgba(104,215,255,0.2), transparent),
                   radial-gradient(800px 600px at 90% -20%, rgba(255,180,84,0.15), transparent),
-                  #0b1116;
+                  linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)),
+                  var(--bg);
       min-height: 100vh;
     }
     .wrap {
@@ -1649,6 +3071,41 @@ RECORD_HTML = r"""
       align-items: center;
       gap: 14px;
       margin-bottom: 18px;
+    }
+    .header-actions {
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap: wrap;
+    }
+    .nav-btn {
+      appearance:none;
+      border: 1px solid var(--stroke);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0.03)),
+        var(--panel-solid);
+      color: var(--text);
+      text-decoration: none;
+      border-radius: 12px;
+      padding: 9px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      cursor:pointer;
+      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+      backdrop-filter: blur(12px) saturate(135%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+    }
+    .nav-btn:hover {
+      transform: translateY(-1px);
+      border-color: var(--stroke-strong);
+      box-shadow: 0 8px 16px rgba(0,0,0,0.10);
+    }
+    .nav-btn:focus-visible {
+      outline: 2px solid var(--accent-2);
+      outline-offset: 2px;
     }
     h1 {
       margin: 0;
@@ -1676,12 +3133,15 @@ RECORD_HTML = r"""
       gap: 16px;
     }
     .card {
-      background: var(--panel);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0) 38%),
+        linear-gradient(120deg, rgba(104,215,255,0.05), rgba(255,180,84,0.03)),
+        var(--panel);
       border: 1px solid var(--stroke);
-      border-radius: 16px;
+      border-radius: 18px;
       padding: 16px;
-      backdrop-filter: blur(10px);
-      box-shadow: 0 10px 30px rgba(0,0,0,0.22);
+      backdrop-filter: blur(16px) saturate(135%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), var(--shadow);
     }
     .card h3 {
       margin: 0 0 10px;
@@ -1691,10 +3151,12 @@ RECORD_HTML = r"""
       color: var(--muted);
     }
     .preview {
-      border-radius: 12px;
+      border-radius: 14px;
       overflow: hidden;
       border: 1px solid rgba(255,255,255,0.06);
-      background: #0a0f14;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0)),
+        var(--panel-solid);
       aspect-ratio: 16/9;
     }
     .preview img {
@@ -1713,6 +3175,9 @@ RECORD_HTML = r"""
     }
     .chip {
       border: 1px solid var(--stroke);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0)),
+        var(--chip-bg);
       border-radius: 999px;
       padding: 4px 10px;
       font-family: "JetBrains Mono", monospace;
@@ -1726,12 +3191,22 @@ RECORD_HTML = r"""
     }
     input, select {
       width: 100%;
-      padding: 8px 10px;
-      border-radius: 10px;
+      padding: 9px 11px;
+      border-radius: 12px;
       border: 1px solid var(--stroke);
-      background: rgba(9, 12, 18, 0.9);
+      background: var(--input-bg);
       color: var(--text);
       font-size: 13px;
+      transition: border-color .16s ease, box-shadow .16s ease, background-color .16s ease;
+    }
+    input:focus, select:focus {
+      outline: none;
+      border-color: color-mix(in srgb, var(--accent-2) 55%, var(--stroke));
+      box-shadow: 0 0 0 4px var(--ring);
+    }
+    input:disabled, select:disabled {
+      opacity: .7;
+      cursor: not-allowed;
     }
     .row {
       display: grid;
@@ -1748,14 +3223,36 @@ RECORD_HTML = r"""
       padding: 10px 14px;
       border-radius: 12px;
       border: 1px solid var(--stroke);
-      background: linear-gradient(180deg, rgba(255,255,255,0.15), rgba(255,255,255,0.05));
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0.03)),
+        var(--panel-solid);
       color: var(--text);
       font-weight: 600;
       cursor: pointer;
+      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease, background .16s ease;
+      backdrop-filter: blur(12px) saturate(130%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.07);
+    }
+    button:hover {
+      transform: translateY(-1px);
+      border-color: var(--stroke-strong);
+      box-shadow: 0 8px 16px rgba(0,0,0,0.10);
+    }
+    button:focus-visible {
+      outline: 2px solid var(--accent-2);
+      outline-offset: 2px;
     }
     button.primary {
-      background: linear-gradient(180deg, rgba(255,180,84,0.7), rgba(255,180,84,0.25));
-      border-color: rgba(255,180,84,0.6);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.22), rgba(255,255,255,0)),
+        linear-gradient(180deg, rgba(255,180,84,0.78), rgba(255,180,84,0.28));
+      border-color: rgba(255,180,84,0.56);
+      color: var(--btn-text);
+      box-shadow: 0 10px 22px rgba(255,180,84,0.18);
+    }
+    button.primary:hover {
+      border-color: rgba(255,180,84,0.76);
+      box-shadow: 0 12px 24px rgba(255,180,84,0.24);
     }
     button.ghost { background: transparent; }
     .status {
@@ -1771,6 +3268,14 @@ RECORD_HTML = r"""
     @media (max-width: 1000px) {
       .span-8, .span-4, .span-6 { grid-column: span 12; }
       header { flex-direction: column; align-items: flex-start; }
+      .header-actions { width: 100%; }
+    }
+    @media (max-width: 680px) {
+      .wrap { padding: 18px 12px 40px; }
+      .row { grid-template-columns: 1fr; }
+      .btns > button { width: 100%; }
+      .meta { gap: 8px; }
+      .card { padding: 12px; }
     }
   </style>
 </head>
@@ -1778,27 +3283,22 @@ RECORD_HTML = r"""
   <div class="wrap">
     <header>
       <div>
-        <h1>BallScope Dual Cam Ball Tracker</h1>
-        <div class="sub">YOLO on downscaled frames, auto camera selection, smart zoom output.</div>
+        <h1>BallScope Recording</h1>
+        <div class="sub">Dual-camera recording and camera tuning. AI controls are available in Live and Analysis.</div>
       </div>
-      <div class="badge"><span class="dot" id="systemDot"></span><span id="systemStatus">Booting</span></div>
+      <div class="header-actions">
+        <a class="nav-btn" href="/">Back to Home</a>
+        <div class="badge"><span class="dot" id="systemDot"></span><span id="systemStatus">Booting</span></div>
+      </div>
     </header>
 
     <section class="grid">
-      <div class="card span-8">
-        <h3>Final Output</h3>
-        <div class="preview"><img id="finalImg" src="" alt="Final output"></div>
-        <div class="meta">
-          <div class="chip" id="aiState">state</div>
-          <div class="chip" id="aiFps">fps</div>
-          <div class="chip" id="aiActive">active</div>
-          <div class="chip" id="aiConf">conf</div>
-        </div>
-      </div>
-      <div class="card span-4">
+      <div class="card span-12">
         <h3>Cameras</h3>
-        <div class="preview" style="aspect-ratio: 4/3; margin-bottom: 10px;"><img id="camLImg" src="" alt="Cam Left"></div>
-        <div class="preview" style="aspect-ratio: 4/3;"><img id="camRImg" src="" alt="Cam Right"></div>
+        <div class="row">
+          <div class="preview" style="aspect-ratio: 4/3;"><img id="camLImg" src="" alt="Cam Left"></div>
+          <div class="preview" style="aspect-ratio: 4/3;"><img id="camRImg" src="" alt="Cam Right"></div>
+        </div>
         <div class="meta">
           <div class="chip" id="camLStatus">camL</div>
           <div class="chip" id="camRStatus">camR</div>
@@ -1807,119 +3307,8 @@ RECORD_HTML = r"""
     </section>
 
     <section class="grid" style="margin-top: 16px;">
-      <div class="card span-6">
-        <h3>AI Controls</h3>
-        <div class="row">
-          <div>
-            <label>Active Camera</label>
-            <select id="aiActiveInput">
-              <option value="auto">Auto</option>
-              <option value="camL">Camera Left</option>
-              <option value="camR">Camera Right</option>
-            </select>
-          </div>
-          <div>
-            <label>Confidence</label>
-            <input id="aiConfInput" type="number" step="0.05" min="0" max="1" value="0.35" />
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <div>
-            <label>Zoom</label>
-            <input id="aiZoomInput" type="number" step="0.1" min="1" max="4" value="1.6" />
-          </div>
-          <div>
-            <label>IOU</label>
-            <input id="aiIouInput" type="number" step="0.05" min="0" max="1" value="0.5" />
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <div>
-            <label>Zoom Enabled</label>
-            <select id="aiZoomEnabled">
-              <option value="true">On</option>
-              <option value="false">Off</option>
-            </select>
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <div>
-            <label>Smooth</label>
-            <input id="aiSmoothInput" type="number" step="0.05" min="0" max="0.99" value="0.85" />
-          </div>
-          <div>
-            <label>Lost Hold (sec)</label>
-            <input id="aiLostHold" type="number" step="0.1" min="0" max="10" value="1.5" />
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <div>
-            <label>Model Path</label>
-            <input id="aiModelPath" type="text" value="models/football-ball-detection.pt" />
-          </div>
-          <div>
-            <label>Class ID</label>
-            <input id="aiClassId" type="number" min="0" max="50" value="0" />
-          </div>
-        </div>
-        <div class="btns">
-          <button class="primary" id="aiStart">Start AI</button>
-          <button class="ghost" id="aiStop">Stop</button>
-        </div>
-        <div class="status" id="aiStatusLine">idle</div>
-      </div>
-
-      
-      <div class="card span-6">
-        <h3>System</h3>
-        <div class="row">
-          <div>
-            <label>Detect Every N Frames</label>
-            <input id="aiDetectEvery" type="number" min="1" max="30" value="5" />
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <div>
-            <label>Output Dir</label>
-            <input id="sysOutputDir" type="text" placeholder="recordings" />
-          </div>
-          <div>
-            <label>FPS</label>
-            <input id="sysFps" type="number" step="1" min="60" max="60" value="60" disabled />
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <div>
-            <label>Mic (Audio)</label>
-            <select id="audioDevice"></select>
-          </div>
-          <div>
-            <label>Audio Bitrate</label>
-            <select id="audioBitrate">
-              <option value="32000">32 kbps (low)</option>
-              <option value="64000" selected>64 kbps</option>
-              <option value="96000">96 kbps</option>
-            </select>
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <div>
-            <label>Container</label>
-            <select id="videoContainer">
-              <option value="mkv">MKV (Audio in same file)</option>
-              <option value="avi">AVI (Audio separate MP3)</option>
-            </select>
-          </div>
-        </div>
-        <div class="btns">
-          <button class="primary" id="sysStart">Start (AI + Record)</button>
-          <button class="ghost" id="sysStop">System Stop</button>
-        </div>
-        <div class="status" id="sysStatus">idle</div>
-      </div>
-
-      <div class="card span-6">
-        <h3>Normal Recording (No AI)</h3>
+      <div class="card span-12">
+        <h3>Recording</h3>
         <div class="row">
           <div>
             <label>Camera</label>
@@ -1958,9 +3347,10 @@ RECORD_HTML = r"""
           </div>
         </div>
         <div class="btns">
-          <button class="primary" id="rawStart">Start Normal Record</button>
+          <button class="primary" id="rawStart">Start Recording</button>
           <button class="ghost" id="rawStop">Stop</button>
         </div>
+        <div class="status" id="rawStatusLine">idle</div>
       </div>
 
       <div class="card span-12">
@@ -2035,6 +3425,27 @@ RECORD_HTML = r"""
   </div>
 
   <script>
+    (() => {
+      const KEY = "ballscope-theme";
+      const root = document.documentElement;
+      const media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+      const normalize = (value) => (value === "light" || value === "dark" || value === "system") ? value : "system";
+      const getPref = () => normalize(localStorage.getItem(KEY));
+      const resolve = (pref) => pref === "system" ? ((media && media.matches) ? "light" : "dark") : pref;
+      const apply = () => {
+        const pref = getPref();
+        root.setAttribute("data-theme", resolve(pref));
+        root.setAttribute("data-theme-pref", pref);
+      };
+      if (!localStorage.getItem(KEY)) localStorage.setItem(KEY, "system");
+      apply();
+      if (media) {
+        const onMediaChange = () => { if (getPref() === "system") apply(); };
+        if (typeof media.addEventListener === "function") media.addEventListener("change", onMediaChange);
+        else if (typeof media.addListener === "function") media.addListener(onMediaChange);
+      }
+    })();
+
     const fetchJSON = async (url, opts = {}) => {
       const res = await fetch(url, Object.assign({ headers: { "Content-Type": "application/json" } }, opts));
       if (!res.ok) throw new Error(await res.text());
@@ -2059,67 +3470,18 @@ RECORD_HTML = r"""
         $("camPreset").value = st.defaults.preset || "1080p60";
       }
 
-      $("sysOutputDir").value = $("sysOutputDir").value || st.defaults.video_dir;
       $("rawOutputDir").value = $("rawOutputDir").value || st.defaults.video_dir;
-      $("sysFps").value = st.defaults.record_fps;
 
       const camL = st.cameras.camL;
       const camR = st.cameras.camR;
       if (camL) $("camLStatus").textContent = camL.is_open ? `camL ${camL.fps.toFixed(1)}fps` : "camL offline";
       if (camR) $("camRStatus").textContent = camR.is_open ? `camR ${camR.fps.toFixed(1)}fps` : "camR offline";
 
-      const ai = st.ai || {};
-      $("aiState").textContent = ai.state || "idle";
-      $("aiFps").textContent = `${(ai.fps || 0).toFixed(1)} fps`;
-      $("aiActive").textContent = `active ${ai.active_camera || "-"}`;
-      $("aiConf").textContent = `conf ${(ai.last_conf || 0).toFixed(2)}`;
-      $("aiStatusLine").textContent = ai.running ? `running / ${ai.state}` : "stopped";
-
-      const rec = st.recording || {};
       const raw = st.recording_raw || {};
-      const finalLine = rec.running ? `AI record -> ${rec.output_path}` : (rec.last_error ? `AI err: ${rec.last_error}` : "AI record idle");
       const rawL = raw.camL && raw.camL.running ? `Raw L -> ${raw.camL.output_path}` : (raw.camL && raw.camL.last_error ? `Raw L err: ${raw.camL.last_error}` : "");
       const rawR = raw.camR && raw.camR.running ? `Raw R -> ${raw.camR.output_path}` : (raw.camR && raw.camR.last_error ? `Raw R err: ${raw.camR.last_error}` : "");
       const rawLine = [rawL, rawR].filter(Boolean).join(" | ");
-      $("sysStatus").textContent = rawLine ? `${finalLine} | ${rawLine}` : finalLine;
-
-      const aiCfg = st.ai_config || {};
-      if (!$("aiModelPath").dataset.init) {
-        $("aiModelPath").value = aiCfg.model_path || "";
-        $("aiModelPath").dataset.init = "1";
-      }
-      if (!$("aiClassId").dataset.init) {
-        $("aiClassId").value = aiCfg.class_id ?? 0;
-        $("aiClassId").dataset.init = "1";
-      }
-      if (!$("aiZoomInput").dataset.init) {
-        $("aiZoomInput").value = aiCfg.zoom || 1.0;
-        $("aiZoomInput").dataset.init = "1";
-      }
-      if (!$("aiSmoothInput").dataset.init) {
-        $("aiSmoothInput").value = aiCfg.smooth || 0.85;
-        $("aiSmoothInput").dataset.init = "1";
-      }
-      if (!$("aiLostHold").dataset.init) {
-        $("aiLostHold").value = aiCfg.lost_hold_sec || 1.5;
-        $("aiLostHold").dataset.init = "1";
-      }
-      if (!$("aiConfInput").dataset.init) {
-        $("aiConfInput").value = aiCfg.conf || 0.35;
-        $("aiConfInput").dataset.init = "1";
-      }
-      if (!$("aiIouInput").dataset.init) {
-        $("aiIouInput").value = aiCfg.iou || 0.5;
-        $("aiIouInput").dataset.init = "1";
-      }
-      if (!$("aiDetectEvery").dataset.init) {
-        $("aiDetectEvery").value = aiCfg.detect_every || 1;
-        $("aiDetectEvery").dataset.init = "1";
-      }
-      if (!$("aiZoomEnabled").dataset.init) {
-        $("aiZoomEnabled").value = (aiCfg.zoom && aiCfg.zoom > 1.0) ? "true" : "false";
-        $("aiZoomEnabled").dataset.init = "1";
-      }
+      $("rawStatusLine").textContent = rawLine || "idle";
 
       if (!$("camSource").dataset.init) {
         const selCam = $("camSelect").value || "camL";
@@ -2144,7 +3506,7 @@ RECORD_HTML = r"""
       try {
         const res = await fetchJSON("/api/audio/devices");
         const devices = res.devices || [];
-        const sels = [$("audioDevice"), $("rawAudioDevice")];
+        const sels = [$("rawAudioDevice")];
         for (const sel of sels) {
           if (sel.options.length === 0) {
             for (const d of devices) {
@@ -2158,36 +3520,8 @@ RECORD_HTML = r"""
       } catch (e) {}
     };
 
-    $("finalImg").src = "/video/final.mjpg";
     $("camLImg").src = "/video/cam/camL.mjpg";
     $("camRImg").src = "/video/cam/camR.mjpg";
-
-    $("aiStart").onclick = async () => {
-      const zoomEnabled = $("aiZoomEnabled").value === "true";
-      const zoomValue = zoomEnabled ? $("aiZoomInput").value : 1.0;
-      const payload = {
-        active_camera: $("aiActiveInput").value,
-        conf: $("aiConfInput").value,
-        iou: $("aiIouInput").value,
-        zoom: zoomValue,
-        smooth: $("aiSmoothInput").value,
-        lost_hold_sec: $("aiLostHold").value,
-        detect_every: $("aiDetectEvery").value,
-        model_path: $("aiModelPath").value,
-        class_id: $("aiClassId").value
-      };
-      try {
-        await fetchJSON("/api/ai/start", { method: "POST", body: JSON.stringify(payload) });
-      } catch (e) {
-        $("aiStatusLine").textContent = "AI start failed";
-      }
-    };
-
-    $("aiStop").onclick = async () => {
-      try {
-        await fetchJSON("/api/ai/stop", { method: "POST" });
-      } catch (e) {}
-    };
 
     $("camApply").onclick = async () => {
       const camId = $("camSelect").value;
@@ -2208,41 +3542,6 @@ RECORD_HTML = r"""
         $("camStatusLine").textContent = "apply failed";
       }
     };
-
-
-    $("sysStart").onclick = async () => {
-      const zoomEnabled = $("aiZoomEnabled").value === "true";
-      const zoomValue = zoomEnabled ? $("aiZoomInput").value : 1.0;
-      const payload = {
-        active_camera: $("aiActiveInput").value,
-        conf: $("aiConfInput").value,
-        iou: $("aiIouInput").value,
-        zoom: zoomValue,
-        smooth: $("aiSmoothInput").value,
-        lost_hold_sec: $("aiLostHold").value,
-        detect_every: $("aiDetectEvery").value,
-        model_path: $("aiModelPath").value,
-        class_id: $("aiClassId").value,
-        output_dir: $("sysOutputDir").value,
-        audio_device: $("audioDevice").value,
-        audio_bitrate: $("audioBitrate").value,
-        container: $("videoContainer").value
-      };
-      try {
-        await fetchJSON("/api/system/start", { method: "POST", body: JSON.stringify(payload) });
-        $("sysStatus").textContent = "running";
-      } catch (e) {
-        $("sysStatus").textContent = "start failed";
-      }
-    };
-
-    $("sysStop").onclick = async () => {
-      try {
-        await fetchJSON("/api/system/stop", { method: "POST" });
-        $("sysStatus").textContent = "stopped";
-      } catch (e) {}
-    };
-
     $("rawStart").onclick = async () => {
       const payload = {
         which: $("rawWhich").value,
@@ -2253,25 +3552,14 @@ RECORD_HTML = r"""
       };
       try {
         await fetchJSON("/api/raw/start", { method: "POST", body: JSON.stringify(payload) });
+        $("rawStatusLine").textContent = "recording started";
       } catch (e) {}
-    };
-
-    $("audioDevice").onchange = () => {
-      $("rawAudioDevice").value = $("audioDevice").value;
-    };
-    $("rawAudioDevice").onchange = () => {
-      $("audioDevice").value = $("rawAudioDevice").value;
-    };
-    $("audioBitrate").onchange = () => {
-      $("rawAudioBitrate").value = $("audioBitrate").value;
-    };
-    $("rawAudioBitrate").onchange = () => {
-      $("audioBitrate").value = $("rawAudioBitrate").value;
     };
 
     $("rawStop").onclick = async () => {
       try {
         await fetchJSON("/api/raw/stop", { method: "POST" });
+        $("rawStatusLine").textContent = "recording stopped";
       } catch (e) {}
     };
 
@@ -2300,6 +3588,11 @@ def home():
 @app.get("/record", response_class=HTMLResponse)
 def record_page():
     return HTMLResponse(RECORD_HTML)
+
+
+@app.get("/live", response_class=HTMLResponse)
+def live_page():
+    return HTMLResponse(LIVE_HTML)
 
 
 @app.get("/analysis", response_class=HTMLResponse)
