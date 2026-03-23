@@ -702,7 +702,7 @@ if [[ "${PLATFORM}" == "mac_apple_silicon" ]]; then
   fi
 
   if [[ -n "${BREW_BIN}" ]]; then
-    info "Installing Homebrew packages (ffmpeg, gstreamer, plugins, portaudio)..."
+    info "Installing Homebrew packages (ffmpeg, gstreamer, plugins, portaudio, node)..."
     if [[ "${EUID}" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
       info "macOS setup is running with sudo; executing Homebrew install as ${SUDO_USER}"
       if sudo -u "${SUDO_USER}" -H "${BREW_BIN}" install \
@@ -712,7 +712,8 @@ if [[ "${PLATFORM}" == "mac_apple_silicon" ]]; then
         gst-plugins-good \
         gst-plugins-bad \
         gst-plugins-ugly \
-        portaudio; then
+        portaudio \
+        node; then
         ok "Homebrew package step completed"
       else
         warn "Homebrew package install failed. Check the log above."
@@ -727,13 +728,33 @@ if [[ "${PLATFORM}" == "mac_apple_silicon" ]]; then
       gst-plugins-good \
       gst-plugins-bad \
       gst-plugins-ugly \
-      portaudio; then
+      portaudio \
+      node; then
       ok "Homebrew package step completed"
     else
       warn "Homebrew package install failed. Check the log above."
     fi
   else
-    warn "Homebrew not found. If needed, install ffmpeg, gstreamer (+ plugins), and portaudio manually."
+    warn "Homebrew not found. If needed, install ffmpeg, gstreamer (+ plugins), portaudio, and node manually."
+  fi
+
+  if command -v npm >/dev/null 2>&1; then
+    info "Installing uvcc for macOS camera control..."
+    if [[ "${EUID}" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+      if sudo -u "${SUDO_USER}" -H npm install --global uvcc; then
+        ok "uvcc installed"
+      else
+        warn "uvcc install failed. Camera Settings will fall back to limited controls until npm install --global uvcc succeeds."
+      fi
+    elif [[ "${EUID}" -eq 0 ]]; then
+      warn "Skipping uvcc install because setup is running as root without SUDO_USER."
+    elif npm install --global uvcc; then
+      ok "uvcc installed"
+    else
+      warn "uvcc install failed. Camera Settings will fall back to limited controls until npm install --global uvcc succeeds."
+    fi
+  else
+    warn "npm not found. Install Node.js and then run: npm install --global uvcc"
   fi
 fi
 

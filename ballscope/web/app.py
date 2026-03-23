@@ -26,7 +26,16 @@ from ballscope.config import (
     DEFAULT_RECORD_FPS,
     AiConfig,
 )
-from ballscope.camera import CameraState, CameraSettings, CameraWorker, mjpeg_stream, camera_state_dict
+from ballscope.camera import (
+    CameraState,
+    CameraSettings,
+    CameraWorker,
+    camera_control_metadata,
+    macos_camera_auth_message,
+    mjpeg_stream,
+    prepare_macos_camera_access,
+    camera_state_dict,
+)
 from ballscope.ai import PersonSwitcherWorker, ai_mjpeg_stream
 from ballscope.recording import GstPipeRecorder, GstDeviceRecorder, GstDualRecorder, GstAudioRecorder
 from ballscope.runtime_device import resolve_torch_device, runtime_device_options
@@ -34,8 +43,10 @@ from ballscope.runtime_device import resolve_torch_device, runtime_device_option
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    for worker in CAMERA_WORKERS.values():
-        worker.start()
+    mac_ok, _mac_msg = prepare_macos_camera_access([state.src for state in CAMERA_STATES.values()])
+    if mac_ok:
+        for worker in CAMERA_WORKERS.values():
+            worker.start()
     AI_WORKER.start()
     AI_WORKER.stop()
     yield
@@ -1013,6 +1024,48 @@ def live_final_preview(request: Request):
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
+
+def _settings_preview_spec(mode: str):
+    mode_use = (mode or "auto").strip().lower()
+    if mode_use == "camr":
+        worker = CAMERA_WORKERS["camR"]
+        return worker.get_latest_frame_bgr, worker.get_latest_jpeg_and_seq, worker.wait_for_new_frame
+    if mode_use == "auto" and AI_WORKER.status.running and AI_WORKER.get_latest_frame() is not None:
+        return AI_WORKER.get_latest_frame, AI_WORKER.get_latest_jpeg_and_seq, AI_WORKER.wait_for_new_frame
+    worker = CAMERA_WORKERS["camL"]
+    return worker.get_latest_frame_bgr, worker.get_latest_jpeg_and_seq, worker.wait_for_new_frame
+
+
+@app.get("/video/settings/result.mjpg")
+def settings_result_preview(request: Request, mode: str = "auto"):
+    cfg = _parse_preview_profile(request)
+    frame_getter, seq_getter, wait_for_new = _settings_preview_spec(mode)
+    return StreamingResponse(
+        _mjpeg_from_frame_getter(
+            frame_getter,
+            seq_getter,
+            wait_for_new,
+            max_w=cfg["max_w"],
+            fps=cfg["fps"],
+            jpeg_q=cfg["jpeg_q"],
+        ),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+def _camera_settings_payload(camera_id: str) -> dict:
+    state = CAMERA_STATES[camera_id]
+    payload = camera_control_metadata(state.src, state.settings)
+    payload["camera_id"] = camera_id
+    payload["name"] = state.name
+    payload["src"] = state.src
+    payload["preset"] = state.settings.preset
+    payload["settings"] = asdict(state.settings)
+    payload["is_open"] = state.is_open
+    payload["fps"] = state.fps
+    payload["last_error"] = state.last_error
+    return payload
+
 @app.get("/api/state")
 def api_state():
     return JSONResponse(
@@ -1029,6 +1082,9 @@ def api_state():
                 "video_dir": DEFAULT_VIDEO_DIR,
                 "record_fps": DEFAULT_RECORD_FPS,
             },
+            "platform": {
+                "macos_camera_auth_error": macos_camera_auth_message(),
+            },
         }
     )
 
@@ -1038,11 +1094,23 @@ def api_audio_devices():
     return {"devices": list_audio_devices()}
 
 
-@app.post("/api/settings/{camera_id}")
-async def set_settings(camera_id: str, request: Request):
+@app.get("/api/camera/settings")
+def api_camera_settings():
+    return {
+        "presets": QUALITY_PRESETS,
+        "defaults": {
+            "preset": DEFAULT_PRESET,
+        },
+        "cameras": {
+            "camL": _camera_settings_payload("camL"),
+            "camR": _camera_settings_payload("camR"),
+        },
+    }
+
+
+def _apply_camera_settings(camera_id: str, body: dict) -> dict:
     if camera_id not in CAMERA_STATES:
         raise HTTPException(status_code=404, detail="Unknown camera_id")
-    body = await request.json()
     st = CAMERA_STATES[camera_id].settings
 
     preset_changed = False
@@ -1060,7 +1128,20 @@ async def set_settings(camera_id: str, request: Request):
             st.preset = preset
             preset_changed = True
 
-    for key in ["brightness", "contrast", "saturation", "gain"]:
+    for key in [
+        "brightness",
+        "contrast",
+        "saturation",
+        "sharpness",
+        "gain",
+        "power_line_frequency",
+        "white_balance_temperature",
+        "exposure_time",
+        "focus",
+        "zoom",
+        "pan",
+        "tilt",
+    ]:
         if key in body:
             val = body[key]
             if val is None:
@@ -1071,7 +1152,7 @@ async def set_settings(camera_id: str, request: Request):
                 except Exception:
                     raise HTTPException(status_code=400, detail=f"Invalid {key}")
 
-    for key in ["auto_wb", "auto_exposure"]:
+    for key in ["auto_wb", "auto_exposure", "exposure_priority", "hdr", "auto_focus"]:
         if key in body:
             val = body[key]
             if val is None:
@@ -1084,6 +1165,30 @@ async def set_settings(camera_id: str, request: Request):
     CAMERA_WORKERS[camera_id].apply_driver_controls_now()
 
     return {"ok": True, "camera_id": camera_id, "settings": asdict(st)}
+
+
+@app.post("/api/settings/{camera_id}")
+async def set_settings(camera_id: str, request: Request):
+    body = await request.json()
+    return _apply_camera_settings(camera_id, body)
+
+
+@app.post("/api/camera/settings")
+async def save_camera_settings(request: Request):
+    body = await request.json()
+    results = {}
+    for camera_id in ["camL", "camR"]:
+        if camera_id not in body:
+            continue
+        results[camera_id] = _apply_camera_settings(camera_id, body[camera_id])
+    return {
+        "ok": True,
+        "results": results,
+        "cameras": {
+            "camL": _camera_settings_payload("camL"),
+            "camR": _camera_settings_payload("camR"),
+        },
+    }
 
 
 @app.post("/api/record/start")
@@ -1768,14 +1873,20 @@ HOME_HTML = r"""
         <p>Record video from one or both cameras. Use this when you want to save footage.</p>
         <span class="pill">Open</span>
       </a>
+      <a class="card" href="/camera-settings">
+        <small>02 / CAMERA SETTINGS</small>
+        <h2>Camera Settings</h2>
+        <p>Preview both cameras live, tune BRIO controls, and save one session-wide setup for recording and live use.</p>
+        <span class="pill">Open</span>
+      </a>
       <a class="card" href="/analysis">
-        <small>02 / AI ANALYSIS</small>
+        <small>03 / AI ANALYSIS</small>
         <h2>Analysis</h2>
         <p>Upload a video file and run ball tracking after recording. Best for reviewing clips later.</p>
         <span class="pill">Open</span>
       </a>
       <a class="card" href="/live">
-        <small>03 / LIVE</small>
+        <small>04 / LIVE</small>
         <h2>Live</h2>
         <p>Watch the cameras live in the browser. BallScope follows the ball and zooms in automatically.</p>
         <span class="pill">Open</span>
@@ -2652,74 +2763,6 @@ LIVE_HTML = r"""
           </div>
         </div>
 
-        <div class="card">
-          <h3>Camera Tuning</h3>
-          <div class="row">
-            <div>
-              <label>Camera</label>
-              <select id="camSelect">
-                <option value="camL">Camera Left</option>
-                <option value="camR">Camera Right</option>
-              </select>
-            </div>
-            <div>
-              <label>Preset</label>
-              <select id="camPreset"></select>
-            </div>
-          </div>
-          <div class="row" style="margin-top:10px;">
-            <div>
-              <label>Source (Device)</label>
-              <input id="camSource" type="text" placeholder="/dev/video0 or 0"/>
-            </div>
-            <div>
-              <label>Apply</label>
-              <div class="hint" style="margin-top:8px;">Use `0/1` on Mac, `/dev/video*` on Jetson</div>
-            </div>
-          </div>
-          <div class="row" style="margin-top:10px;">
-            <div>
-              <label>Brightness</label>
-              <input id="camBrightness" type="number"/>
-            </div>
-            <div>
-              <label>Contrast</label>
-              <input id="camContrast" type="number"/>
-            </div>
-          </div>
-          <div class="row" style="margin-top:10px;">
-            <div>
-              <label>Saturation</label>
-              <input id="camSaturation" type="number"/>
-            </div>
-            <div>
-              <label>Gain</label>
-              <input id="camGain" type="number"/>
-            </div>
-          </div>
-          <div class="row" style="margin-top:10px;">
-            <div>
-              <label>Auto WB</label>
-              <select id="camAutoWb">
-                <option value="">Keep</option>
-                <option value="true">On</option>
-                <option value="false">Off</option>
-              </select>
-            </div>
-            <div>
-              <label>Auto Exposure</label>
-              <select id="camAutoExp">
-                <option value="">Keep</option>
-                <option value="true">On</option>
-                <option value="false">Off</option>
-              </select>
-            </div>
-          </div>
-          <div class="btn-row" style="margin-top:10px;">
-            <button type="button" class="btn" id="camApply">Apply Camera Settings</button>
-          </div>
-          <div class="statusline" id="camStatusLine">idle</div>
-        </div>
       </div>
     </section>
   </div>
@@ -2908,16 +2951,6 @@ LIVE_HTML = r"""
       $("systemDot").className = "dot ok";
       $("systemStatus").textContent = "Online";
 
-      if ($("camPreset").options.length === 0) {
-        for (const k of Object.keys(st.presets || {})) {
-          const opt = document.createElement("option");
-          opt.value = k;
-          opt.textContent = k;
-          $("camPreset").appendChild(opt);
-        }
-        $("camPreset").value = st.defaults.preset || "1080p60";
-      }
-
       const camL = st.cameras?.camL;
       const camR = st.cameras?.camR;
       if (camL) $("camLStatus").textContent = camL.is_open ? `camL:${camL.fps.toFixed(1)}fps` : "camL:offline";
@@ -2946,13 +2979,6 @@ LIVE_HTML = r"""
       setIfInit("aiDetectEvery", aiCfg.detect_every);
       setIfInit("aiImgsz", aiCfg.imgsz);
       setIfInit("deviceSel", aiCfg.device || "auto");
-      if (!$("camSource").dataset.init) {
-        const selCam = $("camSelect").value || "camL";
-        const camState = st.cameras[selCam];
-        if (camState) $("camSource").value = camState.src || "";
-        $("camSource").dataset.init = "1";
-      }
-
       const running = !!ai.running;
       $("liveStatusLine").textContent = running
         ? `live tracking running | active=${ai.active_camera || "-"} | state=${ai.state || "-"} | fps=${(ai.fps || 0).toFixed(1)}`
@@ -3003,32 +3029,6 @@ LIVE_HTML = r"""
       } catch (e) {
         $("liveStatusLine").textContent = "live stop failed";
       }
-    };
-
-    $("camApply").onclick = async () => {
-      const camId = $("camSelect").value;
-      const payload = {
-        src: $("camSource").value,
-        preset: $("camPreset").value,
-        brightness: $("camBrightness").value ? parseInt($("camBrightness").value) : null,
-        contrast: $("camContrast").value ? parseInt($("camContrast").value) : null,
-        saturation: $("camSaturation").value ? parseInt($("camSaturation").value) : null,
-        gain: $("camGain").value ? parseInt($("camGain").value) : null,
-      };
-      if ($("camAutoWb").value !== "") payload.auto_wb = $("camAutoWb").value === "true";
-      if ($("camAutoExp").value !== "") payload.auto_exposure = $("camAutoExp").value === "true";
-      try {
-        await fetchJSON(`/api/settings/${camId}`, { method: "POST", body: JSON.stringify(payload) });
-        $("camStatusLine").textContent = "camera settings applied";
-      } catch (e) {
-        $("camStatusLine").textContent = "camera settings failed";
-      }
-    };
-
-    $("camSelect").onchange = () => {
-      if (!lastState) return;
-      const camState = lastState.cameras?.[$("camSelect").value];
-      if (camState) $("camSource").value = camState.src || "";
     };
 
     $("modelPath").onchange = loadClasses;
@@ -3372,7 +3372,7 @@ RECORD_HTML = r"""
     <header>
       <div>
         <h1>BallScope Recording</h1>
-        <div class="sub">Dual-camera recording and camera tuning. AI controls are available in Live and Analysis.</div>
+        <div class="sub">Dual-camera recording. Camera controls are now available in the dedicated Camera Settings workspace.</div>
       </div>
       <div class="header-actions">
         <a class="nav-btn" href="/">Back to Home</a>
@@ -3441,74 +3441,6 @@ RECORD_HTML = r"""
         <div class="status" id="rawStatusLine">idle</div>
       </div>
 
-      <div class="card span-12">
-        <h3>Camera Tuning</h3>
-        <div class="row">
-          <div>
-            <label>Camera</label>
-            <select id="camSelect">
-              <option value="camL">Camera Left</option>
-              <option value="camR">Camera Right</option>
-            </select>
-          </div>
-          <div>
-            <label>Preset</label>
-            <select id="camPreset"></select>
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <div>
-            <label>Source (Device)</label>
-            <input id="camSource" type="text" placeholder="/dev/video0 or 0" />
-          </div>
-          <div>
-            <label>Apply Source Change</label>
-            <div class="status" style="margin-top: 6px; color: var(--muted);">Tip: Jetson: /dev/video0, Mac: 0 or 1</div>
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <div>
-            <label>Brightness</label>
-            <input id="camBrightness" type="number" />
-          </div>
-          <div>
-            <label>Contrast</label>
-            <input id="camContrast" type="number" />
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <div>
-            <label>Saturation</label>
-            <input id="camSaturation" type="number" />
-          </div>
-          <div>
-            <label>Gain</label>
-            <input id="camGain" type="number" />
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <div>
-            <label>Auto WB</label>
-            <select id="camAutoWb">
-              <option value="">Keep</option>
-              <option value="true">On</option>
-              <option value="false">Off</option>
-            </select>
-          </div>
-          <div>
-            <label>Auto Exposure</label>
-            <select id="camAutoExp">
-              <option value="">Keep</option>
-              <option value="true">On</option>
-              <option value="false">Off</option>
-            </select>
-          </div>
-        </div>
-        <div class="btns">
-          <button class="primary" id="camApply">Apply</button>
-        </div>
-        <div class="status" id="camStatusLine">idle</div>
-      </div>
     </section>
   </div>
 
@@ -3548,16 +3480,6 @@ RECORD_HTML = r"""
       $("systemDot").className = "dot ok";
       $("systemStatus").textContent = "Online";
 
-    if ($("camPreset").options.length === 0) {
-        for (const k of Object.keys(st.presets || {})) {
-          const opt = document.createElement("option");
-          opt.value = k;
-          opt.textContent = k;
-          $("camPreset").appendChild(opt);
-        }
-        $("camPreset").value = st.defaults.preset || "1080p60";
-      }
-
       $("rawOutputDir").value = $("rawOutputDir").value || st.defaults.video_dir;
 
       const camL = st.cameras.camL;
@@ -3570,15 +3492,6 @@ RECORD_HTML = r"""
       const rawR = raw.camR && raw.camR.running ? `Raw R -> ${raw.camR.output_path}` : (raw.camR && raw.camR.last_error ? `Raw R err: ${raw.camR.last_error}` : "");
       const rawLine = [rawL, rawR].filter(Boolean).join(" | ");
       $("rawStatusLine").textContent = rawLine || "idle";
-
-      if (!$("camSource").dataset.init) {
-        const selCam = $("camSelect").value || "camL";
-        const camState = st.cameras[selCam];
-        if (camState) {
-          $("camSource").value = camState.src || "";
-        }
-        $("camSource").dataset.init = "1";
-      }
     };
 
     const startLoop = () => {
@@ -3611,25 +3524,6 @@ RECORD_HTML = r"""
     $("camLImg").src = "/video/cam/camL.mjpg";
     $("camRImg").src = "/video/cam/camR.mjpg";
 
-    $("camApply").onclick = async () => {
-      const camId = $("camSelect").value;
-      const payload = {
-        src: $("camSource").value,
-        preset: $("camPreset").value,
-        brightness: $("camBrightness").value ? parseInt($("camBrightness").value) : null,
-        contrast: $("camContrast").value ? parseInt($("camContrast").value) : null,
-        saturation: $("camSaturation").value ? parseInt($("camSaturation").value) : null,
-        gain: $("camGain").value ? parseInt($("camGain").value) : null
-      };
-      if ($("camAutoWb").value !== "") payload.auto_wb = $("camAutoWb").value === "true";
-      if ($("camAutoExp").value !== "") payload.auto_exposure = $("camAutoExp").value === "true";
-      try {
-        await fetchJSON(`/api/settings/${camId}`, { method: "POST", body: JSON.stringify(payload) });
-        $("camStatusLine").textContent = "applied";
-      } catch (e) {
-        $("camStatusLine").textContent = "apply failed";
-      }
-    };
     $("rawStart").onclick = async () => {
       const payload = {
         which: $("rawWhich").value,
@@ -3650,18 +3544,665 @@ RECORD_HTML = r"""
         $("rawStatusLine").textContent = "recording stopped";
       } catch (e) {}
     };
+    startLoop();
+    initAudioDevices();
+  </script>
+</body>
+</html>
+"""
 
-    $("camSelect").onchange = () => {
-      if (!lastState) return;
-      const sel = $("camSelect").value;
-      const camState = lastState.cameras[sel];
-      if (camState) {
-        $("camSource").value = camState.src || "";
+
+CAMERA_SETTINGS_HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>BallScope - Camera Settings</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Rubik:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+    :root {
+      color-scheme: dark;
+      --bg: #0b1118;
+      --panel: rgba(14, 22, 33, 0.84);
+      --panel-2: rgba(9, 15, 23, 0.9);
+      --stroke: rgba(255,255,255,0.08);
+      --stroke-strong: rgba(255,255,255,0.16);
+      --text: #f4f7ff;
+      --muted: rgba(244,247,255,0.66);
+      --accent: #ffb454;
+      --accent-2: #68d7ff;
+      --ring: rgba(104,215,255,0.24);
+      --ok: #7dffb3;
+      --warn: #ffd66e;
+      --danger: #ff8f8f;
+      --btn-text: #fffaf1;
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --bg: #ecf3fb;
+      --panel: rgba(255,255,255,0.9);
+      --panel-2: rgba(250,252,255,0.94);
+      --stroke: rgba(18, 30, 50, 0.1);
+      --stroke-strong: rgba(18, 30, 50, 0.2);
+      --text: #101826;
+      --muted: rgba(16,24,38,0.64);
+      --accent: #d97b1c;
+      --accent-2: #0c86cc;
+      --ring: rgba(12,134,204,0.18);
+      --ok: #149c62;
+      --warn: #c58b16;
+      --danger: #d14b4b;
+      --btn-text: #ffffff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Rubik", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(780px 440px at -8% -10%, rgba(104,215,255,0.18), transparent),
+        radial-gradient(760px 440px at 110% -10%, rgba(255,180,84,0.14), transparent),
+        var(--bg);
+    }
+    .wrap { max-width: 1440px; margin: 0 auto; padding: 22px 16px 42px; }
+    .top { display:flex; justify-content:space-between; align-items:flex-start; gap:14px; margin-bottom:16px; }
+    .sub { color: var(--muted); font-size: 13px; max-width: 760px; }
+    .top-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .nav-btn, button, select, input { font: inherit; }
+    .nav-btn, button {
+      appearance: none;
+      border-radius: 14px;
+      border: 1px solid var(--stroke);
+      padding: 10px 14px;
+      background: color-mix(in srgb, var(--panel-2) 90%, transparent);
+      color: var(--text);
+      text-decoration: none;
+      font-weight: 600;
+      cursor: pointer;
+      transition: border-color .16s ease, background-color .16s ease;
+    }
+    button.primary {
+      border-color: color-mix(in srgb, var(--accent-2) 58%, var(--stroke) 42%);
+      background: color-mix(in srgb, var(--accent-2) 72%, #2a63d7 28%);
+      color: var(--btn-text);
+    }
+    .nav-btn:hover, button:hover { border-color: var(--stroke-strong); }
+    .grid { display:grid; gap:16px; }
+    .hero-grid { grid-template-columns: minmax(0, 1.35fr) 320px; }
+    .camera-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .card {
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,0) 38%),
+        linear-gradient(120deg, rgba(104,215,255,.05), rgba(255,180,84,.03)),
+        var(--panel);
+      border: 1px solid var(--stroke);
+      border-radius: 20px;
+      padding: 16px;
+      backdrop-filter: blur(16px) saturate(130%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.05);
+    }
+    .card h3 { margin: 0 0 12px; font-size: 13px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+    .preview {
+      border-radius: 18px;
+      overflow: hidden;
+      border: 1px solid var(--stroke);
+      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,0)), var(--panel-2);
+      aspect-ratio: 16/9;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+    }
+    .preview img { width:100%; height:100%; object-fit:cover; display:block; }
+    .preview.result img { object-fit: contain; }
+    .meta, .status-row { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .chip {
+      border-radius: 999px;
+      border: 1px solid var(--stroke);
+      background: rgba(255,255,255,0.03);
+      padding: 6px 9px;
+      font-size: 12px;
+      font-family: "JetBrains Mono", monospace;
+    }
+    .row, .top-row, .control-grid { display:grid; gap:10px; }
+    .row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .top-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .control-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    label { display:block; font-size:12px; color:var(--muted); margin:0 0 6px; }
+    input, select {
+      width:100%;
+      border-radius:12px;
+      border:1px solid var(--stroke);
+      background: rgba(10,15,23,0.92);
+      color: var(--text);
+      padding: 9px 11px;
+    }
+    html[data-theme="light"] input, html[data-theme="light"] select { background: rgba(255,255,255,0.95); }
+    input:focus, select:focus { outline:none; border-color: color-mix(in srgb, var(--accent-2) 55%, var(--stroke)); box-shadow: 0 0 0 4px var(--ring); }
+    .control {
+      border: 1px solid var(--stroke);
+      border-radius: 16px;
+      padding: 12px;
+      background: rgba(255,255,255,0.02);
+    }
+    .control.unsupported { opacity: 0.58; }
+    .control-head { display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:8px; }
+    .control-title { font-size:13px; font-weight:600; }
+    .control-help { color:var(--muted); font-size:11px; line-height:1.35; margin-top:6px; }
+    .toggle { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .toggle input { width:auto; transform: scale(1.05); }
+    .value-pair { display:grid; grid-template-columns: minmax(0, 1fr) 88px; gap:8px; align-items:center; }
+    input[type="range"] { padding: 0; }
+    .camera-head { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; margin-bottom:10px; }
+    .camera-copy { color:var(--muted); font-size:12px; }
+    .statusline { min-height:18px; color:var(--muted); font-size:12px; margin-top:10px; }
+    .save-bar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:16px; }
+    .backend-note { color:var(--muted); font-size:12px; line-height:1.4; }
+    .config-box {
+      margin-top: 12px;
+      border: 1px solid var(--stroke);
+      border-radius: 14px;
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.02);
+    }
+    .config-box strong { display:block; font-size:12px; margin-bottom:6px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; }
+    .config-list { display:flex; flex-wrap:wrap; gap:8px; }
+    @media (max-width: 1180px) {
+      .hero-grid, .camera-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 760px) {
+      .wrap { padding: 18px 12px 34px; }
+      .top, .save-bar, .camera-head { flex-direction: column; align-items: flex-start; }
+      .row, .top-row, .control-grid { grid-template-columns: 1fr; }
+      button, .nav-btn { width: 100%; justify-content: center; }
+      .top-actions { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1 style="margin:0 0 6px;">Camera Settings</h1>
+        <div class="sub">Tune both BRIO cameras live, compare left and right previews, and save one session-wide configuration for recording and live operation on macOS Apple Silicon and Jetson.</div>
+      </div>
+      <div class="top-actions">
+        <a class="nav-btn" href="/">Back to Home</a>
+        <div class="chip" id="systemStatus">Booting</div>
+      </div>
+    </div>
+
+    <section class="grid hero-grid">
+      <div class="card">
+        <div class="camera-head">
+          <div>
+            <h3 style="margin-bottom:6px;">Live Result</h3>
+            <div class="camera-copy">Shows BallScope result preview. In auto mode it uses the live AI result when tracking is running, otherwise it falls back to the left camera preview.</div>
+          </div>
+          <div class="top-row" style="min-width:min(100%, 360px);">
+            <div>
+              <label>Result Source</label>
+              <select id="resultMode">
+                <option value="auto">Auto Result</option>
+                <option value="camL">Left Camera</option>
+                <option value="camR">Right Camera</option>
+              </select>
+            </div>
+            <div>
+              <label>Preview Quality</label>
+              <select id="resultQuality">
+                <option value="high">High</option>
+                <option value="balanced" selected>Balanced</option>
+                <option value="fast">Fast</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="preview result"><img id="resultImg" src="" alt="Result preview"></div>
+        <div class="meta">
+          <div class="chip" id="resultModeChip">mode:auto</div>
+          <div class="chip" id="aiStateChip">ai:idle</div>
+          <div class="chip" id="activeCamChip">active:-</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Session Save</h3>
+        <div class="backend-note" id="backendNote">Loading camera backends...</div>
+        <div class="status-row">
+          <div class="chip" id="leftStatus">camL:-</div>
+          <div class="chip" id="rightStatus">camR:-</div>
+        </div>
+        <div class="save-bar" style="margin-top:14px;">
+          <button type="button" class="primary" id="saveAll">Save Camera Settings</button>
+        </div>
+        <div class="statusline" id="saveStatus">idle</div>
+      </div>
+    </section>
+
+    <section class="grid camera-grid" style="margin-top:16px;">
+      <div class="card">
+        <div class="camera-head">
+          <div>
+            <h3 style="margin-bottom:6px;">Left Camera</h3>
+            <div class="camera-copy">Configure source, preset, exposure, color and lens controls for the left BRIO.</div>
+          </div>
+          <div class="chip" id="camLBackend">backend:-</div>
+        </div>
+        <div class="preview"><img id="camLImg" src="" alt="Camera left"></div>
+        <div class="row" style="margin-top:10px;">
+          <div>
+            <label>Source (Device)</label>
+            <input id="camLSource" type="text" placeholder="/dev/video0 or 0"/>
+          </div>
+          <div>
+            <label>Preset</label>
+            <select id="camLPreset"></select>
+          </div>
+        </div>
+        <div class="config-box">
+          <strong>Current Config</strong>
+          <div class="config-list" id="camLCurrentConfig"></div>
+        </div>
+        <div class="control-grid" id="camLControls" style="margin-top:12px;"></div>
+        <div class="statusline" id="camLStatusLine">idle</div>
+      </div>
+
+      <div class="card">
+        <div class="camera-head">
+          <div>
+            <h3 style="margin-bottom:6px;">Right Camera</h3>
+            <div class="camera-copy">Configure the right BRIO in parallel and save both cameras together.</div>
+          </div>
+          <div class="chip" id="camRBackend">backend:-</div>
+        </div>
+        <div class="preview"><img id="camRImg" src="" alt="Camera right"></div>
+        <div class="row" style="margin-top:10px;">
+          <div>
+            <label>Source (Device)</label>
+            <input id="camRSource" type="text" placeholder="/dev/video2 or 1"/>
+          </div>
+          <div>
+            <label>Preset</label>
+            <select id="camRPreset"></select>
+          </div>
+        </div>
+        <div class="config-box">
+          <strong>Current Config</strong>
+          <div class="config-list" id="camRCurrentConfig"></div>
+        </div>
+        <div class="control-grid" id="camRControls" style="margin-top:12px;"></div>
+        <div class="statusline" id="camRStatusLine">idle</div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    (() => {
+      const KEY = "ballscope-theme";
+      const root = document.documentElement;
+      const media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+      const normalize = (value) => (value === "light" || value === "dark" || value === "system") ? value : "system";
+      const getPref = () => normalize(localStorage.getItem(KEY));
+      const resolve = (pref) => pref === "system" ? ((media && media.matches) ? "light" : "dark") : pref;
+      const apply = () => {
+        const pref = getPref();
+        root.setAttribute("data-theme", resolve(pref));
+        root.setAttribute("data-theme-pref", pref);
+      };
+      if (!localStorage.getItem(KEY)) localStorage.setItem(KEY, "system");
+      apply();
+      if (media) {
+        const onMediaChange = () => { if (getPref() === "system") apply(); };
+        if (typeof media.addEventListener === "function") media.addEventListener("change", onMediaChange);
+        else if (typeof media.addListener === "function") media.addListener(onMediaChange);
+      }
+    })();
+
+    const $ = (id) => document.getElementById(id);
+    const fetchJSON = async (url, opts = {}) => {
+      const res = await fetch(url, Object.assign({ headers: { "Content-Type": "application/json" } }, opts));
+      if (!res.ok) throw new Error(await res.text());
+      return await res.json();
+    };
+
+    const controlEls = { camL: {}, camR: {} };
+    const autosaveTimers = { camL: null, camR: null };
+    let cameraData = null;
+    let lastState = null;
+    let resultKey = "";
+    let streamNonce = 0;
+
+    const previewUrl = (cameraId) => `/video/cam/${cameraId}.mjpg?v=${Date.now()}`;
+
+    const refreshResultPreview = (force = false) => {
+      const mode = $("resultMode").value || "auto";
+      const quality = $("resultQuality").value || "balanced";
+      const url = `/video/settings/result.mjpg?mode=${encodeURIComponent(mode)}&profile=${encodeURIComponent(quality)}`;
+      const key = `${mode}|${quality}`;
+      if (!force && resultKey === key) return;
+      resultKey = key;
+      streamNonce += 1;
+      $("resultImg").src = `${url}&v=${streamNonce}`;
+      $("resultModeChip").textContent = `mode:${mode}`;
+    };
+
+    const makeBoolControl = (cameraId, control) => {
+      const wrap = document.createElement("div");
+      wrap.className = "control" + (control.supported ? "" : " unsupported");
+      const head = document.createElement("div");
+      head.className = "control-head";
+      head.innerHTML = `<div class="control-title">${control.label}</div>`;
+      const toggle = document.createElement("label");
+      toggle.className = "toggle";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = !!control.current;
+      input.disabled = !control.supported;
+      toggle.appendChild(input);
+      head.appendChild(toggle);
+      wrap.appendChild(head);
+      if (control.help) {
+        const help = document.createElement("div");
+        help.className = "control-help";
+        help.textContent = control.help;
+        wrap.appendChild(help);
+      }
+      controlEls[cameraId][control.id] = { kind: control.kind, input, wrap, supported: !!control.supported };
+      input.addEventListener("change", () => {
+        syncDependentControls(cameraId);
+        queueAutosave(cameraId, control.id, !!input.checked, 0);
+      });
+      return wrap;
+    };
+
+    const makeSelectControl = (cameraId, control) => {
+      const wrap = document.createElement("div");
+      wrap.className = "control" + (control.supported ? "" : " unsupported");
+      wrap.innerHTML = `<div class="control-title">${control.label}</div>`;
+      const select = document.createElement("select");
+      for (const option of (control.options || [])) {
+        const el = document.createElement("option");
+        el.value = String(option.value);
+        el.textContent = option.label;
+        if (String(option.value) === String(control.current)) el.selected = true;
+        select.appendChild(el);
+      }
+      select.disabled = !control.supported;
+      wrap.appendChild(select);
+      if (control.help) {
+        const help = document.createElement("div");
+        help.className = "control-help";
+        help.textContent = control.help;
+        wrap.appendChild(help);
+      }
+      controlEls[cameraId][control.id] = { kind: control.kind, input: select, wrap, supported: !!control.supported };
+      select.addEventListener("change", () => {
+        const raw = select.value;
+        queueAutosave(cameraId, control.id, /^-?\d+$/.test(raw) ? parseInt(raw, 10) : raw, 0);
+      });
+      return wrap;
+    };
+
+    const makeRangeControl = (cameraId, control) => {
+      const wrap = document.createElement("div");
+      wrap.className = "control" + (control.supported ? "" : " unsupported");
+      wrap.innerHTML = `<div class="control-title">${control.label}</div>`;
+      const pair = document.createElement("div");
+      pair.className = "value-pair";
+      const slider = document.createElement("input");
+      slider.type = "range";
+      slider.min = String(control.min ?? 0);
+      slider.max = String(control.max ?? 255);
+      slider.step = String(control.step ?? 1);
+      slider.value = String(control.current ?? control.default ?? control.min ?? 0);
+      slider.disabled = !control.supported;
+      const number = document.createElement("input");
+      number.type = "number";
+      number.min = slider.min;
+      number.max = slider.max;
+      number.step = slider.step;
+      number.value = slider.value;
+      number.disabled = slider.disabled;
+      slider.addEventListener("input", () => { number.value = slider.value; });
+      number.addEventListener("input", () => { slider.value = number.value; });
+      slider.addEventListener("input", () => queueAutosave(cameraId, control.id, parseInt(slider.value || "0", 10), 220));
+      number.addEventListener("input", () => queueAutosave(cameraId, control.id, number.value === "" ? null : parseInt(number.value, 10), 220));
+      pair.appendChild(slider);
+      pair.appendChild(number);
+      wrap.appendChild(pair);
+      if (control.help) {
+        const help = document.createElement("div");
+        help.className = "control-help";
+        help.textContent = control.help;
+        wrap.appendChild(help);
+      }
+      controlEls[cameraId][control.id] = { kind: control.kind, slider, number, wrap, supported: !!control.supported };
+      return wrap;
+    };
+
+    const buildControls = (cameraId, meta) => {
+      const root = $(`${cameraId}Controls`);
+      root.innerHTML = "";
+      controlEls[cameraId] = {};
+      for (const control of (meta.controls || [])) {
+        let node = null;
+        if (control.kind === "bool") node = makeBoolControl(cameraId, control);
+        else if (control.kind === "menu") node = makeSelectControl(cameraId, control);
+        else node = makeRangeControl(cameraId, control);
+        if (node) root.appendChild(node);
+      }
+      syncDependentControls(cameraId);
+      renderCurrentConfig(cameraId);
+    };
+
+    const setPresetOptions = (cameraId, presets, current) => {
+      const select = $(`${cameraId}Preset`);
+      if (select.options.length > 0) return;
+      for (const name of Object.keys(presets || {})) {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+      }
+      if (current) select.value = current;
+    };
+
+    const syncDependentControls = (cameraId) => {
+      const controls = controlEls[cameraId] || {};
+      const autoExp = controls.auto_exposure?.input;
+      const exposure = controls.exposure_time;
+      if (autoExp && exposure) {
+        const disabled = !exposure.supported || autoExp.checked;
+        exposure.slider.disabled = disabled;
+        exposure.number.disabled = disabled;
+      }
+      const autoWb = controls.auto_wb?.input;
+      const wb = controls.white_balance_temperature;
+      if (autoWb && wb) {
+        const disabled = !wb.supported || autoWb.checked;
+        wb.slider.disabled = disabled;
+        wb.number.disabled = disabled;
+      }
+      const autoFocus = controls.auto_focus?.input;
+      const focus = controls.focus;
+      if (autoFocus && focus) {
+        const disabled = !focus.supported || autoFocus.checked;
+        focus.slider.disabled = disabled;
+        focus.number.disabled = disabled;
       }
     };
 
+    const controlValueForDisplay = (cameraId, controlId) => {
+      const entry = controlEls[cameraId]?.[controlId];
+      if (!entry) return null;
+      if (entry.kind === "bool") return entry.input.checked ? "On" : "Off";
+      if (entry.kind === "menu") {
+        const opt = entry.input.options[entry.input.selectedIndex];
+        return opt ? opt.textContent : entry.input.value;
+      }
+      return entry.number.value;
+    };
+
+    const renderCurrentConfig = (cameraId) => {
+      const root = $(`${cameraId}CurrentConfig`);
+      if (!root) return;
+      root.innerHTML = "";
+      const items = [];
+      items.push({ label: "Source", value: $(`${cameraId}Source`).value || "-" });
+      items.push({ label: "Preset", value: $(`${cameraId}Preset`).value || "-" });
+      for (const [controlId, entry] of Object.entries(controlEls[cameraId] || {})) {
+        if (entry.wrap.classList.contains("unsupported")) continue;
+        const title = entry.wrap.querySelector(".control-title")?.textContent || controlId;
+        const value = controlValueForDisplay(cameraId, controlId);
+        if (value == null || value === "") continue;
+        items.push({ label: title, value: String(value) });
+      }
+      for (const item of items) {
+        const chip = document.createElement("div");
+        chip.className = "chip";
+        chip.textContent = `${item.label}:${item.value}`;
+        root.appendChild(chip);
+      }
+    };
+
+    const applyLocalState = (cameraId, key, value) => {
+      if (key === "src") $(`${cameraId}Source`).value = value ?? "";
+      else if (key === "preset") $(`${cameraId}Preset`).value = value ?? "";
+      else {
+        const entry = controlEls[cameraId]?.[key];
+        if (!entry) return;
+        if (entry.kind === "bool") entry.input.checked = !!value;
+        else if (entry.kind === "menu") entry.input.value = String(value);
+        else {
+          const safe = value == null ? "" : String(value);
+          entry.slider.value = safe || entry.slider.value;
+          entry.number.value = safe;
+        }
+      }
+      syncDependentControls(cameraId);
+      renderCurrentConfig(cameraId);
+    };
+
+    const savePartial = async (cameraId, payload) => {
+      $(`${cameraId}StatusLine`).textContent = "applying live...";
+      try {
+        await fetchJSON(`/api/settings/${cameraId}`, { method: "POST", body: JSON.stringify(payload) });
+        $(`${cameraId}StatusLine`).textContent = "live applied";
+        renderCurrentConfig(cameraId);
+      } catch (e) {
+        $(`${cameraId}StatusLine`).textContent = "live apply failed";
+      }
+    };
+
+    const queueAutosave = (cameraId, key, value, delayMs = 180) => {
+      applyLocalState(cameraId, key, value);
+      if (autosaveTimers[cameraId]) clearTimeout(autosaveTimers[cameraId]);
+      autosaveTimers[cameraId] = setTimeout(() => {
+        savePartial(cameraId, { [key]: value });
+      }, delayMs);
+    };
+
+    const loadCameraSettings = async () => {
+      cameraData = await fetchJSON("/api/camera/settings");
+      for (const cameraId of ["camL", "camR"]) {
+        const meta = cameraData.cameras[cameraId];
+        $(`${cameraId}Source`).value = meta.src || "";
+        setPresetOptions(cameraId, cameraData.presets, meta.preset || cameraData.defaults?.preset);
+        buildControls(cameraId, meta);
+        $(`${cameraId}Backend`).textContent = `${meta.backend}${meta.backend_available ? "" : " (limited)"}`;
+        $(`${cameraId}StatusLine`).textContent = meta.last_error || "ready";
+      }
+      const noteParts = [];
+      for (const cameraId of ["camL", "camR"]) {
+        const meta = cameraData.cameras[cameraId];
+        if (meta.backend_hint) noteParts.push(`${cameraId}: ${meta.backend_hint}`);
+      }
+      $("backendNote").textContent = noteParts.length ? noteParts.join(" | ") : "Save applies both cameras for the full current BallScope session.";
+    };
+
+    const collectCameraPayload = (cameraId) => {
+      const out = {
+        src: $(`${cameraId}Source`).value,
+        preset: $(`${cameraId}Preset`).value,
+      };
+      const controls = controlEls[cameraId] || {};
+      for (const [controlId, entry] of Object.entries(controls)) {
+        if (entry.kind === "bool") {
+          out[controlId] = !!entry.input.checked;
+        } else if (entry.kind === "menu") {
+          const raw = entry.input.value;
+          out[controlId] = /^-?\d+$/.test(raw) ? parseInt(raw, 10) : raw;
+        } else {
+          const raw = entry.number.value;
+          out[controlId] = raw === "" ? null : parseInt(raw, 10);
+        }
+      }
+      return out;
+    };
+
+    const updateState = (st) => {
+      lastState = st;
+      $("systemStatus").textContent = "Online";
+      const ai = st.ai || {};
+      $("aiStateChip").textContent = `ai:${ai.running ? (ai.state || "running") : "idle"}`;
+      $("activeCamChip").textContent = `active:${ai.active_camera || "-"}`;
+      const camL = st.cameras?.camL;
+      const camR = st.cameras?.camR;
+      if (camL) $("leftStatus").textContent = camL.is_open ? `camL:${camL.fps.toFixed(1)}fps` : "camL:offline";
+      if (camR) $("rightStatus").textContent = camR.is_open ? `camR:${camR.fps.toFixed(1)}fps` : "camR:offline";
+      refreshResultPreview(ai.running !== undefined);
+    };
+
+    $("saveAll").onclick = async () => {
+      const payload = {
+        camL: collectCameraPayload("camL"),
+        camR: collectCameraPayload("camR"),
+      };
+      $("saveStatus").textContent = "saving camera settings...";
+      try {
+        const res = await fetchJSON("/api/camera/settings", { method: "POST", body: JSON.stringify(payload) });
+        cameraData = res;
+        $("saveStatus").textContent = "camera settings saved for this session";
+        await loadCameraSettings();
+      } catch (e) {
+        $("saveStatus").textContent = "save failed";
+      }
+    };
+
+    $("camLSource").addEventListener("input", () => {
+      renderCurrentConfig("camL");
+      if (autosaveTimers.camL) clearTimeout(autosaveTimers.camL);
+      autosaveTimers.camL = setTimeout(() => savePartial("camL", { src: $("camLSource").value }), 350);
+    });
+    $("camRSource").addEventListener("input", () => {
+      renderCurrentConfig("camR");
+      if (autosaveTimers.camR) clearTimeout(autosaveTimers.camR);
+      autosaveTimers.camR = setTimeout(() => savePartial("camR", { src: $("camRSource").value }), 350);
+    });
+    $("camLPreset").addEventListener("change", () => queueAutosave("camL", "preset", $("camLPreset").value, 0));
+    $("camRPreset").addEventListener("change", () => queueAutosave("camR", "preset", $("camRPreset").value, 0));
+
+    $("camLImg").src = previewUrl("camL");
+    $("camRImg").src = previewUrl("camR");
+    $("resultMode").addEventListener("change", () => refreshResultPreview(true));
+    $("resultQuality").addEventListener("change", () => refreshResultPreview(true));
+
+    const startLoop = async () => {
+      await loadCameraSettings();
+      refreshResultPreview(true);
+      const tick = async () => {
+        try {
+          const st = await fetchJSON("/api/state");
+          updateState(st);
+        } catch (e) {}
+      };
+      await tick();
+      setInterval(tick, 1000);
+    };
+
     startLoop();
-    initAudioDevices();
   </script>
 </body>
 </html>
@@ -3676,6 +4217,11 @@ def home():
 @app.get("/record", response_class=HTMLResponse)
 def record_page():
     return HTMLResponse(RECORD_HTML)
+
+
+@app.get("/camera-settings", response_class=HTMLResponse)
+def camera_settings_page():
+    return HTMLResponse(CAMERA_SETTINGS_HTML)
 
 
 @app.get("/live", response_class=HTMLResponse)

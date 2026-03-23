@@ -14,7 +14,17 @@ cd ballscope
 ```bash
 ./setup.sh
 ```
-`setup.sh` installs Homebrew dependencies for BallScope on macOS, including `ffmpeg`, `gstreamer`, and common GStreamer plugins used by recording/audio features.
+`setup.sh` installs Homebrew dependencies for BallScope on macOS, including `ffmpeg`, `gstreamer`, common GStreamer plugins, `node`, and `uvcc`.
+That means the macOS camera-control stack is prepared automatically by the installer:
+- `node` / `npm`
+- `uvcc` via `npm install --global uvcc`
+
+`uvcc` is used by the `Camera Settings` workspace for advanced BRIO controls such as:
+- HDR / backlight compensation
+- auto exposure + manual exposure time
+- white balance
+- focus
+- zoom / pan / tilt
 
 ### NVIDIA Jetson (Linux aarch64)
 Run:
@@ -30,6 +40,7 @@ The installer asks for a PyTorch mode before Jetson Python dependencies:
 
 If CUDA is unavailable, setup fails with guidance.
 When run with `sudo`, setup resets repository ownership back to the invoking user at the end.
+The Linux camera-control stack is also installed automatically by `setup.sh`, including `v4l-utils` / `v4l2-ctl`.
 
 ### Model Download (both Mac and Jetson)
 `setup.sh` downloads all `.pt` files from:
@@ -54,6 +65,14 @@ sudo ./start.sh
 Web UI:
 - Local: `http://localhost:8000`
 - Jetson on LAN: `http://<jetson-ip>:8000`
+
+## Camera Settings Workspace
+Open `Camera Settings` from the home screen to tune both cameras side by side.
+
+Notes:
+- macOS uses `uvcc` for advanced UVC controls.
+- Jetson uses `v4l2-ctl` (`v4l-utils`), which is installed by `setup.sh`.
+- Saved camera settings remain active for the full current BallScope session and are used by recording and live preview pages.
 
 ## 4) Optional Device Override
 ```bash

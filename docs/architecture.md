@@ -20,7 +20,7 @@ BallScope is designed to run the same application logic on:
 - `ballscope/recording/`
   - Processed output recording and raw stream recorders.
 - `ballscope/web/`
-  - FastAPI endpoints, frontend views, and analysis APIs.
+  - FastAPI endpoints, frontend views, recording/live workspaces, camera settings workspace, and analysis APIs.
 - `ballscope/runtime_device.py`
   - Platform and accelerator resolution (`cuda`, `mps`, `cpu`).
 
@@ -44,6 +44,7 @@ Auto device resolution:
 
 ## Operational Reliability
 - Camera reopen on source or preset changes.
+- Session-wide camera settings are applied through one shared state object for live preview and recording.
 - Graceful worker start/stop lifecycle in app lifespan.
 - Recording start/stop endpoints are idempotent.
 - Setup and environment diagnostics are logged by installer.

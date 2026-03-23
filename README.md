@@ -15,6 +15,7 @@ BallScope is an AI-assisted multi-camera football tracking project. It captures 
 - Stream live MJPEG preview in the browser.
 - Record processed output and raw camera streams.
 - Analyze uploaded videos in the web UI.
+- Tune both cameras in a dedicated Camera Settings workspace and keep those settings for the current session.
 
 ## Supported Platforms
 - Apple Silicon macOS (`arm64`, M1/M2/M3/M4)
@@ -75,7 +76,7 @@ Dependencies are split by role:
 - Detects platform (Apple Silicon Mac vs Jetson)
 - Creates/uses `.venv`
 - Installs platform-specific dependencies
-  - macOS: Homebrew packages including `ffmpeg`, `gstreamer` and common GStreamer plugins (used for recording/audio device support)
+  - macOS: Homebrew packages including `ffmpeg`, `gstreamer`, common GStreamer plugins, `node`, and `uvcc` (used for recording/audio support and BRIO camera controls)
 - Downloads model files (`models/*.pt`) from Hugging Face:
   - `https://huggingface.co/RafaelReverberi/ballscope-assets/tree/main/models`
 - On Jetson: ensures PyTorch CUDA is installed before other Python packages
@@ -116,7 +117,7 @@ python main.py
 - Jetson default sources: `/dev/video0`, `/dev/video2`
 - Mac default sources: `0`, `1`
 
-In the UI (Camera Tuning), you can change source values at runtime.
+In the `Camera Settings` workspace, you can change source values and save BRIO camera controls for the current app session. Those settings are then reused by recording and live previews.
 
 ## Main Components
 - `main.py`: app entrypoint
@@ -130,6 +131,13 @@ In the UI (Camera Tuning), you can change source values at runtime.
 - `docs/setup.md`: full setup instructions
 - `docs/jetson_notes.md`: Jetson-specific notes
 - `docs/architecture.md`: architecture and data flow
+
+## Camera Settings Workspace
+- Open `Camera Settings` from the home screen to tune left and right cameras side by side.
+- The page shows a live result preview at the top and both raw camera previews below it.
+- BRIO-relevant controls are exposed on both macOS and Jetson, including HDR/backlight, auto exposure, manual exposure, white balance, focus, zoom, pan, and tilt.
+- On macOS, advanced controls use `uvcc`.
+- On Jetson, advanced controls use `v4l2-ctl`.
 
 ## Troubleshooting
 - If setup fails, inspect the latest installer log in `logs/`.
