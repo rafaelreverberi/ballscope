@@ -73,6 +73,8 @@ Notes:
 - macOS uses `uvcc` for advanced UVC controls.
 - Jetson uses `v4l2-ctl` (`v4l-utils`), which is installed by `setup.sh`.
 - Saved camera settings remain active for the full current BallScope session and are used by recording and live preview pages.
+- You can save the full manually tuned left/right camera setup as a named preset and load it later from the same page.
+- Named camera presets are stored in `camera_presets.json` by default. Override the location with `BALLSCOPE_CAMERA_PRESET_FILE` if needed.
 
 ## 4) Optional Device Override
 ```bash

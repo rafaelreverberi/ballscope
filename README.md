@@ -15,7 +15,7 @@ BallScope is an AI-assisted multi-camera football tracking project. It captures 
 - Stream live MJPEG preview in the browser.
 - Record processed output and raw camera streams.
 - Analyze uploaded videos in the web UI.
-- Tune both cameras in a dedicated Camera Settings workspace and keep those settings for the current session.
+- Tune both cameras in a dedicated Camera Settings workspace, keep those settings for the current session, and save named camera presets for later reuse.
 
 ## Supported Platforms
 - Apple Silicon macOS (`arm64`, M1/M2/M3/M4)
@@ -117,7 +117,7 @@ python main.py
 - Jetson default sources: `/dev/video0`, `/dev/video2`
 - Mac default sources: `0`, `1`
 
-In the `Camera Settings` workspace, you can change source values and save BRIO camera controls for the current app session. Those settings are then reused by recording and live previews.
+In the `Camera Settings` workspace, you can change source values and save BRIO camera controls for the current app session. You can also store the full left/right camera setup as a named preset and reload it later with one click. Session settings and saved presets are reused by recording and live previews.
 
 ## Main Components
 - `main.py`: app entrypoint
@@ -138,6 +138,8 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 - BRIO-relevant controls are exposed on both macOS and Jetson, including HDR/backlight, auto exposure, manual exposure, white balance, focus, zoom, pan, and tilt.
 - On macOS, advanced controls use `uvcc`.
 - On Jetson, advanced controls use `v4l2-ctl`.
+- Named camera presets save the full current left/right camera configuration, including source, quality preset, and manual control values.
+- Saved camera presets are stored in `camera_presets.json` by default. You can override the path with `BALLSCOPE_CAMERA_PRESET_FILE`.
 
 ## Troubleshooting
 - If setup fails, inspect the latest installer log in `logs/`.

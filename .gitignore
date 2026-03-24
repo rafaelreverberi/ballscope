@@ -213,6 +213,8 @@ uploads/*
 recordings/*
 models/*
 wheels/*
+camera_presets.json
+camera_presets*.json
 
 # But keep placeholder file
 !uploads/.gitkeep

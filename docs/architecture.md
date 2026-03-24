@@ -45,6 +45,7 @@ Auto device resolution:
 ## Operational Reliability
 - Camera reopen on source or preset changes.
 - Session-wide camera settings are applied through one shared state object for live preview and recording.
+- Named camera presets persist complete left/right camera configurations in a shared JSON store and can be reapplied through the same settings API on macOS and Jetson.
 - Graceful worker start/stop lifecycle in app lifespan.
 - Recording start/stop endpoints are idempotent.
 - Setup and environment diagnostics are logged by installer.

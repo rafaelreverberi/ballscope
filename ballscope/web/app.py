@@ -10,7 +10,7 @@ import uuid
 from collections import defaultdict, deque
 from pathlib import Path
 from dataclasses import asdict
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 from contextlib import asynccontextmanager
 
 import cv2
@@ -100,6 +100,23 @@ ANALYSIS_TARGET_FPS = 30
 ANALYSIS_ENCODE_CRF = 14
 ANALYSIS_ENCODE_PRESET = "slow"
 ANALYSIS_ENCODE_PRESET_SPEED_UP = "medium"
+CAMERA_PRESET_FILE = Path(os.getenv("BALLSCOPE_CAMERA_PRESET_FILE", "camera_presets.json"))
+CAMERA_PRESET_LOCK = threading.Lock()
+CAMERA_INT_SETTING_KEYS = [
+    "brightness",
+    "contrast",
+    "saturation",
+    "sharpness",
+    "gain",
+    "power_line_frequency",
+    "white_balance_temperature",
+    "exposure_time",
+    "focus",
+    "zoom",
+    "pan",
+    "tilt",
+]
+CAMERA_BOOL_SETTING_KEYS = ["auto_wb", "auto_exposure", "exposure_priority", "hdr", "auto_focus"]
 
 
 def _analysis_load_model(model_path: str):
@@ -116,6 +133,64 @@ def _analysis_load_model(model_path: str):
 
 def _analysis_clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
+
+
+def _camera_preset_store_default() -> Dict[str, Any]:
+    return {"version": 1, "presets": {}}
+
+
+def _camera_preset_name(raw: Any) -> str:
+    return str(raw or "").strip()
+
+
+def _read_camera_preset_store() -> Dict[str, Any]:
+    try:
+        if not CAMERA_PRESET_FILE.exists():
+            return _camera_preset_store_default()
+        data = json.loads(CAMERA_PRESET_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return _camera_preset_store_default()
+        presets = data.get("presets")
+        if not isinstance(presets, dict):
+            data["presets"] = {}
+        if "version" not in data:
+            data["version"] = 1
+        return data
+    except Exception:
+        return _camera_preset_store_default()
+
+
+def _write_camera_preset_store(store: Dict[str, Any]) -> None:
+    CAMERA_PRESET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CAMERA_PRESET_FILE.write_text(json.dumps(store, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _camera_payload_from_state(camera_id: str) -> Dict[str, Any]:
+    state = CAMERA_STATES[camera_id]
+    settings = state.settings
+    payload: Dict[str, Any] = {
+        "src": state.src,
+        "preset": settings.preset,
+    }
+    for key in CAMERA_INT_SETTING_KEYS + CAMERA_BOOL_SETTING_KEYS:
+        payload[key] = getattr(settings, key, None)
+    return payload
+
+
+def _camera_preset_summary(store: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    data = store if store is not None else _read_camera_preset_store()
+    items = []
+    for name, entry in sorted((data.get("presets") or {}).items()):
+        if not isinstance(entry, dict):
+            continue
+        items.append(
+            {
+                "name": name,
+                "updated_at": entry.get("updated_at"),
+                "notes": entry.get("notes") or "",
+            }
+        )
+    return items
 
 
 def _analysis_parse_fps(raw: str) -> float:
@@ -1098,6 +1173,7 @@ def api_audio_devices():
 def api_camera_settings():
     return {
         "presets": QUALITY_PRESETS,
+        "saved_presets": _camera_preset_summary(),
         "defaults": {
             "preset": DEFAULT_PRESET,
         },
@@ -1128,20 +1204,7 @@ def _apply_camera_settings(camera_id: str, body: dict) -> dict:
             st.preset = preset
             preset_changed = True
 
-    for key in [
-        "brightness",
-        "contrast",
-        "saturation",
-        "sharpness",
-        "gain",
-        "power_line_frequency",
-        "white_balance_temperature",
-        "exposure_time",
-        "focus",
-        "zoom",
-        "pan",
-        "tilt",
-    ]:
+    for key in CAMERA_INT_SETTING_KEYS:
         if key in body:
             val = body[key]
             if val is None:
@@ -1152,7 +1215,7 @@ def _apply_camera_settings(camera_id: str, body: dict) -> dict:
                 except Exception:
                     raise HTTPException(status_code=400, detail=f"Invalid {key}")
 
-    for key in ["auto_wb", "auto_exposure", "exposure_priority", "hdr", "auto_focus"]:
+    for key in CAMERA_BOOL_SETTING_KEYS:
         if key in body:
             val = body[key]
             if val is None:
@@ -1184,11 +1247,82 @@ async def save_camera_settings(request: Request):
     return {
         "ok": True,
         "results": results,
+        "saved_presets": _camera_preset_summary(),
         "cameras": {
             "camL": _camera_settings_payload("camL"),
             "camR": _camera_settings_payload("camR"),
         },
     }
+
+
+@app.get("/api/camera/presets")
+def api_camera_presets():
+    return {"presets": _camera_preset_summary()}
+
+
+@app.post("/api/camera/presets")
+async def save_camera_preset(request: Request):
+    body = await request.json()
+    name = _camera_preset_name(body.get("name"))
+    if not name:
+        raise HTTPException(status_code=400, detail="Preset name is required")
+    notes = str(body.get("notes") or "").strip()
+    cameras_body = body.get("cameras") or {}
+    entry = {
+        "name": name,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "notes": notes,
+        "cameras": {
+            "camL": cameras_body.get("camL") if isinstance(cameras_body.get("camL"), dict) else _camera_payload_from_state("camL"),
+            "camR": cameras_body.get("camR") if isinstance(cameras_body.get("camR"), dict) else _camera_payload_from_state("camR"),
+        },
+    }
+    with CAMERA_PRESET_LOCK:
+        store = _read_camera_preset_store()
+        store["presets"][name] = entry
+        _write_camera_preset_store(store)
+        presets = _camera_preset_summary(store)
+    return {"ok": True, "preset": entry, "presets": presets}
+
+
+@app.post("/api/camera/presets/{preset_name}/load")
+def load_camera_preset(preset_name: str):
+    name = _camera_preset_name(preset_name)
+    with CAMERA_PRESET_LOCK:
+        store = _read_camera_preset_store()
+        entry = (store.get("presets") or {}).get(name)
+    if not isinstance(entry, dict):
+        raise HTTPException(status_code=404, detail="Unknown camera preset")
+    cameras = entry.get("cameras") or {}
+    results = {}
+    for camera_id in ["camL", "camR"]:
+        payload = cameras.get(camera_id)
+        if isinstance(payload, dict):
+            results[camera_id] = _apply_camera_settings(camera_id, payload)
+    return {
+        "ok": True,
+        "name": name,
+        "results": results,
+        "saved_presets": _camera_preset_summary(),
+        "cameras": {
+            "camL": _camera_settings_payload("camL"),
+            "camR": _camera_settings_payload("camR"),
+        },
+    }
+
+
+@app.delete("/api/camera/presets/{preset_name}")
+def delete_camera_preset(preset_name: str):
+    name = _camera_preset_name(preset_name)
+    with CAMERA_PRESET_LOCK:
+        store = _read_camera_preset_store()
+        presets = store.get("presets") or {}
+        if name not in presets:
+            raise HTTPException(status_code=404, detail="Unknown camera preset")
+        del presets[name]
+        _write_camera_preset_store(store)
+        summary = _camera_preset_summary(store)
+    return {"ok": True, "name": name, "presets": summary}
 
 
 @app.post("/api/record/start")
@@ -3774,6 +3908,24 @@ CAMERA_SETTINGS_HTML = r"""
           <div class="chip" id="leftStatus">camL:-</div>
           <div class="chip" id="rightStatus">camR:-</div>
         </div>
+        <div class="row" style="margin-top:14px;">
+          <div>
+            <label>Saved Camera Preset</label>
+            <select id="savedPresetSelect">
+              <option value="">No saved preset</option>
+            </select>
+          </div>
+          <div>
+            <label>Preset Name</label>
+            <input id="savedPresetName" type="text" placeholder="football-match-day"/>
+          </div>
+        </div>
+        <div class="save-bar" style="margin-top:10px;">
+          <button type="button" id="loadSavedPreset">Load Preset</button>
+          <button type="button" id="saveNamedPreset">Save Current As Preset</button>
+          <button type="button" id="deleteSavedPreset">Delete Preset</button>
+        </div>
+        <div class="statusline" id="savedPresetStatus">Preset storage keeps your manually tuned left and right camera setup for later sessions.</div>
         <div class="save-bar" style="margin-top:14px;">
           <button type="button" class="primary" id="saveAll">Save Camera Settings</button>
         </div>
@@ -3875,6 +4027,30 @@ CAMERA_SETTINGS_HTML = r"""
     let streamNonce = 0;
 
     const previewUrl = (cameraId) => `/video/cam/${cameraId}.mjpg?v=${Date.now()}`;
+    const presetDisplayLabel = (preset) => {
+      if (!preset || !preset.name) return "";
+      return preset.updated_at ? `${preset.name} (${preset.updated_at})` : preset.name;
+    };
+
+    const setSavedPresetOptions = (presets, preferredName = "") => {
+      const select = $("savedPresetSelect");
+      const current = preferredName || select.value || "";
+      select.innerHTML = "";
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "No saved preset";
+      select.appendChild(empty);
+      for (const preset of (presets || [])) {
+        const opt = document.createElement("option");
+        opt.value = preset.name;
+        opt.textContent = presetDisplayLabel(preset);
+        if (preset.name === current) opt.selected = true;
+        select.appendChild(opt);
+      }
+      if (current && !Array.from(select.options).some((opt) => opt.value === current)) {
+        select.value = "";
+      }
+    };
 
     const refreshResultPreview = (force = false) => {
       const mode = $("resultMode").value || "auto";
@@ -4106,6 +4282,7 @@ CAMERA_SETTINGS_HTML = r"""
 
     const loadCameraSettings = async () => {
       cameraData = await fetchJSON("/api/camera/settings");
+      setSavedPresetOptions(cameraData.saved_presets || []);
       for (const cameraId of ["camL", "camR"]) {
         const meta = cameraData.cameras[cameraId];
         $(`${cameraId}Source`).value = meta.src || "";
@@ -4168,6 +4345,76 @@ CAMERA_SETTINGS_HTML = r"""
         await loadCameraSettings();
       } catch (e) {
         $("saveStatus").textContent = "save failed";
+      }
+    };
+
+    $("savedPresetSelect").addEventListener("change", () => {
+      $("savedPresetName").value = $("savedPresetSelect").value || "";
+    });
+
+    $("saveNamedPreset").onclick = async () => {
+      const name = ($("savedPresetName").value || "").trim();
+      if (!name) {
+        $("savedPresetStatus").textContent = "preset name required";
+        return;
+      }
+      $("savedPresetStatus").textContent = "saving preset...";
+      try {
+        const res = await fetchJSON("/api/camera/presets", {
+          method: "POST",
+          body: JSON.stringify({
+            name,
+            cameras: {
+              camL: collectCameraPayload("camL"),
+              camR: collectCameraPayload("camR"),
+            },
+          }),
+        });
+        setSavedPresetOptions(res.presets || [], name);
+        $("savedPresetSelect").value = name;
+        $("savedPresetStatus").textContent = `preset saved: ${name}`;
+      } catch (e) {
+        $("savedPresetStatus").textContent = "preset save failed";
+      }
+    };
+
+    $("loadSavedPreset").onclick = async () => {
+      const name = ($("savedPresetSelect").value || $("savedPresetName").value || "").trim();
+      if (!name) {
+        $("savedPresetStatus").textContent = "select a preset first";
+        return;
+      }
+      $("savedPresetStatus").textContent = "loading preset...";
+      try {
+        const res = await fetchJSON(`/api/camera/presets/${encodeURIComponent(name)}/load`, {
+          method: "POST",
+        });
+        setSavedPresetOptions(res.saved_presets || [], name);
+        $("savedPresetName").value = name;
+        await loadCameraSettings();
+        $("savedPresetSelect").value = name;
+        $("savedPresetStatus").textContent = `preset loaded: ${name}`;
+      } catch (e) {
+        $("savedPresetStatus").textContent = "preset load failed";
+      }
+    };
+
+    $("deleteSavedPreset").onclick = async () => {
+      const name = ($("savedPresetSelect").value || $("savedPresetName").value || "").trim();
+      if (!name) {
+        $("savedPresetStatus").textContent = "select a preset first";
+        return;
+      }
+      $("savedPresetStatus").textContent = "deleting preset...";
+      try {
+        const res = await fetchJSON(`/api/camera/presets/${encodeURIComponent(name)}`, {
+          method: "DELETE",
+        });
+        setSavedPresetOptions(res.presets || []);
+        $("savedPresetName").value = "";
+        $("savedPresetStatus").textContent = `preset deleted: ${name}`;
+      } catch (e) {
+        $("savedPresetStatus").textContent = "preset delete failed";
       }
     };
 
