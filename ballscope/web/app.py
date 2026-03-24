@@ -43,6 +43,7 @@ from ballscope.runtime_device import resolve_torch_device, runtime_device_option
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _autoload_last_camera_preset()
     mac_ok, _mac_msg = prepare_macos_camera_access([state.src for state in CAMERA_STATES.values()])
     if mac_ok:
         for worker in CAMERA_WORKERS.values():
@@ -136,7 +137,7 @@ def _analysis_clamp(v: int, lo: int, hi: int) -> int:
 
 
 def _camera_preset_store_default() -> Dict[str, Any]:
-    return {"version": 1, "presets": {}}
+    return {"version": 1, "presets": {}, "meta": {"auto_load_last": False, "last_used": ""}}
 
 
 def _camera_preset_name(raw: Any) -> str:
@@ -153,6 +154,12 @@ def _read_camera_preset_store() -> Dict[str, Any]:
         presets = data.get("presets")
         if not isinstance(presets, dict):
             data["presets"] = {}
+        meta = data.get("meta")
+        if not isinstance(meta, dict):
+            data["meta"] = {"auto_load_last": False, "last_used": ""}
+        else:
+            meta.setdefault("auto_load_last", False)
+            meta.setdefault("last_used", "")
         if "version" not in data:
             data["version"] = 1
         return data
@@ -191,6 +198,38 @@ def _camera_preset_summary(store: Optional[Dict[str, Any]] = None) -> List[Dict[
             }
         )
     return items
+
+
+def _camera_preset_meta(store: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    data = store if store is not None else _read_camera_preset_store()
+    meta = data.get("meta")
+    if not isinstance(meta, dict):
+        return {"auto_load_last": False, "last_used": ""}
+    return {
+        "auto_load_last": bool(meta.get("auto_load_last")),
+        "last_used": _camera_preset_name(meta.get("last_used")),
+    }
+
+
+def _apply_camera_preset_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    cameras = entry.get("cameras") or {}
+    results = {}
+    for camera_id in ["camL", "camR"]:
+        payload = cameras.get(camera_id)
+        if isinstance(payload, dict):
+            results[camera_id] = _apply_camera_settings(camera_id, payload)
+    return results
+
+
+def _autoload_last_camera_preset() -> None:
+    with CAMERA_PRESET_LOCK:
+        store = _read_camera_preset_store()
+        meta = _camera_preset_meta(store)
+        if not meta["auto_load_last"] or not meta["last_used"]:
+            return
+        entry = (store.get("presets") or {}).get(meta["last_used"])
+    if isinstance(entry, dict):
+        _apply_camera_preset_entry(entry)
 
 
 def _analysis_parse_fps(raw: str) -> float:
@@ -1174,6 +1213,7 @@ def api_camera_settings():
     return {
         "presets": QUALITY_PRESETS,
         "saved_presets": _camera_preset_summary(),
+        "preset_meta": _camera_preset_meta(),
         "defaults": {
             "preset": DEFAULT_PRESET,
         },
@@ -1257,7 +1297,7 @@ async def save_camera_settings(request: Request):
 
 @app.get("/api/camera/presets")
 def api_camera_presets():
-    return {"presets": _camera_preset_summary()}
+    return {"presets": _camera_preset_summary(), "meta": _camera_preset_meta()}
 
 
 @app.post("/api/camera/presets")
@@ -1280,9 +1320,11 @@ async def save_camera_preset(request: Request):
     with CAMERA_PRESET_LOCK:
         store = _read_camera_preset_store()
         store["presets"][name] = entry
+        store["meta"]["last_used"] = name
         _write_camera_preset_store(store)
         presets = _camera_preset_summary(store)
-    return {"ok": True, "preset": entry, "presets": presets}
+        meta = _camera_preset_meta(store)
+    return {"ok": True, "preset": entry, "presets": presets, "meta": meta}
 
 
 @app.post("/api/camera/presets/{preset_name}/load")
@@ -1293,17 +1335,19 @@ def load_camera_preset(preset_name: str):
         entry = (store.get("presets") or {}).get(name)
     if not isinstance(entry, dict):
         raise HTTPException(status_code=404, detail="Unknown camera preset")
-    cameras = entry.get("cameras") or {}
-    results = {}
-    for camera_id in ["camL", "camR"]:
-        payload = cameras.get(camera_id)
-        if isinstance(payload, dict):
-            results[camera_id] = _apply_camera_settings(camera_id, payload)
+    results = _apply_camera_preset_entry(entry)
+    with CAMERA_PRESET_LOCK:
+        store = _read_camera_preset_store()
+        if name in (store.get("presets") or {}):
+            store["meta"]["last_used"] = name
+            _write_camera_preset_store(store)
+        meta = _camera_preset_meta(store)
     return {
         "ok": True,
         "name": name,
         "results": results,
         "saved_presets": _camera_preset_summary(),
+        "preset_meta": meta,
         "cameras": {
             "camL": _camera_settings_payload("camL"),
             "camR": _camera_settings_payload("camR"),
@@ -1320,9 +1364,30 @@ def delete_camera_preset(preset_name: str):
         if name not in presets:
             raise HTTPException(status_code=404, detail="Unknown camera preset")
         del presets[name]
+        if _camera_preset_name(store["meta"].get("last_used")) == name:
+            store["meta"]["last_used"] = ""
         _write_camera_preset_store(store)
         summary = _camera_preset_summary(store)
-    return {"ok": True, "name": name, "presets": summary}
+        meta = _camera_preset_meta(store)
+    return {"ok": True, "name": name, "presets": summary, "meta": meta}
+
+
+@app.post("/api/camera/presets/meta")
+async def update_camera_preset_meta(request: Request):
+    body = await request.json()
+    with CAMERA_PRESET_LOCK:
+        store = _read_camera_preset_store()
+        if "auto_load_last" in body:
+            store["meta"]["auto_load_last"] = bool(body.get("auto_load_last"))
+        if "last_used" in body:
+            last_used = _camera_preset_name(body.get("last_used"))
+            if last_used and last_used not in (store.get("presets") or {}):
+                raise HTTPException(status_code=404, detail="Unknown camera preset")
+            store["meta"]["last_used"] = last_used
+        _write_camera_preset_store(store)
+        meta = _camera_preset_meta(store)
+        presets = _camera_preset_summary(store)
+    return {"ok": True, "meta": meta, "presets": presets}
 
 
 @app.post("/api/record/start")
@@ -3925,6 +3990,10 @@ CAMERA_SETTINGS_HTML = r"""
           <button type="button" id="saveNamedPreset">Save Current As Preset</button>
           <button type="button" id="deleteSavedPreset">Delete Preset</button>
         </div>
+        <label style="display:flex; align-items:center; gap:10px; margin-top:10px;">
+          <input id="autoLoadLastPreset" type="checkbox"/>
+          <span>Auto-load last used preset on startup</span>
+        </label>
         <div class="statusline" id="savedPresetStatus">Preset storage keeps your manually tuned left and right camera setup for later sessions.</div>
         <div class="save-bar" style="margin-top:14px;">
           <button type="button" class="primary" id="saveAll">Save Camera Settings</button>
@@ -4025,6 +4094,7 @@ CAMERA_SETTINGS_HTML = r"""
     let lastState = null;
     let resultKey = "";
     let streamNonce = 0;
+    let presetMeta = { auto_load_last: false, last_used: "" };
 
     const previewUrl = (cameraId) => `/video/cam/${cameraId}.mjpg?v=${Date.now()}`;
     const presetDisplayLabel = (preset) => {
@@ -4034,7 +4104,7 @@ CAMERA_SETTINGS_HTML = r"""
 
     const setSavedPresetOptions = (presets, preferredName = "") => {
       const select = $("savedPresetSelect");
-      const current = preferredName || select.value || "";
+      const current = preferredName || presetMeta.last_used || select.value || "";
       select.innerHTML = "";
       const empty = document.createElement("option");
       empty.value = "";
@@ -4049,6 +4119,17 @@ CAMERA_SETTINGS_HTML = r"""
       }
       if (current && !Array.from(select.options).some((opt) => opt.value === current)) {
         select.value = "";
+      }
+    };
+
+    const applyPresetMeta = (meta = {}) => {
+      presetMeta = {
+        auto_load_last: !!meta.auto_load_last,
+        last_used: meta.last_used || "",
+      };
+      $("autoLoadLastPreset").checked = presetMeta.auto_load_last;
+      if (presetMeta.last_used) {
+        $("savedPresetName").value = presetMeta.last_used;
       }
     };
 
@@ -4282,6 +4363,7 @@ CAMERA_SETTINGS_HTML = r"""
 
     const loadCameraSettings = async () => {
       cameraData = await fetchJSON("/api/camera/settings");
+      applyPresetMeta(cameraData.preset_meta || {});
       setSavedPresetOptions(cameraData.saved_presets || []);
       for (const cameraId of ["camL", "camR"]) {
         const meta = cameraData.cameras[cameraId];
@@ -4349,7 +4431,30 @@ CAMERA_SETTINGS_HTML = r"""
     };
 
     $("savedPresetSelect").addEventListener("change", () => {
-      $("savedPresetName").value = $("savedPresetSelect").value || "";
+      const selected = $("savedPresetSelect").value || "";
+      $("savedPresetName").value = selected;
+      presetMeta.last_used = selected;
+    });
+
+    $("autoLoadLastPreset").addEventListener("change", async () => {
+      const selectedName = ($("savedPresetSelect").value || $("savedPresetName").value || presetMeta.last_used || "").trim();
+      try {
+        const res = await fetchJSON("/api/camera/presets/meta", {
+          method: "POST",
+          body: JSON.stringify({
+            auto_load_last: $("autoLoadLastPreset").checked,
+            last_used: selectedName,
+          }),
+        });
+        applyPresetMeta(res.meta || {});
+        setSavedPresetOptions(res.presets || [], presetMeta.last_used);
+        $("savedPresetStatus").textContent = presetMeta.auto_load_last
+          ? "auto-load enabled for last used preset"
+          : "auto-load disabled";
+      } catch (e) {
+        $("autoLoadLastPreset").checked = !!presetMeta.auto_load_last;
+        $("savedPresetStatus").textContent = "auto-load update failed";
+      }
     });
 
     $("saveNamedPreset").onclick = async () => {
@@ -4370,6 +4475,7 @@ CAMERA_SETTINGS_HTML = r"""
             },
           }),
         });
+        applyPresetMeta(res.meta || {});
         setSavedPresetOptions(res.presets || [], name);
         $("savedPresetSelect").value = name;
         $("savedPresetStatus").textContent = `preset saved: ${name}`;
@@ -4389,6 +4495,7 @@ CAMERA_SETTINGS_HTML = r"""
         const res = await fetchJSON(`/api/camera/presets/${encodeURIComponent(name)}/load`, {
           method: "POST",
         });
+        applyPresetMeta(res.preset_meta || {});
         setSavedPresetOptions(res.saved_presets || [], name);
         $("savedPresetName").value = name;
         await loadCameraSettings();
@@ -4410,6 +4517,7 @@ CAMERA_SETTINGS_HTML = r"""
         const res = await fetchJSON(`/api/camera/presets/${encodeURIComponent(name)}`, {
           method: "DELETE",
         });
+        applyPresetMeta(res.meta || {});
         setSavedPresetOptions(res.presets || []);
         $("savedPresetName").value = "";
         $("savedPresetStatus").textContent = `preset deleted: ${name}`;

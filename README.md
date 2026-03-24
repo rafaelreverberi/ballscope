@@ -140,6 +140,7 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 - On Jetson, advanced controls use `v4l2-ctl`.
 - Named camera presets save the full current left/right camera configuration, including source, quality preset, and manual control values.
 - Saved camera presets are stored in `camera_presets.json` by default. You can override the path with `BALLSCOPE_CAMERA_PRESET_FILE`.
+- In the Camera Settings page, you can enable automatic loading of the last used preset on app startup.
 
 ## Troubleshooting
 - If setup fails, inspect the latest installer log in `logs/`.

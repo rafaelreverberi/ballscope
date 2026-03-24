@@ -75,6 +75,7 @@ Notes:
 - Saved camera settings remain active for the full current BallScope session and are used by recording and live preview pages.
 - You can save the full manually tuned left/right camera setup as a named preset and load it later from the same page.
 - Named camera presets are stored in `camera_presets.json` by default. Override the location with `BALLSCOPE_CAMERA_PRESET_FILE` if needed.
+- The Camera Settings page can also auto-load the last used preset on startup when the checkbox below the preset controls is enabled.
 
 ## 4) Optional Device Override
 ```bash
