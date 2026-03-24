@@ -158,8 +158,8 @@ CONTROL_SPECS = {
 
 LINUX_CTRL_ALIASES = {
     "hdr": ["backlight_compensation"],
-    "auto_exposure": ["auto_exposure"],
-    "exposure_time": ["exposure_time_absolute"],
+    "auto_exposure": ["auto_exposure", "exposure_auto"],
+    "exposure_time": ["exposure_time_absolute", "exposure_absolute"],
     "exposure_priority": ["exposure_dynamic_framerate", "auto_exposure_bias"],
     "brightness": ["brightness"],
     "contrast": ["contrast"],
@@ -169,7 +169,7 @@ LINUX_CTRL_ALIASES = {
     "power_line_frequency": ["power_line_frequency"],
     "auto_wb": ["white_balance_automatic", "white_balance_temperature_auto"],
     "white_balance_temperature": ["white_balance_temperature"],
-    "auto_focus": ["focus_automatic_continuous"],
+    "auto_focus": ["focus_automatic_continuous", "focus_auto"],
     "focus": ["focus_absolute"],
     "zoom": ["zoom_absolute"],
     "pan": ["pan_absolute"],
