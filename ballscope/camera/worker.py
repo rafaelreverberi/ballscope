@@ -677,7 +677,7 @@ def apply_camera_controls(src: str, settings: "CameraSettings") -> Tuple[bool, s
                 set_ctrl(ctrl, int(settings.exposure_time))
 
         for key in ["brightness", "contrast", "saturation", "sharpness", "gain", "power_line_frequency", "zoom", "pan", "tilt"]:
-            value = getattr(settings, key)
+            value = getattr(settings, key, None)
             if value is None:
                 continue
             linux_name = first_existing(key, LINUX_CTRL_ALIASES[key][0])
@@ -722,7 +722,7 @@ def apply_camera_controls(src: str, settings: "CameraSettings") -> Tuple[bool, s
             set_uvcc("absolute_exposure_time", int(settings.exposure_time))
 
         for key in ["brightness", "contrast", "saturation", "sharpness", "gain", "power_line_frequency", "white_balance_temperature", "zoom"]:
-            value = getattr(settings, key)
+            value = getattr(settings, key, None)
             if value is None:
                 continue
             if key == "white_balance_temperature" and settings.auto_wb is not False:
@@ -759,6 +759,7 @@ class CameraSettings:
     saturation: Optional[int] = None
     sharpness: Optional[int] = None
     gain: Optional[int] = None
+    power_line_frequency: Optional[int] = None
     auto_wb: Optional[bool] = True
     white_balance_temperature: Optional[int] = None
     auto_exposure: Optional[bool] = True
