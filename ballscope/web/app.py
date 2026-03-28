@@ -1231,6 +1231,7 @@ def _apply_camera_settings(camera_id: str, body: dict) -> dict:
 
     preset_changed = False
     src_changed = False
+    control_changed = False
     src = body.get("src")
     if src is not None:
         if str(src) != CAMERA_STATES[camera_id].src:
@@ -1254,6 +1255,7 @@ def _apply_camera_settings(camera_id: str, body: dict) -> dict:
                     setattr(st, key, int(val))
                 except Exception:
                     raise HTTPException(status_code=400, detail=f"Invalid {key}")
+            control_changed = True
 
     for key in CAMERA_BOOL_SETTING_KEYS:
         if key in body:
@@ -1262,10 +1264,12 @@ def _apply_camera_settings(camera_id: str, body: dict) -> dict:
                 setattr(st, key, None)
             else:
                 setattr(st, key, bool(val))
+            control_changed = True
 
     if preset_changed or src_changed:
         CAMERA_WORKERS[camera_id].request_reopen()
-    CAMERA_WORKERS[camera_id].apply_driver_controls_now()
+    elif control_changed:
+        CAMERA_WORKERS[camera_id].apply_driver_controls_now()
 
     return {"ok": True, "camera_id": camera_id, "settings": asdict(st)}
 
@@ -4224,7 +4228,7 @@ CAMERA_SETTINGS_HTML = r"""
       number.disabled = slider.disabled;
       slider.addEventListener("input", () => { number.value = slider.value; });
       number.addEventListener("input", () => { slider.value = number.value; });
-      slider.addEventListener("input", () => queueAutosave(cameraId, control.id, parseInt(slider.value || "0", 10), 220));
+      slider.addEventListener("change", () => queueAutosave(cameraId, control.id, parseInt(slider.value || "0", 10), 0));
       number.addEventListener("input", () => queueAutosave(cameraId, control.id, number.value === "" ? null : parseInt(number.value, 10), 220));
       pair.appendChild(slider);
       pair.appendChild(number);
