@@ -82,6 +82,9 @@ class CameraViewState:
     center: Optional[tuple[float, float]] = None
     velocity: tuple[float, float] = (0.0, 0.0)
     zoom: float = 1.0
+    shot_target_center: Optional[tuple[float, float]] = None
+    shot_target_zoom: float = 1.0
+    last_shot_update_frame: int = 0
 
 
 @dataclass
@@ -184,14 +187,17 @@ class OfflineAnalysisEngine:
         self.hold_frames = max(3, int(round(config.target_fps * 0.45)))
         self.lost_short_frames = max(self.hold_frames + 1, int(round(config.target_fps * 1.4)))
         self.lost_long_frames = max(self.lost_short_frames + 1, int(round(config.target_fps * 3.0)))
-        self.roi_interval_tracked = max(4, int(round(config.target_fps * 0.35)))
-        self.roi_interval_hold = max(6, int(round(config.target_fps * 0.55)))
+        self.roi_interval_tracked = max(8, int(round(config.target_fps * 0.70)))
+        self.roi_interval_hold = max(10, int(round(config.target_fps * 0.90)))
         self.full_interval_unknown = max(8, int(round(config.target_fps * 1.0)))
         self.full_interval_lost_short = max(6, int(round(config.target_fps * 0.7)))
         self.full_interval_hold = max(10, int(round(config.target_fps * 1.2)))
         self.full_interval_tracked = max(16, int(round(config.target_fps * 2.0)))
         self.max_ball_speed_px_per_sec = 0.42 * 1920.0
         self.large_jump_confirm_frames = max(2, int(round(config.target_fps * 0.18)))
+        self.shot_hold_frames = max(24, int(round(config.target_fps * 2.2)))
+        self.shot_break_distance_px = 220.0
+        self.shot_break_distance_y_px = 140.0
 
     def process_frame(
         self,
@@ -768,69 +774,129 @@ class OfflineAnalysisEngine:
         tactical_center = (w / 2.0, h / 2.0)
         if self.camera.center is None:
             self.camera.center = tactical_center
+        if self.camera.shot_target_center is None:
+            self.camera.shot_target_center = tactical_center
+            self.camera.shot_target_zoom = self.camera.zoom
+            self.camera.last_shot_update_frame = frame_idx
 
-        target_center = tactical_center
-        target_zoom = 1.0
+        proposed_center = tactical_center
+        proposed_zoom = 1.0
         if self.fused.phase == "TRACKED" and best is not None:
-            lead = 0.10
-            target_center = (
-                best.master_center[0] + self.fused.velocity[0] * lead,
-                best.master_center[1] + self.fused.velocity[1] * lead,
-            )
-            target_zoom = self._tracked_zoom(best, render_shape)
+            lead = 0.04
+            proposed_center = self._comfortable_tracking_center(best, render_shape, lead)
+            proposed_zoom = self._tracked_zoom(best, render_shape)
         elif self.fused.phase == "HOLD_SHORT":
-            target_center = self.fused.last_safe_center or self.camera.center
-            target_zoom = max(1.08, self.camera.zoom * 0.985)
+            proposed_center = self.fused.last_safe_center or self.camera.center
+            proposed_zoom = max(1.08, self.camera.zoom * 0.995)
         elif self.fused.phase == "LOST_SHORT":
             safe = self.fused.last_safe_center or self.camera.center
-            target_center = (
+            proposed_center = (
                 safe[0] * 0.78 + tactical_center[0] * 0.22,
                 safe[1] * 0.78 + tactical_center[1] * 0.22,
             )
-            target_zoom = max(1.0, self.camera.zoom * 0.95)
+            proposed_zoom = max(1.0, self.camera.zoom * 0.985)
         elif self.fused.phase in {"LOST_LONG", "UNKNOWN"}:
-            target_center = tactical_center
-            target_zoom = 1.0
+            proposed_center = tactical_center
+            proposed_zoom = 1.0
+
+        self._update_shot_targets(frame_idx, proposed_center, proposed_zoom)
+        target_center = self.camera.shot_target_center or tactical_center
+        target_zoom = self.camera.shot_target_zoom
 
         cx, cy = self.camera.center
-        deadzone = max(10.0, min(w, h) * 0.035)
+        deadzone = max(18.0, min(w, h) * 0.055)
         dx = target_center[0] - cx
         dy = target_center[1] - cy
         if abs(dx) < deadzone:
             dx = 0.0
         if abs(dy) < deadzone:
             dy = 0.0
-        accel = max(6.0, min(w, h) * 0.012)
+        accel = max(2.5, min(w, h) * 0.005)
         self.camera.velocity = (
-            max(-accel, min(accel, self.camera.velocity[0] * 0.88 + dx * 0.08)),
-            max(-accel, min(accel, self.camera.velocity[1] * 0.88 + dy * 0.08)),
+            max(-accel, min(accel, self.camera.velocity[0] * 0.94 + dx * 0.028)),
+            max(-accel, min(accel, self.camera.velocity[1] * 0.94 + dy * 0.028)),
         )
         if self.fused.phase in {"LOST_LONG", "UNKNOWN"}:
-            self.camera.velocity = (self.camera.velocity[0] * 0.72, self.camera.velocity[1] * 0.72)
+            self.camera.velocity = (self.camera.velocity[0] * 0.84, self.camera.velocity[1] * 0.84)
         self.camera.center = (
             float(cx + self.camera.velocity[0]),
             float(cy + self.camera.velocity[1]),
         )
-        zoom_alpha = 0.045 if self.fused.phase == "TRACKED" else 0.035
+        zoom_alpha = 0.008 if self.fused.phase == "TRACKED" else 0.012
         self.camera.zoom = float(max(1.0, min(4.0, self.camera.zoom * (1.0 - zoom_alpha) + target_zoom * zoom_alpha)))
         self.camera.center = (
             float(max(0.0, min(w, self.camera.center[0]))),
             float(max(0.0, min(h, self.camera.center[1]))),
         )
 
+    def _update_shot_targets(
+        self,
+        frame_idx: int,
+        proposed_center: tuple[float, float],
+        proposed_zoom: float,
+    ) -> None:
+        current_target = self.camera.shot_target_center or proposed_center
+        dx = proposed_center[0] - current_target[0]
+        dy = proposed_center[1] - current_target[1]
+        frames_since = frame_idx - self.camera.last_shot_update_frame
+        can_refresh = frames_since >= self.shot_hold_frames
+        must_refresh = abs(dx) > self.shot_break_distance_px or abs(dy) > self.shot_break_distance_y_px
+        if can_refresh or must_refresh or self.fused.phase in {"LOST_LONG", "UNKNOWN"}:
+            self.camera.shot_target_center = proposed_center
+            if self.fused.phase == "TRACKED":
+                self.camera.shot_target_zoom = proposed_zoom
+            else:
+                self.camera.shot_target_zoom = min(self.camera.shot_target_zoom, proposed_zoom)
+            self.camera.last_shot_update_frame = frame_idx
+
+    def _comfortable_tracking_center(
+        self,
+        best: StreamHypothesis,
+        render_shape: tuple[int, int],
+        lead: float,
+    ) -> tuple[float, float]:
+        w = render_shape[1]
+        h = render_shape[0]
+        out_w, out_h = self.output_size or (w, h)
+        zoom = max(1.0, self.camera.zoom)
+        view_w = max(1.0, out_w / zoom)
+        view_h = max(1.0, out_h / zoom)
+        current_center = self.camera.center or (w / 2.0, h / 2.0)
+        predicted_ball = (
+            best.master_center[0] + self.fused.velocity[0] * lead,
+            best.master_center[1] + self.fused.velocity[1] * lead,
+        )
+        safe_half_w = view_w * 0.14
+        safe_half_h = view_h * 0.12
+        edge_half_w = view_w * 0.36
+        edge_half_h = view_h * 0.32
+        dx = predicted_ball[0] - current_center[0]
+        dy = predicted_ball[1] - current_center[1]
+        target_x = current_center[0]
+        target_y = current_center[1]
+
+        if abs(dx) > edge_half_w:
+            overflow_x = dx - math.copysign(safe_half_w, dx)
+            target_x += overflow_x
+        if abs(dy) > edge_half_h:
+            overflow_y = dy - math.copysign(safe_half_h, dy)
+            target_y += overflow_y
+
+        return (target_x, target_y)
+
     def _tracked_zoom(self, best: StreamHypothesis, render_shape: tuple[int, int]) -> float:
         box = best.master_box
         area_ratio = _area_ratio(box, render_shape)
-        zoom = 1.25
+        zoom = 1.18
         if area_ratio < 0.00014:
-            zoom += 0.85
+            zoom += 0.35
         elif area_ratio < 0.00028:
-            zoom += 0.55
+            zoom += 0.22
         elif area_ratio < 0.00055:
-            zoom += 0.25
+            zoom += 0.10
         if best.detection.confidence < 0.55:
             zoom -= 0.18
-        return max(1.0, min(2.4, zoom))
+        return max(1.0, min(1.55, zoom))
 
     def _render_virtual_camera(self, render_base: np.ndarray) -> np.ndarray:
         h, w = render_base.shape[:2]
