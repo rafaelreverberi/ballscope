@@ -2,6 +2,9 @@
 
 Date: 2026-04-17
 
+Status:
+- Implemented as the active offline dual-camera pipeline in `ballscope/ai/offline_analysis.py` and integrated through `ballscope/web/app.py`.
+
 ## Goal
 Build a post-analysis pipeline for left/right football-camera recordings that produces one seamless broadcast-style output.
 
@@ -73,9 +76,15 @@ Detection must remain resolution-aware.
 - Keep the ROI detector active most of the time once a lock exists.
 
 Recommended policy:
-- full-frame RF-DETR on both sources at lower cadence
-- ROI-based RF-DETR around the predicted position at higher cadence
+- full-frame reacquire scans on original-resolution source frames at lower cadence
+- ROI-based detection around the predicted position at higher cadence
 - short-gap CPU prediction when no confident model result is available
+
+Implemented policy details:
+- full-frame reacquire is per-camera and never uses aggressive downscaling
+- ROI detection is the common path while locked
+- full-frame cadence becomes more aggressive during `LOST_SHORT` and `LOST_LONG`
+- left/right scans can alternate so the expensive path does not fire on every source every frame
 
 ## Fusion Strategy
 Each frame produces zero or more hypotheses:
@@ -89,6 +98,11 @@ The fused master state is chosen by:
 - source image scale / object size
 - consistency between adjacent frames
 - source visibility quality in overlap regions
+
+Current implementation:
+- per-camera hypotheses are scored in master-canvas space with confidence, scale sanity, and continuity
+- close left/right detections can be merged into one fused master hypothesis
+- predicted hypotheses are allowed only for short gaps and are penalized relative to real detections
 
 ## Virtual Camera Strategy
 The virtual camera should behave like a sports broadcast operator.
@@ -107,6 +121,12 @@ The virtual camera should behave like a sports broadcast operator.
 - confidence
 - local player density around the ball
 - uncertainty level
+
+Current implementation:
+- `TRACKED`: follow the fused ball with deadzones, acceleration limits, and mild look-ahead
+- `HOLD_SHORT`: stay near the last safe region and widen slightly
+- `LOST_SHORT`: keep bias toward the last safe region while blending toward a wider tactical view
+- `LOST_LONG` / `UNKNOWN`: transition to a wide tactical master-canvas framing
 
 ## Implementation Phases
 ### Phase A: Foundation
@@ -146,10 +166,12 @@ For each substantial phase:
 - Tracking fallback can drift onto players if not bounded by strong reacquire logic.
 
 ## Immediate Build Decision
-Start with a practical local implementation:
+Delivered baseline:
 - heuristic blended master canvas
 - mapped left/right detections
 - one virtual camera crop from master space
 - default fusion enabled for dual-video analysis
+- fixed-layout seam calibration from multiple early video samples
 
-Then iterate toward calibrated field registration after the master-canvas pipeline is stable.
+Next iteration target:
+- move from overlap heuristics to explicit calibrated field registration / homography when calibration data is available.

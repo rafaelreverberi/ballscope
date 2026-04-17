@@ -150,14 +150,16 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 - If a camera cannot be opened on Mac, use numeric sources (`0`, `1`) instead of `/dev/videoX`.
 - If Jetson reports no CUDA, verify your Torch wheel matches your JetPack/L4T version.
 - If Jetson shows NumPy ABI warnings at startup, rerun `./setup.sh` so Jetson dependencies are re-resolved with `numpy<2`.
-- In the analysis page, enable `Speed Up` for faster processing (reduced preview overhead, lower inference size, and detection every N frames).
+- The analysis page now always uses the high-quality dual-camera offline pipeline by default.
 
 ## Analysis Workspace
 - The `Analysis` page accepts separate `Left Camera` and `Right Camera` uploads.
 - Analysis can optionally be limited to the first N minutes of the uploaded files for fast debugging on long recordings.
 - BallScope detects whether a model is a YOLO checkpoint or an RF-DETR checkpoint and uses the matching runtime automatically.
 - `models/ballscope.pt` is detected as RF-DETR and is the default analysis model.
-- The analysis pipeline keeps left/right source labels, exposes the active field side in the UI, and uses a CPU-side fallback motion tracker for short detection gaps so zooming stays stable on small balls.
+- Dual-camera analysis is per-camera first: left/right detections stay separate, are fused in master-canvas space, and the final broadcast crop is rendered from the master canvas.
+- Full-frame global reacquire scans keep original frame resolution so small-ball detectability is not destroyed by downscaling.
+- Short ball losses are handled with bounded prediction and phased camera behavior (`TRACKED`, `HOLD_SHORT`, `LOST_SHORT`, `LOST_LONG`, `UNKNOWN`) so the view widens gradually instead of snapping away.
 
 ## License
 MIT License (`LICENSE`)

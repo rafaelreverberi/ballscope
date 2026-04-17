@@ -35,8 +35,14 @@ BallScope is designed to run the same application logic on:
 - The `Analysis` workspace can ingest either one video file or separate left/right camera files.
 - Offline analysis uses the same shared runtime-device resolution strategy (`auto` -> Jetson CUDA, Apple Silicon MPS, fallback CPU).
 - Model loading is backend-aware: YOLO checkpoints use `ultralytics`, RF-DETR checkpoints use `rfdetr`.
-- For post-analysis, BallScope keeps per-stream tracking state, applies short-gap CPU prediction when detections drop out, and smooths zoom dynamically so left/right camera switches stay readable.
-- The next-generation redesign for dual-camera stitched broadcast rendering is specified in `docs/architecture_video_analysis_2026-04-17.md`.
+- Dual-camera post-analysis now uses a per-camera-first pipeline:
+  1. left/right videos are detected independently
+  2. detections are mapped into master-canvas coordinates
+  3. hypotheses are fused into one shared ball state
+  4. a virtual broadcast camera renders the final output from the master canvas
+- Full-frame reacquire scans preserve original frame resolution. Only ROI follow-up detection is allowed to use a reduced inference size.
+- Missing-ball handling is stateful: `UNKNOWN` -> `TRACKED` -> `HOLD_SHORT` -> `LOST_SHORT` -> `LOST_LONG`, with the virtual camera widening gradually instead of snapping to center.
+- The detailed design direction and validation notes stay documented in `docs/architecture_video_analysis_2026-04-17.md`.
 
 ## Runtime Compatibility Strategy
 BallScope keeps behavior aligned across Mac and Jetson by:

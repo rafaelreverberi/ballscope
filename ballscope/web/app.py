@@ -7,9 +7,7 @@ import platform
 import subprocess
 import threading
 import uuid
-import math
-import statistics
-from collections import defaultdict, deque
+from collections import deque
 from pathlib import Path
 from dataclasses import asdict
 from typing import Any, Dict, Optional, List
@@ -40,17 +38,17 @@ from ballscope.camera import (
 )
 from ballscope.ai import PersonSwitcherWorker, ai_mjpeg_stream
 from ballscope.ai.analysis_models import (
-    AnalysisDetection,
     build_analysis_model,
     inspect_model_metadata,
 )
 from ballscope.ai.master_canvas import (
     MasterCanvasConfig,
-    MasterCanvasLayout,
-    assemble_master_canvas,
-    estimate_master_canvas_layout,
-    map_box_to_master,
-    map_point_to_master,
+)
+from ballscope.ai.offline_analysis import (
+    OfflineAnalysisEngine,
+    OfflineAnalysisEngineConfig,
+    build_master_frame,
+    calibrate_master_layout,
 )
 from ballscope.recording import GstPipeRecorder, GstDeviceRecorder, GstDualRecorder, GstAudioRecorder
 from ballscope.runtime_device import resolve_torch_device, runtime_device_options
@@ -116,7 +114,6 @@ ANALYSIS_DEFAULT_MODEL = "models/ballscope.pt"
 ANALYSIS_TARGET_FPS = 30
 ANALYSIS_ENCODE_CRF = 14
 ANALYSIS_ENCODE_PRESET = "slow"
-ANALYSIS_ENCODE_PRESET_SPEED_UP = "medium"
 CAMERA_PRESET_FILE = Path(os.getenv("BALLSCOPE_CAMERA_PRESET_FILE", "camera_presets.json"))
 CAMERA_PRESET_LOCK = threading.Lock()
 CAMERA_INT_SETTING_KEYS = [
@@ -524,21 +521,18 @@ def _analysis_process_video(session_id: str, video_path: str):
     model_path = session.get("model_path") or ANALYSIS_DEFAULT_MODEL
     model_meta = _analysis_model_meta(model_path)
     class_id = session.get("class_id")
-    conf = float(session.get("conf", 0.32))
+    conf = float(session.get("conf", 0.18))
     iou = float(session.get("iou", 0.35))
     zoom = float(session.get("zoom", 1.6))
-    speed_up = bool(session.get("speed_up", False))
-    rf_default_size = int(model_meta.resolution or 1024)
     if model_meta.backend == "rfdetr":
-        default_imgsz = 576 if speed_up else 704
-        default_detect_every = 3 if speed_up else 2
+        default_imgsz = max(256, min(1408, int(model_meta.resolution or 1024)))
+        default_detect_every = 2
     else:
-        default_imgsz = 384 if speed_up else 640
-        default_detect_every = 2 if speed_up else 1
+        default_imgsz = 640
+        default_detect_every = 1
     detect_every = max(1, int(session.get("detect_every", default_detect_every)))
     infer_imgsz = max(224, min(1408, int(session.get("imgsz", default_imgsz))))
-    preview_stride = max(1, int(session.get("preview_stride", 2 if speed_up else 1)))
-    allow_switch = bool(session.get("allow_switch", False))
+    preview_stride = max(1, int(session.get("preview_stride", 1)))
     device_pref = str(session.get("device", "auto"))
     device_use = _analysis_resolve_device(device_pref)
     crop = session.get("crop") or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
@@ -566,6 +560,7 @@ def _analysis_process_video(session_id: str, video_path: str):
     if not source_paths:
         source_paths = [video_path]
         source_labels = ["main"]
+
     tmp_sources: List[str] = []
     streams = _analysis_ffprobe_video_streams(video_path)
     if len(source_paths) == 1 and len(streams) > 1:
@@ -583,8 +578,8 @@ def _analysis_process_video(session_id: str, video_path: str):
 
     caps: List[cv2.VideoCapture] = []
     open_labels: List[str] = []
-    for idx, p in enumerate(source_paths):
-        cap = cv2.VideoCapture(p)
+    for idx, path in enumerate(source_paths):
+        cap = cv2.VideoCapture(path)
         if cap.isOpened():
             caps.append(cap)
             open_labels.append(str(source_labels[idx] if idx < len(source_labels) else f"stream-{idx + 1}").strip().lower())
@@ -602,14 +597,10 @@ def _analysis_process_video(session_id: str, video_path: str):
     fps_list = [(cap.get(cv2.CAP_PROP_FPS) or ANALYSIS_TARGET_FPS) for cap in caps]
     frame_count_list = [int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) for cap in caps]
     dual_master_mode = len(caps) >= 2 and {"left", "right"}.issubset(set(source_labels))
-    left_stream_idx = source_labels.index("left") if "left" in source_labels else None
-    right_stream_idx = source_labels.index("right") if "right" in source_labels else None
     master_canvas_cfg = MasterCanvasConfig()
     total_frames = max([n for n in frame_count_list if n > 0] or [0])
     src_fps = max([f for f in fps_list if f > 0] or [ANALYSIS_TARGET_FPS])
-    media_duration_sec = min(
-        [n / f for n, f in zip(frame_count_list, fps_list) if n > 0 and f > 0] or [0.0]
-    )
+    media_duration_sec = min([n / f for n, f in zip(frame_count_list, fps_list) if n > 0 and f > 0] or [0.0])
     start_sec = max(0.0, analysis_start_min * 60.0)
     if media_duration_sec > 0:
         start_sec = min(start_sec, max(0.0, media_duration_sec - 0.25))
@@ -624,39 +615,29 @@ def _analysis_process_video(session_id: str, video_path: str):
     analysis_limit_frames = int(round(analysis_limit_sec * src_fps)) if analysis_limit_sec > 0 and src_fps > 0 else 0
     if analysis_limit_frames > 0:
         total_frames = analysis_limit_frames
-    proc_times = deque(maxlen=50)
-    last_seen_ts = None
-    lost_hold_sec = 2.2 if model_meta.backend == "rfdetr" else 1.8
-    focus_stream = 0
-    smooth_alpha = 0.88
-    smooth_cx = None
-    smooth_cy = None
-    smooth_vx = 0.0
-    smooth_vy = 0.0
-    max_pan_ratio = 0.05
-    smooth_zoom = max(1.0, min(4.0, zoom))
-    out_size = None
-    writer = None
-    segment_paths: List[str] = []
-    segment_frames = max(120, int(src_fps * 8))
-    segment_frame_count = 0
-    segment_index = 0
-    frame_idx = 0
-    max_track_misses = 12
-    non_focus_scan_multiplier = 2 if model_meta.backend == "rfdetr" else 1
+
+    if device_use.startswith("cuda") and model_meta.backend == "yolo":
+        if device_use in ("cuda", "cuda:0"):
+            predict_device = "0"
+        elif device_use.startswith("cuda:") and device_use.split(":", 1)[1].isdigit():
+            predict_device = device_use.split(":", 1)[1]
+        else:
+            predict_device = device_use
+    else:
+        predict_device = device_use
+
     master_layout_fixed = None
-    master_layout_shape = None
-    stream_states = [
-        {
-            "center": None,
-            "velocity": (0.0, 0.0),
-            "box": None,
-            "last_conf": 0.0,
-            "misses": max_track_misses + 1,
-            "last_seen_ts": 0.0,
-        }
-        for _ in caps
-    ]
+    if dual_master_mode:
+        left_idx = source_labels.index("left")
+        right_idx = source_labels.index("right")
+        master_layout_fixed = calibrate_master_layout(
+            left_path=source_paths[left_idx],
+            right_path=source_paths[right_idx],
+            start_sec=start_sec,
+            media_duration_sec=media_duration_sec,
+            config=master_canvas_cfg,
+        )
+
     segment_dir = os.path.join(ANALYSIS_RESULT_DIR, f"analysis_{session_id}_parts")
     os.makedirs(segment_dir, exist_ok=True)
     stitched_avi = os.path.join(segment_dir, f"{session_id}_stitched.avi")
@@ -676,7 +657,6 @@ def _analysis_process_video(session_id: str, video_path: str):
         ANALYSIS_SESSIONS[session_id]["progress_pct"] = 0.0
         ANALYSIS_SESSIONS[session_id]["eta_sec"] = None
         ANALYSIS_SESSIONS[session_id]["stream_count"] = len(caps)
-        ANALYSIS_SESSIONS[session_id]["speed_up"] = speed_up
         ANALYSIS_SESSIONS[session_id]["detect_every"] = detect_every
         ANALYSIS_SESSIONS[session_id]["imgsz"] = infer_imgsz
         ANALYSIS_SESSIONS[session_id]["output_path"] = None
@@ -684,150 +664,35 @@ def _analysis_process_video(session_id: str, video_path: str):
         ANALYSIS_SESSIONS[session_id]["model_backend"] = model_meta.backend
         ANALYSIS_SESSIONS[session_id]["focus_stream_label"] = source_labels[0] if source_labels else "main"
         ANALYSIS_SESSIONS[session_id]["render_mode"] = "master-canvas" if dual_master_mode else "single-stream"
+        ANALYSIS_SESSIONS[session_id]["fusion_mode"] = "per-camera-master-fusion"
 
-    if device_use.startswith("cuda") and model_meta.backend == "yolo":
-        if device_use in ("cuda", "cuda:0"):
-            predict_device = "0"
-        elif device_use.startswith("cuda:") and device_use.split(":", 1)[1].isdigit():
-            predict_device = device_use.split(":", 1)[1]
-        else:
-            predict_device = device_use
-    else:
-        predict_device = device_use
-
-    def _blend_width_for_overlap(overlap_px: int) -> int:
-        width = int(round(overlap_px * master_canvas_cfg.seam_blend_ratio))
-        return max(master_canvas_cfg.min_blend_px, min(master_canvas_cfg.max_blend_px, max(1, width)))
-
-    def _build_fixed_master_layout(
-        left_shape: tuple[int, int],
-        right_shape: tuple[int, int],
-        right_offset_x: int,
-        left_crop_y: int,
-        right_crop_y: int,
-    ) -> MasterCanvasLayout:
-        left_h, left_w = int(left_shape[0]), int(left_shape[1])
-        right_h, right_w = int(right_shape[0]), int(right_shape[1])
-        right_offset_x = max(0, min(left_w - 32, int(right_offset_x)))
-        left_crop_y = max(0, min(left_h - 1, int(left_crop_y)))
-        right_crop_y = max(0, min(right_h - 1, int(right_crop_y)))
-        overlap_px = max(32, min(left_w - right_offset_x, right_w))
-        width = max(left_w, right_offset_x + right_w)
-        height = max(1, min(left_h - left_crop_y, right_h - right_crop_y))
-        seam_x = right_offset_x + (overlap_px // 2)
-        blend_width = _blend_width_for_overlap(overlap_px)
-        blend_start_x = max(right_offset_x, seam_x - (blend_width // 2))
-        blend_end_x = min(right_offset_x + overlap_px, blend_start_x + blend_width)
-        return MasterCanvasLayout(
-            width=width,
-            height=height,
-            overlap_px=overlap_px,
-            left_offset_x=0,
-            left_crop_y=left_crop_y,
-            right_offset_x=right_offset_x,
-            right_crop_y=right_crop_y,
-            left_width=left_w,
-            right_width=right_w,
-            seam_x=seam_x,
-            blend_start_x=blend_start_x,
-            blend_end_x=blend_end_x,
-        )
-
-    def _calibrate_master_layout_from_samples() -> Optional[MasterCanvasLayout]:
-        if not dual_master_mode or left_stream_idx is None or right_stream_idx is None:
-            return None
-        left_path = source_paths[left_stream_idx]
-        right_path = source_paths[right_stream_idx]
-        left_cap = cv2.VideoCapture(left_path)
-        right_cap = cv2.VideoCapture(right_path)
-        if not left_cap.isOpened() or not right_cap.isOpened():
-            left_cap.release()
-            right_cap.release()
-            return None
-        try:
-            sample_ts = []
-            base_ts = max(0.0, start_sec)
-            for offset_sec in (0.0, 1.2, 2.6, 4.0):
-                ts = base_ts + offset_sec
-                if media_duration_sec > 0:
-                    ts = min(max(0.0, media_duration_sec - 0.35), ts)
-                sample_ts.append(ts)
-            layouts: List[MasterCanvasLayout] = []
-            left_shape = None
-            right_shape = None
-            for ts in sample_ts:
-                try:
-                    left_cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
-                    right_cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
-                except Exception:
-                    pass
-                ok_left, left_frame = left_cap.read()
-                ok_right, right_frame = right_cap.read()
-                if not ok_left or left_frame is None or not ok_right or right_frame is None:
-                    continue
-                left_shape = left_frame.shape[:2]
-                right_shape = right_frame.shape[:2]
-                layouts.append(estimate_master_canvas_layout(left_frame, right_frame, master_canvas_cfg))
-            if not layouts or left_shape is None or right_shape is None:
-                return None
-            right_offset_x = int(round(statistics.median(layout.right_offset_x for layout in layouts)))
-            left_crop_y = int(round(statistics.median(layout.left_crop_y for layout in layouts)))
-            right_crop_y = int(round(statistics.median(layout.right_crop_y for layout in layouts)))
-            return _build_fixed_master_layout(left_shape, right_shape, right_offset_x, left_crop_y, right_crop_y)
-        finally:
-            left_cap.release()
-            right_cap.release()
-
-    master_layout_fixed = _calibrate_master_layout_from_samples()
-
-    def _pick_best_detection(
-        detections: List[AnalysisDetection],
-        state: dict,
-        off_x: int,
-        off_y: int,
-        frame_w: int,
-        frame_h: int,
-    ):
-        best = None
-        best_score = -1e9
-        ref_center = state.get("center")
-        for det in detections:
-            gx1 = off_x + int(det.x1)
-            gy1 = off_y + int(det.y1)
-            gx2 = off_x + int(det.x2)
-            gy2 = off_y + int(det.y2)
-            candidate = AnalysisDetection(
-                class_id=int(det.class_id),
-                confidence=float(det.confidence),
-                x1=gx1,
-                y1=gy1,
-                x2=gx2,
-                y2=gy2,
-                label=det.label,
-            )
-            score = candidate.confidence * 1.35
-            if ref_center is not None:
-                dist = math.hypot(candidate.cx - ref_center[0], candidate.cy - ref_center[1])
-                limit = max(80.0, min(frame_w, frame_h) * 0.22)
-                score -= min(0.42, dist / limit * 0.18)
-            score -= min(0.10, candidate.area / max(1.0, frame_w * frame_h) * 0.6)
-            if score > best_score:
-                best_score = score
-                best = (score, candidate)
-        return best
-
-    def _run_detection(search_img, off_x: int, off_y: int, imgsz_local: int, state: dict, frame_w: int, frame_h: int):
-        if search_img is None or search_img.size == 0:
-            return None
-        detections = model.predict(
-            search_img,
+    proc_times = deque(maxlen=50)
+    frame_idx = 0
+    writer = None
+    segment_paths: List[str] = []
+    segment_frames = max(120, int(src_fps * 8))
+    segment_frame_count = 0
+    segment_index = 0
+    output_size = None
+    engine = OfflineAnalysisEngine(
+        OfflineAnalysisEngineConfig(
+            model=model,
+            model_backend=model_meta.backend,
+            model_resolution=int(model_meta.resolution) if model_meta.resolution else None,
+            predict_device=predict_device,
+            source_labels=source_labels,
+            class_id=class_id,
             conf=conf,
             iou=iou,
-            imgsz=imgsz_local,
-            class_id=class_id,
-            device=predict_device,
+            crop=crop,
+            default_zoom=zoom,
+            roi_imgsz=infer_imgsz,
+            speed_up=False,
+            target_output_size=None,
+            master_canvas_config=master_canvas_cfg,
+            target_fps=src_fps,
         )
-        return _pick_best_detection(detections, state, off_x, off_y, frame_w, frame_h)
+    )
 
     try:
         if start_sec > 0:
@@ -841,7 +706,7 @@ def _analysis_process_video(session_id: str, video_path: str):
             if total_frames > 0 and frame_idx >= total_frames:
                 break
             frame_idx += 1
-            frames = []
+            frames: List[Optional[np.ndarray]] = []
             any_open = False
             for cap in caps:
                 ok, frame = cap.read()
@@ -852,366 +717,94 @@ def _analysis_process_video(session_id: str, video_path: str):
                     frames.append(None)
             if not any_open:
                 break
-            active_ref_frame = frames[focus_stream] if focus_stream < len(frames) and frames[focus_stream] is not None else None
-            if active_ref_frame is None:
-                active_ref_frame = next((frame for frame in frames if frame is not None), None)
-            if active_ref_frame is None:
+
+            reference_frame = next((frame for frame in frames if frame is not None), None)
+            if reference_frame is None:
                 continue
+            if output_size is None:
+                output_size = (reference_frame.shape[1], reference_frame.shape[0])
+                engine.output_size = output_size
+
             master_frame = None
             master_layout = None
-            if dual_master_mode and left_stream_idx is not None and right_stream_idx is not None:
-                left_frame = frames[left_stream_idx] if left_stream_idx < len(frames) else None
-                right_frame = frames[right_stream_idx] if right_stream_idx < len(frames) else None
-                if left_frame is not None and right_frame is not None:
-                    shape_key = (left_frame.shape[:2], right_frame.shape[:2])
-                    if master_layout_fixed is None:
-                        master_layout_fixed = estimate_master_canvas_layout(left_frame, right_frame, master_canvas_cfg)
-                        master_layout_shape = shape_key
-                    elif master_layout_shape is None:
-                        master_layout_shape = shape_key
-                    master_frame, master_layout = assemble_master_canvas(
-                        left_frame,
-                        right_frame,
-                        master_canvas_cfg,
-                        layout=master_layout_fixed,
-                    )
-
-            last_conf = 0.0
-            stream_best = {}
-            now_ts = time.time()
-            for idx, frame in enumerate(frames):
-                if frame is None:
-                    continue
-                h, w = frame.shape[:2]
-                rx = int(float(crop.get("x", 0.0)) * w)
-                ry = int(float(crop.get("y", 0.0)) * h)
-                rw = int(float(crop.get("w", 1.0)) * w)
-                rh = int(float(crop.get("h", 1.0)) * h)
-                rx = _analysis_clamp(rx, 0, w - 1)
-                ry = _analysis_clamp(ry, 0, h - 1)
-                rw = _analysis_clamp(rw, 1, w - rx)
-                rh = _analysis_clamp(rh, 1, h - ry)
-                roi = frame[ry:ry + rh, rx:rx + rw]
-                if roi.size == 0:
-                    continue
-
-                state = stream_states[idx]
-                best_for_stream = None
-                scan_mod = detect_every
-                if idx != focus_stream and len(caps) > 1:
-                    scan_mod = max(1, detect_every * non_focus_scan_multiplier)
-                do_full_scan = (frame_idx % scan_mod) == 0 or state["box"] is None or state["misses"] > 1
-
-                if state["box"] is not None and (now_ts - float(state["last_seen_ts"] or 0.0)) <= lost_hold_sec:
-                    bx1, by1, bx2, by2 = state["box"]
-                    bw = max(8, bx2 - bx1)
-                    bh = max(8, by2 - by1)
-                    pvx, pvy = state["velocity"]
-                    pcx = float(state["center"][0] if state["center"] is not None else (bx1 + bx2) / 2.0) + float(pvx)
-                    pcy = float(state["center"][1] if state["center"] is not None else (by1 + by2) / 2.0) + float(pvy)
-                    search_expand = 3.4 if model_meta.backend == "rfdetr" else 2.8
-                    sw = max(140, int(bw * search_expand))
-                    sh = max(140, int(bh * search_expand))
-                    sx1 = _analysis_clamp(int(pcx - sw // 2), rx, rx + rw - 2)
-                    sy1 = _analysis_clamp(int(pcy - sh // 2), ry, ry + rh - 2)
-                    sx2 = _analysis_clamp(sx1 + sw, sx1 + 1, rx + rw)
-                    sy2 = _analysis_clamp(sy1 + sh, sy1 + 1, ry + rh)
-                    search_roi = frame[sy1:sy2, sx1:sx2]
-                    best_for_stream = _run_detection(search_roi, sx1, sy1, max(256, infer_imgsz - 96), state, w, h)
-
-                if best_for_stream is None and do_full_scan:
-                    best_for_stream = _run_detection(roi, rx, ry, infer_imgsz, state, w, h)
-
-                if best_for_stream is not None:
-                    score, det = best_for_stream
-                    prev_center = state["center"]
-                    if prev_center is not None:
-                        raw_vx = det.cx - prev_center[0]
-                        raw_vy = det.cy - prev_center[1]
-                        old_vx, old_vy = state["velocity"]
-                        state["velocity"] = (old_vx * 0.65 + raw_vx * 0.35, old_vy * 0.65 + raw_vy * 0.35)
-                    state["center"] = (det.cx, det.cy)
-                    state["box"] = (det.x1, det.y1, det.x2, det.y2)
-                    state["last_conf"] = det.confidence
-                    state["misses"] = 0
-                    state["last_seen_ts"] = now_ts
-                    stream_best[idx] = {
-                        "kind": "detected",
-                        "score": score,
-                        "det": det,
-                        "vx": state["velocity"][0],
-                        "vy": state["velocity"][1],
-                        "stream_idx": idx,
-                        "stream_label": source_labels[idx] if idx < len(source_labels) else f"stream-{idx + 1}",
-                    }
-                else:
-                    state["misses"] += 1
-                    if state["center"] is not None and state["box"] is not None and state["misses"] <= max_track_misses and (now_ts - float(state["last_seen_ts"] or 0.0)) <= lost_hold_sec:
-                        pvx, pvy = state["velocity"]
-                        pcx = state["center"][0] + pvx
-                        pcy = state["center"][1] + pvy
-                        bx1, by1, bx2, by2 = state["box"]
-                        bw = max(8, bx2 - bx1)
-                        bh = max(8, by2 - by1)
-                        px1 = _analysis_clamp(int(pcx - bw / 2), rx, rx + rw - 2)
-                        py1 = _analysis_clamp(int(pcy - bh / 2), ry, ry + rh - 2)
-                        px2 = _analysis_clamp(px1 + bw, px1 + 1, rx + rw)
-                        py2 = _analysis_clamp(py1 + bh, py1 + 1, ry + rh)
-                        pred = AnalysisDetection(
-                            class_id=int(class_id or 0),
-                            confidence=max(0.01, float(state["last_conf"]) * (0.84 ** state["misses"])),
-                            x1=px1,
-                            y1=py1,
-                            x2=px2,
-                            y2=py2,
-                            label="predicted",
-                        )
-                        state["center"] = (pred.cx, pred.cy)
-                        state["box"] = (pred.x1, pred.y1, pred.x2, pred.y2)
-                        state["velocity"] = (pvx * 0.88, pvy * 0.88)
-                        stream_best[idx] = {
-                            "kind": "predicted",
-                            "score": pred.confidence * 0.82,
-                            "det": pred,
-                            "vx": state["velocity"][0],
-                            "vy": state["velocity"][1],
-                            "stream_idx": idx,
-                            "stream_label": source_labels[idx] if idx < len(source_labels) else f"stream-{idx + 1}",
-                        }
-
-            chosen = None
-            detected_streams = {idx: item for idx, item in stream_best.items() if item["kind"] == "detected"}
-            predicted_streams = {idx: item for idx, item in stream_best.items() if item["kind"] == "predicted"}
-            if detected_streams:
-                cur_best = detected_streams.get(focus_stream)
-                best_stream = max(detected_streams.keys(), key=lambda key: detected_streams[key]["score"])
-                if len(caps) == 1 or not allow_switch:
-                    focus_stream = focus_stream if cur_best is not None else best_stream
-                elif cur_best is None or (best_stream != focus_stream and detected_streams[best_stream]["score"] > (cur_best["score"] + 0.08)):
-                    focus_stream = best_stream
-                chosen = detected_streams.get(focus_stream) or detected_streams[best_stream]
-            elif predicted_streams:
-                if focus_stream not in predicted_streams:
-                    focus_stream = max(predicted_streams.keys(), key=lambda key: predicted_streams[key]["score"])
-                chosen = predicted_streams[focus_stream]
-
-            detected = bool(chosen and chosen["kind"] == "detected")
-            remembered = bool(chosen and chosen["kind"] == "predicted")
-            render_det = chosen["det"] if chosen is not None else None
-            render_target_cx = render_det.cx if render_det is not None else None
-            render_target_cy = render_det.cy if render_det is not None else None
-            render_stream_label = chosen.get("stream_label") if chosen is not None else None
-            if chosen is not None and master_layout is not None and render_stream_label in {"left", "right"}:
-                det = chosen["det"]
-                mx1, my1, mx2, my2 = map_box_to_master(render_stream_label, (det.x1, det.y1, det.x2, det.y2), master_layout)
-                render_det = AnalysisDetection(
-                    class_id=det.class_id,
-                    confidence=det.confidence,
-                    x1=mx1,
-                    y1=my1,
-                    x2=mx2,
-                    y2=my2,
-                    label=det.label,
+            if dual_master_mode:
+                master_frame, master_layout = build_master_frame(
+                    frames=frames,
+                    source_labels=source_labels,
+                    layout=master_layout_fixed,
+                    config=master_canvas_cfg,
                 )
-                render_target_cx, render_target_cy = map_point_to_master(render_stream_label, det.cx, det.cy, master_layout)
+                if master_layout_fixed is None and master_layout is not None:
+                    master_layout_fixed = master_layout
 
-            if chosen is not None:
-                last_conf = render_det.confidence if render_det is not None else chosen["det"].confidence
-                target_cx = float(render_target_cx) + (chosen["vx"] * 0.6 if remembered else chosen["vx"] * 0.35)
-                target_cy = float(render_target_cy) + (chosen["vy"] * 0.6 if remembered else chosen["vy"] * 0.35)
-                if smooth_cx is None:
-                    smooth_cx, smooth_cy = target_cx, target_cy
-                else:
-                    want_x = smooth_alpha * smooth_cx + (1.0 - smooth_alpha) * target_cx
-                    want_y = smooth_alpha * smooth_cy + (1.0 - smooth_alpha) * target_cy
-                    dx = want_x - smooth_cx
-                    dy = want_y - smooth_cy
-                    deadzone = max(2.0, min(active_ref_frame.shape[1], active_ref_frame.shape[0]) * 0.01)
-                    if abs(dx) < deadzone:
-                        dx = 0.0
-                    if abs(dy) < deadzone:
-                        dy = 0.0
-                    max_pan = max(8.0, min(active_ref_frame.shape[1], active_ref_frame.shape[0]) * max_pan_ratio)
-                    dx = max(-max_pan, min(max_pan, dx))
-                    dy = max(-max_pan, min(max_pan, dy))
-                    smooth_vx = 0.72 * smooth_vx + 0.28 * dx
-                    smooth_vy = 0.72 * smooth_vy + 0.28 * dy
-                    smooth_cx = float(smooth_cx + smooth_vx)
-                    smooth_cy = float(smooth_cy + smooth_vy)
-                last_seen_ts = now_ts
-            else:
-                if smooth_cx is not None:
-                    smooth_cx = smooth_cx * 0.96 + (active_ref_frame.shape[1] / 2.0) * 0.04
-                    smooth_cy = smooth_cy * 0.96 + (active_ref_frame.shape[0] / 2.0) * 0.04
-                smooth_vx *= 0.8
-                smooth_vy *= 0.8
-
-            source_frame = None
-            if focus_stream < len(frames):
-                source_frame = frames[focus_stream]
-            if source_frame is None:
-                for f in frames:
-                    if f is not None:
-                        source_frame = f
-                        break
-            if source_frame is None:
+            result = engine.process_frame(
+                frame_idx=frame_idx,
+                frames=frames,
+                master_frame=master_frame,
+                master_layout=master_layout,
+            )
+            if result is None:
                 continue
 
-            render_frame = master_frame if master_frame is not None else source_frame
-            fh, fw = render_frame.shape[:2]
-            rx = 0
-            ry = 0
-            rw = fw
-            rh = fh
-            if master_frame is None:
-                rx = int(float(crop.get("x", 0.0)) * fw)
-                ry = int(float(crop.get("y", 0.0)) * fh)
-                rw = int(float(crop.get("w", 1.0)) * fw)
-                rh = int(float(crop.get("h", 1.0)) * fh)
-                rx = _analysis_clamp(rx, 0, fw - 1)
-                ry = _analysis_clamp(ry, 0, fh - 1)
-                rw = _analysis_clamp(rw, 1, fw - rx)
-                rh = _analysis_clamp(rh, 1, fh - ry)
-            vis = None
-            if not speed_up:
-                vis = render_frame.copy()
-                if master_frame is None:
-                    cv2.rectangle(vis, (rx, ry), (rx + rw, ry + rh), (255, 190, 40), 1)
-                if render_det is not None:
-                    det = render_det
-                    color = (0, 220, 0) if detected else (0, 165, 255)
-                    label = "BALL" if detected else "BALL predicted"
-                    cv2.rectangle(vis, (det.x1, det.y1), (det.x2, det.y2), color, 2)
-                    cv2.putText(vis, f"{label} {last_conf:.2f}", (det.x1, max(16, det.y1 - 8)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                elif last_seen_ts and (time.time() - last_seen_ts) <= lost_hold_sec:
-                    cv2.putText(vis, "BALL remembered", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                else:
-                    cv2.putText(vis, "BALL lost", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                focus_label = source_labels[focus_stream].upper() if focus_stream < len(source_labels) else f"STREAM {focus_stream + 1}"
-                render_label = "MASTER CANVAS" if master_frame is not None else focus_label
-                cv2.putText(vis, f"{render_label} | {model_meta.label}", (12, fh - 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 2)
-
-            if out_size is None:
-                out_size = (source_frame.shape[1], source_frame.shape[0])
-            out_w, out_h = out_size
-            if smooth_cx is None:
-                smooth_cx = fw // 2
-                smooth_cy = fh // 2
-            if render_det is not None:
-                det = render_det
-                ball_ratio = math.sqrt(det.area / max(1.0, fw * fh))
-                zoom_bonus = 0.0
-                if ball_ratio < 0.016:
-                    zoom_bonus = 1.35
-                elif ball_ratio < 0.024:
-                    zoom_bonus = 0.95
-                elif ball_ratio < 0.034:
-                    zoom_bonus = 0.55
-                elif ball_ratio < 0.048:
-                    zoom_bonus = 0.2
-                edge_margin = min(det.cx, fw - det.cx, det.cy, fh - det.cy)
-                if edge_margin < min(fw, fh) * 0.12:
-                    zoom_bonus -= 0.22
-                desired_zoom = max(1.0, min(4.0, zoom + zoom_bonus))
-            elif last_seen_ts and (time.time() - last_seen_ts) <= lost_hold_sec:
-                desired_zoom = max(1.0, smooth_zoom * 0.992)
-            else:
-                desired_zoom = max(1.0, smooth_zoom * 0.97)
-            smooth_zoom = smooth_zoom * 0.9 + desired_zoom * 0.1
-            zoom_use = max(1.0, min(4.0, smooth_zoom))
-            win_w = int(out_w / zoom_use)
-            win_h = int(out_h / zoom_use)
-            left = _analysis_clamp(int(smooth_cx - win_w // 2), 0, max(0, fw - win_w))
-            top = _analysis_clamp(int(smooth_cy - win_h // 2), 0, max(0, fh - win_h))
-            crop_frame = render_frame[top:top + win_h, left:left + win_w]
-            if crop_frame.size == 0:
-                crop_frame = render_frame
-            if speed_up:
-                interp = cv2.INTER_LINEAR
-            else:
-                interp = cv2.INTER_LANCZOS4 if zoom_use > 1.0 else cv2.INTER_AREA
-            render = cv2.resize(crop_frame, (out_w, out_h), interpolation=interp)
-            if not speed_up:
-                # Mild unsharp mask to reduce softness from digital zoom upscaling.
-                blur = cv2.GaussianBlur(render, (0, 0), 1.0)
-                render = cv2.addWeighted(render, 1.18, blur, -0.18, 0)
-
-            # Publish the clean final render to the UI preview. Debug overlays stay
-            # out of the default preview so the stitched field matches the actual
-            # output composition more closely.
-            preview_frame = render
-
-            publish_preview = False
-            master_debug_frame = None
-            with ANALYSIS_LOCK:
-                sess = ANALYSIS_SESSIONS.get(session_id)
-                if not sess:
-                    break
-                publish_preview = (frame_idx % preview_stride) == 0 or sess.get("frame") is None or sess.get("frame_master") is None
-
-            if publish_preview:
-                debug_src = master_frame if master_frame is not None else render_frame
-                if debug_src is not None:
-                    master_debug_frame = debug_src.copy()
-                    dbg_h, dbg_w = master_debug_frame.shape[:2]
-                    dbg_max_w = 960
-                    if dbg_w > dbg_max_w:
-                        dbg_h = max(1, int(round(dbg_h * (dbg_max_w / float(dbg_w)))))
-                        master_debug_frame = cv2.resize(master_debug_frame, (dbg_max_w, dbg_h), interpolation=cv2.INTER_AREA)
-
-            if writer is None:
+            if writer is None and output_size is not None:
                 segment_path = os.path.join(segment_dir, f"part_{segment_index:04d}.avi")
                 writer = cv2.VideoWriter(
                     segment_path,
                     cv2.VideoWriter_fourcc(*"MJPG"),
                     float(src_fps),
-                    (out_w, out_h),
+                    output_size,
                 )
                 if writer is not None:
                     segment_paths.append(segment_path)
                     segment_frame_count = 0
                     segment_index += 1
             if writer is not None:
-                writer.write(render)
+                writer.write(result.render_frame)
                 segment_frame_count += 1
                 if segment_frame_count >= segment_frames:
                     writer.release()
                     writer = None
 
             proc_times.append(time.time() - t0)
-            fps_proc = 0.0
-            if proc_times:
-                fps_proc = 1.0 / max(1e-6, (sum(proc_times) / len(proc_times)))
-
+            fps_proc = 1.0 / max(1e-6, (sum(proc_times) / len(proc_times))) if proc_times else 0.0
+            publish_preview = False
             with ANALYSIS_LOCK:
                 sess = ANALYSIS_SESSIONS.get(session_id)
                 if not sess:
                     break
+                publish_preview = (frame_idx % preview_stride) == 0 or sess.get("frame") is None or sess.get("frame_master") is None
                 sess["frames"] = float(sess.get("frames", 0.0) + 1.0)
-                sess["detections"] = float(sess.get("detections", 0.0) + (1.0 if detected else 0.0))
+                sess["detections"] = float(sess.get("detections", 0.0) + (1.0 if result.detected else 0.0))
                 sess["fps"] = fps_proc
-                sess["last_conf"] = last_conf
-                sess["state"] = "BALL" if detected else ("REMEMBERED" if remembered or (last_seen_ts and (time.time() - last_seen_ts) <= lost_hold_sec) else "LOST")
-                sess["last_seen_sec"] = (time.time() - last_seen_ts) if last_seen_ts else None
-                focus_label = source_labels[focus_stream] if focus_stream < len(source_labels) else f"stream-{focus_stream + 1}"
-                sess["focus_stream_label"] = focus_label
-                if chosen is not None:
-                    det = chosen["det"]
-                    sess["view_half"] = "left" if det.cx < (fw / 2.0) else "right"
-                    sess["field_side"] = focus_label if focus_label in ("left", "right") else sess["view_half"]
-                sess["zoom_live"] = zoom_use
+                sess["last_conf"] = result.confidence
+                sess["state"] = result.phase
+                if result.phase == "TRACKED":
+                    sess["last_seen_sec"] = 0.0
+                elif result.phase == "HOLD_SHORT":
+                    sess["last_seen_sec"] = max(0.0, 0.4)
+                elif result.phase == "LOST_SHORT":
+                    sess["last_seen_sec"] = max(0.0, 1.4)
+                elif result.phase == "LOST_LONG":
+                    sess["last_seen_sec"] = max(0.0, 3.0)
+                else:
+                    sess["last_seen_sec"] = None
+                sess["focus_stream_label"] = result.focus_stream_label
+                sess["view_half"] = result.view_half
+                sess["field_side"] = result.field_side
+                sess["zoom_live"] = result.zoom
+                sess["fusion_sources"] = list(result.fusion_sources)
                 if total_frames > 0:
                     done = float(sess["frames"])
-                    pct = min(100.0, (done / float(total_frames)) * 100.0)
-                    sess["progress_pct"] = pct
+                    sess["progress_pct"] = min(100.0, (done / float(total_frames)) * 100.0)
                     sess["eta_sec"] = ((float(total_frames) - done) / fps_proc) if fps_proc > 0 and done < total_frames else 0.0
                 if publish_preview:
-                    sess["frame"] = preview_frame
-                    sess["frame_master"] = master_debug_frame if master_debug_frame is not None else preview_frame
-
-            # Offline analysis: run at full speed, no realtime pacing delay.
+                    sess["frame"] = result.preview_frame
+                    debug_frame = result.master_debug_frame
+                    if debug_frame is not None and debug_frame.shape[1] > 960:
+                        scale = 960.0 / float(debug_frame.shape[1])
+                        target_h = max(1, int(round(debug_frame.shape[0] * scale)))
+                        debug_frame = cv2.resize(debug_frame, (960, target_h), interpolation=cv2.INTER_AREA)
+                    sess["frame_master"] = debug_frame if debug_frame is not None else result.preview_frame
     except Exception as exc:
         with ANALYSIS_LOCK:
             sess = ANALYSIS_SESSIONS.get(session_id)
@@ -1225,7 +818,6 @@ def _analysis_process_video(session_id: str, video_path: str):
             writer.release()
         stitched_ok = _analysis_concat_segments(segment_paths, stitched_avi)
         if stitched_ok and shutil.which("ffmpeg"):
-            encode_preset = ANALYSIS_ENCODE_PRESET_SPEED_UP if speed_up else ANALYSIS_ENCODE_PRESET
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -1240,7 +832,7 @@ def _analysis_process_video(session_id: str, video_path: str):
                 "-c:v",
                 "libx264",
                 "-preset",
-                encode_preset,
+                ANALYSIS_ENCODE_PRESET,
                 "-crf",
                 str(ANALYSIS_ENCODE_CRF),
                 "-pix_fmt",
@@ -1258,12 +850,11 @@ def _analysis_process_video(session_id: str, video_path: str):
                 shutil.copyfile(stitched_avi, final_mp4)
             except Exception:
                 pass
-        for p in tmp_sources:
+        for path in tmp_sources:
             try:
-                os.remove(p)
+                os.remove(path)
             except Exception:
                 pass
-
         with ANALYSIS_LOCK:
             sess = ANALYSIS_SESSIONS.get(session_id)
             if sess is not None:
@@ -2679,7 +2270,7 @@ ANALYSIS_HTML = r"""
           </div>
           <div>
             <label>Confidence</label>
-            <input id="conf" type="number" value="0.32" step="0.01" min="0" max="1"/>
+            <input id="conf" type="number" value="0.18" step="0.01" min="0" max="1"/>
           </div>
         </div>
         <div class="row">
@@ -2707,11 +2298,8 @@ ANALYSIS_HTML = r"""
             <input id="zoom" type="number" value="1.6" step="0.1" min="1.0" max="4.0"/>
           </div>
           <div>
-            <label>Speed Up</label>
-            <select id="speedUp">
-              <option value="false">Off (best quality preview)</option>
-              <option value="true" selected>On (faster analysis)</option>
-            </select>
+            <label>Analysis Mode</label>
+            <div class="status" style="margin-top:8px;">High-quality dual-camera mode is always on.</div>
           </div>
         </div>
         <label>Crop X/Y/W/H (0.0 - 1.0, relative to frame)</label>
@@ -2974,9 +2562,8 @@ ANALYSIS_HTML = r"""
         $("stConf").textContent = `conf:${(j.last_conf || 0).toFixed(2)}`;
         $("stSeen").textContent = `last seen:${j.last_seen_sec == null ? "-" : j.last_seen_sec.toFixed(2) + "s"}`;
         if (j.running) {
-          const speedTxt = j.speed_up ? "speed-up:on" : "speed-up:off";
           const tuneTxt = `imgsz:${j.imgsz || "-"}, detectEvery:${j.detect_every || "-"}`;
-          $("line").textContent = `Analysis running ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 1} stream(s), ${j.device_used || "auto"}, ${speedTxt}, ${tuneTxt})`;
+          $("line").textContent = `Analysis running ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 1} stream(s), ${j.device_used || "auto"}, ${tuneTxt})`;
         }
         if (j.output_url && j.state === "done") {
           $("resultLink").href = j.output_url;
@@ -3000,7 +2587,6 @@ ANALYSIS_HTML = r"""
         model_path: $("modelPath").value,
         device: $("deviceSel").value,
         zoom: $("zoom").value,
-        speed_up: $("speedUp").value,
         crop_x: $("cropX").value,
         crop_y: $("cropY").value,
         crop_w: $("cropW").value,
@@ -5111,7 +4697,7 @@ async def analysis_upload(
     right_video: Optional[UploadFile] = File(default=None),
     video: Optional[UploadFile] = File(default=None),
     class_id: Optional[int] = None,
-    conf: float = 0.32,
+    conf: float = 0.18,
     iou: float = 0.35,
     model_path: str = ANALYSIS_DEFAULT_MODEL,
     device: str = "auto",
@@ -5125,6 +4711,7 @@ async def analysis_upload(
     analysis_end_min: float = 0.0,
     analysis_minutes: float = 0.0,
 ):
+    del speed_up
     os.makedirs(ANALYSIS_UPLOAD_DIR, exist_ok=True)
     available_models = set(_analysis_list_model_files())
     if model_path not in available_models:
@@ -5199,7 +4786,6 @@ async def analysis_upload(
             "iou": max(0.01, min(1.0, float(iou))),
             "device": device,
             "zoom": max(1.0, min(4.0, float(zoom))),
-            "speed_up": bool(speed_up),
             "allow_switch": len(sources) > 1,
             "crop": crop,
             "analysis_start_min": max(0.0, float(analysis_start_min)),
@@ -5232,7 +4818,7 @@ async def analysis_upload(
     thread.start()
     print(
         f"[analysis] job started sid={session_id} model={model_path} class_id={class_id} "
-        f"device={device} zoom={zoom} speed_up={bool(speed_up)} sources={','.join(item['label'] for item in sources)}"
+        f"device={device} zoom={zoom} sources={','.join(item['label'] for item in sources)}"
     )
     return {"ok": True, "session_id": session_id}
 
@@ -5256,7 +4842,6 @@ def analysis_status(session_id: str):
             "input_fps": sess.get("input_fps", 0.0),
             "stream_count": sess.get("stream_count", 0),
             "device_used": sess.get("device_used"),
-            "speed_up": bool(sess.get("speed_up", False)),
             "detect_every": sess.get("detect_every"),
             "imgsz": sess.get("imgsz"),
             "segments_saved": sess.get("segments_saved", 0),

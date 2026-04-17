@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+import cv2
 import numpy as np
 
 try:
@@ -171,7 +172,7 @@ class BaseAnalysisModel:
         image: np.ndarray,
         conf: float,
         iou: float,
-        imgsz: int,
+        imgsz: Optional[int | tuple[int, int]],
         class_id: Optional[int],
         device: str,
     ) -> List[AnalysisDetection]:
@@ -194,17 +195,22 @@ class YoloAnalysisModel(BaseAnalysisModel):
         image: np.ndarray,
         conf: float,
         iou: float,
-        imgsz: int,
+        imgsz: Optional[int | tuple[int, int]],
         class_id: Optional[int],
         device: str,
     ) -> List[AnalysisDetection]:
         kwargs: Dict[str, Any] = {
-            "imgsz": max(224, int(imgsz)),
             "conf": float(conf),
             "iou": float(iou),
             "device": device,
             "verbose": False,
         }
+        if imgsz is None:
+            kwargs["imgsz"] = (int(image.shape[0]), int(image.shape[1]))
+        elif isinstance(imgsz, tuple):
+            kwargs["imgsz"] = (max(32, int(imgsz[0])), max(32, int(imgsz[1])))
+        else:
+            kwargs["imgsz"] = max(224, int(imgsz))
         if class_id is not None:
             kwargs["classes"] = [int(class_id)]
         results = self.model.predict(image, **kwargs)
@@ -260,13 +266,22 @@ class RFDetrAnalysisModel(BaseAnalysisModel):
         image: np.ndarray,
         conf: float,
         iou: float,
-        imgsz: int,
+        imgsz: Optional[int | tuple[int, int]],
         class_id: Optional[int],
         device: str,
     ) -> List[AnalysisDetection]:
         del iou, device
-        infer_shape = max(256, min(1408, int(imgsz)))
-        detections = self.model.predict(image, threshold=float(conf), shape=(infer_shape, infer_shape))
+        if image.ndim == 3 and image.shape[2] == 3:
+            # OpenCV frames arrive as BGR. RF-DETR expects RGB numpy input.
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if imgsz is None:
+            infer_shape: tuple[int, int] = (int(image.shape[0]), int(image.shape[1]))
+        elif isinstance(imgsz, tuple):
+            infer_shape = (max(32, int(imgsz[0])), max(32, int(imgsz[1])))
+        else:
+            infer_scalar = max(256, min(1408, int(imgsz)))
+            infer_shape = (infer_scalar, infer_scalar)
+        detections = self.model.predict(image, threshold=float(conf), shape=infer_shape)
         xyxy = getattr(detections, "xyxy", None)
         class_ids = getattr(detections, "class_id", None)
         confidences = getattr(detections, "confidence", None)
@@ -275,8 +290,15 @@ class RFDetrAnalysisModel(BaseAnalysisModel):
         if xyxy is None or class_ids is None or confidences is None:
             return out
         names = list(self.metadata.class_names)
+        max_known_class = len(names)
         for idx in range(len(xyxy)):
-            det_class_id = int(class_ids[idx])
+            raw_class_id = int(class_ids[idx])
+            det_class_id = raw_class_id
+            # Some RF-DETR exports surface foreground class ids as 1..N even when
+            # the training metadata stores names in a 0-based list. Normalize that
+            # back to 0..N-1 before class filtering and label lookup.
+            if max_known_class > 0 and det_class_id >= max_known_class and 1 <= det_class_id <= max_known_class:
+                det_class_id = det_class_id - 1
             if class_id is not None and det_class_id != int(class_id):
                 continue
             x1, y1, x2, y2 = [int(v) for v in xyxy[idx]]

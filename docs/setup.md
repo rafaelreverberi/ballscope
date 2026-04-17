@@ -78,8 +78,10 @@ Notes:
 - You can limit analysis to the first N minutes with a slider / numeric input, which is useful for testing 90-minute source files quickly.
 - Model selection is automatic by checkpoint type. BallScope distinguishes YOLO checkpoints from RF-DETR checkpoints and uses the matching backend.
 - `models/ballscope.pt` is the default analysis model and is treated as RF-DETR.
-- The analysis preview shows the active source side, field side, live zoom factor, and backend in use.
-- Short ball losses are handled by a CPU-side fallback motion tracker to keep the crop stable without aggressive camera jumps.
+- Dual-camera analysis runs per-camera detection first, fuses ball hypotheses in master-canvas space, and renders the final output from the master canvas.
+- Full-frame reacquire scans preserve original frame resolution; only ROI follow-up passes are allowed to use a reduced inference size.
+- The analysis preview shows fused state, field side, live zoom factor, and the master-canvas debug view.
+- Short ball losses are handled by bounded prediction plus phased virtual-camera widening, so the crop does not jump to center immediately.
 
 ## Camera Settings Workspace
 Open `Camera Settings` from the home screen to tune both cameras side by side.
