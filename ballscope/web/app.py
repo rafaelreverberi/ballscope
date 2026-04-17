@@ -523,7 +523,7 @@ def _analysis_process_video(session_id: str, video_path: str):
     class_id = session.get("class_id")
     conf = float(session.get("conf", 0.18))
     iou = float(session.get("iou", 0.35))
-    zoom = float(session.get("zoom", 1.6))
+    zoom = 1.25
     if model_meta.backend == "rfdetr":
         default_imgsz = max(256, min(1408, int(model_meta.resolution or 1024)))
         default_detect_every = 2
@@ -615,6 +615,17 @@ def _analysis_process_video(session_id: str, video_path: str):
     analysis_limit_frames = int(round(analysis_limit_sec * src_fps)) if analysis_limit_sec > 0 and src_fps > 0 else 0
     if analysis_limit_frames > 0:
         total_frames = analysis_limit_frames
+
+    stream_runtimes = [
+        {
+            "cap": cap,
+            "fps": float(fps_list[idx] if idx < len(fps_list) and fps_list[idx] > 0 else ANALYSIS_TARGET_FPS),
+            "rel_idx": -1,
+            "last_frame": None,
+            "ended": False,
+        }
+        for idx, cap in enumerate(caps)
+    ]
 
     if device_use.startswith("cuda") and model_meta.backend == "yolo":
         if device_use in ("cuda", "cuda:0"):
@@ -708,13 +719,22 @@ def _analysis_process_video(session_id: str, video_path: str):
             frame_idx += 1
             frames: List[Optional[np.ndarray]] = []
             any_open = False
-            for cap in caps:
-                ok, frame = cap.read()
-                if ok and frame is not None:
-                    any_open = True
-                    frames.append(frame)
-                else:
+            timeline_sec = (frame_idx - 1) / max(1.0, src_fps)
+            for runtime in stream_runtimes:
+                if runtime["ended"]:
                     frames.append(None)
+                    continue
+                desired_rel_idx = max(0, int(round(timeline_sec * runtime["fps"])))
+                while runtime["rel_idx"] < desired_rel_idx and not runtime["ended"]:
+                    ok, frame = runtime["cap"].read()
+                    if not ok or frame is None:
+                        runtime["ended"] = True
+                        break
+                    runtime["last_frame"] = frame
+                    runtime["rel_idx"] += 1
+                frames.append(runtime["last_frame"])
+                if runtime["last_frame"] is not None:
+                    any_open = True
             if not any_open:
                 break
 
@@ -2295,7 +2315,7 @@ ANALYSIS_HTML = r"""
         <div class="row">
           <div>
             <label>Zoom Output</label>
-            <input id="zoom" type="number" value="1.6" step="0.1" min="1.0" max="4.0"/>
+            <div class="status" style="margin-top:8px;">Automatic broadcast zoom is always on.</div>
           </div>
           <div>
             <label>Analysis Mode</label>
@@ -2586,7 +2606,6 @@ ANALYSIS_HTML = r"""
         iou: $("iou").value,
         model_path: $("modelPath").value,
         device: $("deviceSel").value,
-        zoom: $("zoom").value,
         crop_x: $("cropX").value,
         crop_y: $("cropY").value,
         crop_w: $("cropW").value,
@@ -4785,7 +4804,7 @@ async def analysis_upload(
             "conf": max(0.01, min(1.0, float(conf))),
             "iou": max(0.01, min(1.0, float(iou))),
             "device": device,
-            "zoom": max(1.0, min(4.0, float(zoom))),
+            "zoom": 1.25,
             "allow_switch": len(sources) > 1,
             "crop": crop,
             "analysis_start_min": max(0.0, float(analysis_start_min)),
@@ -4809,7 +4828,7 @@ async def analysis_upload(
             "focus_stream_label": sources[0]["label"],
             "field_side": None,
             "view_half": None,
-            "zoom_live": max(1.0, min(4.0, float(zoom))),
+            "zoom_live": 1.25,
             "frame": None,
             "frame_master": None,
         }

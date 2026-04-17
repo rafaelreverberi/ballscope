@@ -72,6 +72,9 @@ class FusedBallState:
     last_safe_center: Optional[tuple[float, float]] = None
     last_safe_box: Optional[tuple[int, int, int, int]] = None
     last_sources: tuple[str, ...] = ()
+    pending_center: Optional[tuple[float, float]] = None
+    pending_box: Optional[tuple[int, int, int, int]] = None
+    pending_frames: int = 0
 
 
 @dataclass
@@ -187,6 +190,8 @@ class OfflineAnalysisEngine:
         self.full_interval_lost_short = max(6, int(round(config.target_fps * 0.7)))
         self.full_interval_hold = max(10, int(round(config.target_fps * 1.2)))
         self.full_interval_tracked = max(16, int(round(config.target_fps * 2.0)))
+        self.max_ball_speed_px_per_sec = 0.42 * 1920.0
+        self.large_jump_confirm_frames = max(2, int(round(config.target_fps * 0.18)))
 
     def process_frame(
         self,
@@ -595,8 +600,58 @@ class OfflineAnalysisEngine:
             self._advance_lost_state(frame_idx)
             return None
 
+        if not self._accept_fused_candidate(frame_idx, best, detections):
+            self._advance_lost_state(frame_idx)
+            return None
+
         self._update_fused_state(frame_idx, best, hypotheses)
         return best
+
+    def _accept_fused_candidate(
+        self,
+        frame_idx: int,
+        best: StreamHypothesis,
+        detections: Sequence[StreamHypothesis],
+    ) -> bool:
+        if self.fused.last_safe_center is None or self.fused.last_seen_frame is None:
+            self.fused.pending_center = None
+            self.fused.pending_box = None
+            self.fused.pending_frames = 0
+            return True
+        if len(detections) >= 2:
+            self.fused.pending_center = None
+            self.fused.pending_box = None
+            self.fused.pending_frames = 0
+            return True
+
+        frames_since_seen = max(1, frame_idx - self.fused.last_seen_frame)
+        max_jump = max(140.0, (self.max_ball_speed_px_per_sec / max(1.0, self.config.target_fps)) * frames_since_seen)
+        jump = math.hypot(
+            best.master_center[0] - self.fused.last_safe_center[0],
+            best.master_center[1] - self.fused.last_safe_center[1],
+        )
+        if jump <= max_jump or best.detection.confidence >= 0.86:
+            self.fused.pending_center = None
+            self.fused.pending_box = None
+            self.fused.pending_frames = 0
+            return True
+
+        if self.fused.pending_center is not None:
+            pending_jump = math.hypot(
+                best.master_center[0] - self.fused.pending_center[0],
+                best.master_center[1] - self.fused.pending_center[1],
+            )
+            if pending_jump <= max(40.0, max_jump * 0.35):
+                self.fused.pending_frames += 1
+            else:
+                self.fused.pending_center = best.master_center
+                self.fused.pending_box = best.master_box
+                self.fused.pending_frames = 1
+        else:
+            self.fused.pending_center = best.master_center
+            self.fused.pending_box = best.master_box
+            self.fused.pending_frames = 1
+        return self.fused.pending_frames >= self.large_jump_confirm_frames
 
     def _best_pair_agreement(self, detections: Sequence[StreamHypothesis]) -> Optional[StreamHypothesis]:
         best_pair = None
@@ -669,6 +724,9 @@ class OfflineAnalysisEngine:
             self.fused.last_real_center = best.master_center
             self.fused.last_safe_center = best.master_center
             self.fused.last_safe_box = best.master_box
+            self.fused.pending_center = None
+            self.fused.pending_box = None
+            self.fused.pending_frames = 0
         else:
             self._advance_lost_state(frame_idx)
             if self.fused.center is None:
@@ -714,7 +772,7 @@ class OfflineAnalysisEngine:
         target_center = tactical_center
         target_zoom = 1.0
         if self.fused.phase == "TRACKED" and best is not None:
-            lead = 0.30
+            lead = 0.10
             target_center = (
                 best.master_center[0] + self.fused.velocity[0] * lead,
                 best.master_center[1] + self.fused.velocity[1] * lead,
@@ -735,17 +793,17 @@ class OfflineAnalysisEngine:
             target_zoom = 1.0
 
         cx, cy = self.camera.center
-        deadzone = max(4.0, min(w, h) * 0.015)
+        deadzone = max(10.0, min(w, h) * 0.035)
         dx = target_center[0] - cx
         dy = target_center[1] - cy
         if abs(dx) < deadzone:
             dx = 0.0
         if abs(dy) < deadzone:
             dy = 0.0
-        accel = max(12.0, min(w, h) * 0.03)
+        accel = max(6.0, min(w, h) * 0.012)
         self.camera.velocity = (
-            max(-accel, min(accel, self.camera.velocity[0] * 0.72 + dx * 0.22)),
-            max(-accel, min(accel, self.camera.velocity[1] * 0.72 + dy * 0.22)),
+            max(-accel, min(accel, self.camera.velocity[0] * 0.88 + dx * 0.08)),
+            max(-accel, min(accel, self.camera.velocity[1] * 0.88 + dy * 0.08)),
         )
         if self.fused.phase in {"LOST_LONG", "UNKNOWN"}:
             self.camera.velocity = (self.camera.velocity[0] * 0.72, self.camera.velocity[1] * 0.72)
@@ -753,7 +811,7 @@ class OfflineAnalysisEngine:
             float(cx + self.camera.velocity[0]),
             float(cy + self.camera.velocity[1]),
         )
-        zoom_alpha = 0.10 if self.fused.phase == "TRACKED" else 0.07
+        zoom_alpha = 0.045 if self.fused.phase == "TRACKED" else 0.035
         self.camera.zoom = float(max(1.0, min(4.0, self.camera.zoom * (1.0 - zoom_alpha) + target_zoom * zoom_alpha)))
         self.camera.center = (
             float(max(0.0, min(w, self.camera.center[0]))),
@@ -763,16 +821,16 @@ class OfflineAnalysisEngine:
     def _tracked_zoom(self, best: StreamHypothesis, render_shape: tuple[int, int]) -> float:
         box = best.master_box
         area_ratio = _area_ratio(box, render_shape)
-        zoom = max(1.2, float(self.config.default_zoom))
+        zoom = 1.25
         if area_ratio < 0.00014:
-            zoom += 1.25
-        elif area_ratio < 0.00028:
             zoom += 0.85
+        elif area_ratio < 0.00028:
+            zoom += 0.55
         elif area_ratio < 0.00055:
-            zoom += 0.45
+            zoom += 0.25
         if best.detection.confidence < 0.55:
             zoom -= 0.18
-        return max(1.1, min(4.0, zoom))
+        return max(1.0, min(2.4, zoom))
 
     def _render_virtual_camera(self, render_base: np.ndarray) -> np.ndarray:
         h, w = render_base.shape[:2]
