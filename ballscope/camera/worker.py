@@ -13,6 +13,9 @@ import cv2
 
 from ballscope.config import QUALITY_PRESETS, DEFAULT_PRESET, MJPEG_JPEG_QUALITY, STREAM_MAX_FPS, PREFERRED_PIXFMT, V4L2_BUFFER_SIZE
 
+V4L2_TIMEOUT_SEC = float(os.getenv("BALLSCOPE_V4L2_TIMEOUT_SEC", "2.5"))
+UVCC_TIMEOUT_SEC = float(os.getenv("BALLSCOPE_UVCC_TIMEOUT_SEC", "2.5"))
+
 
 def _is_linux() -> bool:
     try:
@@ -339,12 +342,15 @@ def run_v4l2(args: list[str]) -> Tuple[bool, str]:
             stderr=subprocess.PIPE,
             text=True,
             check=False,
+            timeout=V4L2_TIMEOUT_SEC,
         )
         if p.returncode == 0:
             out = (p.stdout or "").strip()
             return True, out
         err = (p.stderr or p.stdout or "").strip()
         return False, err or f"v4l2-ctl failed rc={p.returncode}"
+    except subprocess.TimeoutExpired:
+        return False, f"v4l2-ctl timed out after {V4L2_TIMEOUT_SEC:.1f}s"
     except FileNotFoundError:
         return False, "v4l2-ctl not found (sudo apt install v4l-utils)"
     except Exception as exc:
@@ -359,11 +365,14 @@ def run_uvcc(args: list[str]) -> Tuple[bool, str]:
             stderr=subprocess.PIPE,
             text=True,
             check=False,
+            timeout=UVCC_TIMEOUT_SEC,
         )
         if p.returncode == 0:
             return True, (p.stdout or "").strip()
         err = (p.stderr or p.stdout or "").strip()
         return False, err or f"uvcc failed rc={p.returncode}"
+    except subprocess.TimeoutExpired:
+        return False, f"uvcc timed out after {UVCC_TIMEOUT_SEC:.1f}s"
     except FileNotFoundError:
         return False, "uvcc not found (install Node.js/npm, then npm install --global uvcc)"
     except Exception as exc:
