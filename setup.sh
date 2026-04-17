@@ -820,6 +820,7 @@ step_section "Verification"
 python - <<'PY'
 import cv2
 import fastapi
+import rfdetr
 import ultralytics
 import torch
 from ballscope.runtime_device import resolve_torch_device
@@ -833,6 +834,7 @@ print('auto device:', resolve_torch_device('auto', torch))
 print('opencv:', cv2.__version__)
 print('fastapi:', fastapi.__version__)
 print('ultralytics:', ultralytics.__version__)
+print('rfdetr:', getattr(rfdetr, '__version__', 'installed'))
 PY
 ok "Verification successful"
 

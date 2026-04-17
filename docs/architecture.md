@@ -31,6 +31,13 @@ BallScope is designed to run the same application logic on:
 4. Crop/zoom is applied on full-resolution selected frame.
 5. Final frame is streamed (MJPEG) and optionally recorded.
 
+## Analysis Flow
+- The `Analysis` workspace can ingest either one video file or separate left/right camera files.
+- Offline analysis uses the same shared runtime-device resolution strategy (`auto` -> Jetson CUDA, Apple Silicon MPS, fallback CPU).
+- Model loading is backend-aware: YOLO checkpoints use `ultralytics`, RF-DETR checkpoints use `rfdetr`.
+- For post-analysis, BallScope keeps per-stream tracking state, applies short-gap CPU prediction when detections drop out, and smooths zoom dynamically so left/right camera switches stay readable.
+- The next-generation redesign for dual-camera stitched broadcast rendering is specified in `docs/architecture_video_analysis_2026-04-17.md`.
+
 ## Runtime Compatibility Strategy
 BallScope keeps behavior aligned across Mac and Jetson by:
 - using one shared application codebase

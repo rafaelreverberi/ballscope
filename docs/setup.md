@@ -48,6 +48,10 @@ The Linux camera-control stack is also installed automatically by `setup.sh`, in
 into local:
 - `models/`
 
+The same setup run also installs both supported post-analysis runtimes into `.venv`:
+- YOLO (`ultralytics`)
+- RF-DETR (`rfdetr`)
+
 ## 3) Start BallScope
 ```bash
 source .venv/bin/activate
@@ -65,6 +69,17 @@ sudo ./start.sh
 Web UI:
 - Local: `http://localhost:8000`
 - Jetson on LAN: `http://<jetson-ip>:8000`
+
+## Analysis Workspace
+Open `Analysis` from the home screen for offline post-processing.
+
+Notes:
+- The page accepts separate `Left Camera` and `Right Camera` video uploads.
+- You can limit analysis to the first N minutes with a slider / numeric input, which is useful for testing 90-minute source files quickly.
+- Model selection is automatic by checkpoint type. BallScope distinguishes YOLO checkpoints from RF-DETR checkpoints and uses the matching backend.
+- `models/ballscope.pt` is the default analysis model and is treated as RF-DETR.
+- The analysis preview shows the active source side, field side, live zoom factor, and backend in use.
+- Short ball losses are handled by a CPU-side fallback motion tracker to keep the crop stable without aggressive camera jumps.
 
 ## Camera Settings Workspace
 Open `Camera Settings` from the home screen to tune both cameras side by side.

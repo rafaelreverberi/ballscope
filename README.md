@@ -15,6 +15,7 @@ BallScope is an AI-assisted multi-camera football tracking project. It captures 
 - Stream live MJPEG preview in the browser.
 - Record processed output and raw camera streams.
 - Analyze uploaded videos in the web UI.
+- Run post-analysis on separate left/right camera videos in the web UI.
 - Tune both cameras in a dedicated Camera Settings workspace, keep those settings for the current session, and save named camera presets for later reuse.
 
 ## Supported Platforms
@@ -80,6 +81,7 @@ Dependencies are split by role:
 - Downloads model files (`models/*.pt`) from Hugging Face:
   - `https://huggingface.co/RafaelReverberi/ballscope-assets/tree/main/models`
 - On Jetson: ensures PyTorch CUDA is installed before other Python packages
+- Installs both YOLO and RF-DETR analysis dependencies into the local `.venv`
 - At the end: optional autostart setup (`systemd` on Jetson, `launchd` on macOS)
 - If run with `sudo`: resets repository ownership back to the invoking user
 - Verifies key imports and runtime device resolution
@@ -131,6 +133,7 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 - `docs/setup.md`: full setup instructions
 - `docs/jetson_notes.md`: Jetson-specific notes
 - `docs/architecture.md`: architecture and data flow
+- `docs/architecture_video_analysis_2026-04-17.md`: detailed redesign plan for the dual-camera offline analysis pipeline
 
 ## Camera Settings Workspace
 - Open `Camera Settings` from the home screen to tune left and right cameras side by side.
@@ -148,6 +151,13 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 - If Jetson reports no CUDA, verify your Torch wheel matches your JetPack/L4T version.
 - If Jetson shows NumPy ABI warnings at startup, rerun `./setup.sh` so Jetson dependencies are re-resolved with `numpy<2`.
 - In the analysis page, enable `Speed Up` for faster processing (reduced preview overhead, lower inference size, and detection every N frames).
+
+## Analysis Workspace
+- The `Analysis` page accepts separate `Left Camera` and `Right Camera` uploads.
+- Analysis can optionally be limited to the first N minutes of the uploaded files for fast debugging on long recordings.
+- BallScope detects whether a model is a YOLO checkpoint or an RF-DETR checkpoint and uses the matching runtime automatically.
+- `models/ballscope.pt` is detected as RF-DETR and is the default analysis model.
+- The analysis pipeline keeps left/right source labels, exposes the active field side in the UI, and uses a CPU-side fallback motion tracker for short detection gaps so zooming stays stable on small balls.
 
 ## License
 MIT License (`LICENSE`)

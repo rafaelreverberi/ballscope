@@ -7,6 +7,8 @@ import platform
 import subprocess
 import threading
 import uuid
+import math
+import statistics
 from collections import defaultdict, deque
 from pathlib import Path
 from dataclasses import asdict
@@ -14,7 +16,7 @@ from typing import Any, Dict, Optional, List
 from contextlib import asynccontextmanager
 
 import cv2
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse
 
 from ballscope.config import (
@@ -37,6 +39,19 @@ from ballscope.camera import (
     camera_state_dict,
 )
 from ballscope.ai import PersonSwitcherWorker, ai_mjpeg_stream
+from ballscope.ai.analysis_models import (
+    AnalysisDetection,
+    build_analysis_model,
+    inspect_model_metadata,
+)
+from ballscope.ai.master_canvas import (
+    MasterCanvasConfig,
+    MasterCanvasLayout,
+    assemble_master_canvas,
+    estimate_master_canvas_layout,
+    map_box_to_master,
+    map_point_to_master,
+)
 from ballscope.recording import GstPipeRecorder, GstDeviceRecorder, GstDualRecorder, GstAudioRecorder
 from ballscope.runtime_device import resolve_torch_device, runtime_device_options
 
@@ -96,7 +111,8 @@ ANALYSIS_SESSIONS: Dict[str, dict] = {}
 ANALYSIS_LOCK = threading.Lock()
 ANALYSIS_MODELS: Dict[str, object] = {}
 ANALYSIS_MODEL_LOCK = threading.Lock()
-ANALYSIS_DEFAULT_MODEL = "models/football-ball-detection.pt"
+ANALYSIS_MODEL_META: Dict[str, object] = {}
+ANALYSIS_DEFAULT_MODEL = "models/ballscope.pt"
 ANALYSIS_TARGET_FPS = 30
 ANALYSIS_ENCODE_CRF = 14
 ANALYSIS_ENCODE_PRESET = "slow"
@@ -120,16 +136,21 @@ CAMERA_INT_SETTING_KEYS = [
 CAMERA_BOOL_SETTING_KEYS = ["auto_wb", "auto_exposure", "exposure_priority", "hdr", "auto_focus"]
 
 
-def _analysis_load_model(model_path: str):
+def _analysis_model_meta(model_path: str):
     with ANALYSIS_MODEL_LOCK:
-        if model_path in ANALYSIS_MODELS:
-            return ANALYSIS_MODELS[model_path]
-        try:
-            from ultralytics import YOLO
-        except Exception as exc:
-            raise RuntimeError(f"Ultralytics import failed: {exc}")
-        ANALYSIS_MODELS[model_path] = YOLO(model_path)
-        return ANALYSIS_MODELS[model_path]
+        if model_path not in ANALYSIS_MODEL_META:
+            ANALYSIS_MODEL_META[model_path] = inspect_model_metadata(model_path)
+        return ANALYSIS_MODEL_META[model_path]
+
+
+def _analysis_load_model(model_path: str, device_use: str = "cpu"):
+    metadata = _analysis_model_meta(model_path)
+    cache_key = f"{model_path}|{metadata.backend}|{device_use if metadata.backend == 'rfdetr' else 'shared'}"
+    with ANALYSIS_MODEL_LOCK:
+        if cache_key in ANALYSIS_MODELS:
+            return ANALYSIS_MODELS[cache_key]
+        ANALYSIS_MODELS[cache_key] = build_analysis_model(metadata, device=device_use)
+        return ANALYSIS_MODELS[cache_key]
 
 
 def _analysis_clamp(v: int, lo: int, hi: int) -> int:
@@ -339,19 +360,12 @@ def _analysis_list_model_files() -> List[str]:
 
 def _analysis_model_classes(model_path: str) -> List[dict]:
     try:
-        model = _analysis_load_model(model_path)
+        metadata = _analysis_model_meta(model_path)
     except Exception:
         return []
-    names = getattr(model, "names", None)
-    if names is None and hasattr(model, "model"):
-        names = getattr(model.model, "names", None)
     out = []
-    if isinstance(names, dict):
-        for k in sorted(names.keys()):
-            out.append({"id": int(k), "label": str(names[k])})
-    elif isinstance(names, list):
-        for i, n in enumerate(names):
-            out.append({"id": int(i), "label": str(n)})
+    for i, name in enumerate(metadata.class_names):
+        out.append({"id": int(i), "label": str(name)})
     return out
 
 
@@ -508,26 +522,37 @@ def _analysis_process_video(session_id: str, video_path: str):
         return
 
     model_path = session.get("model_path") or ANALYSIS_DEFAULT_MODEL
+    model_meta = _analysis_model_meta(model_path)
     class_id = session.get("class_id")
     conf = float(session.get("conf", 0.32))
     iou = float(session.get("iou", 0.35))
     zoom = float(session.get("zoom", 1.6))
     speed_up = bool(session.get("speed_up", False))
-    # Keep normal mode unchanged; fast mode trades some temporal density for throughput.
-    detect_every = max(1, int(session.get("detect_every", 2 if speed_up else 1)))
-    infer_imgsz = max(224, min(1280, int(session.get("imgsz", 384 if speed_up else 640))))
+    rf_default_size = int(model_meta.resolution or 1024)
+    if model_meta.backend == "rfdetr":
+        default_imgsz = 576 if speed_up else 704
+        default_detect_every = 3 if speed_up else 2
+    else:
+        default_imgsz = 384 if speed_up else 640
+        default_detect_every = 2 if speed_up else 1
+    detect_every = max(1, int(session.get("detect_every", default_detect_every)))
+    infer_imgsz = max(224, min(1408, int(session.get("imgsz", default_imgsz))))
     preview_stride = max(1, int(session.get("preview_stride", 2 if speed_up else 1)))
     allow_switch = bool(session.get("allow_switch", False))
     device_pref = str(session.get("device", "auto"))
     device_use = _analysis_resolve_device(device_pref)
     crop = session.get("crop") or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+    source_entries = list(session.get("sources") or [])
+    analysis_minutes = max(0.0, float(session.get("analysis_minutes", 0.0) or 0.0))
+    analysis_start_min = max(0.0, float(session.get("analysis_start_min", 0.0) or 0.0))
+    analysis_end_min = max(0.0, float(session.get("analysis_end_min", 0.0) or 0.0))
 
     with ANALYSIS_LOCK:
         ANALYSIS_SESSIONS[session_id]["running"] = True
         ANALYSIS_SESSIONS[session_id]["state"] = "loading-model"
 
     try:
-        model = _analysis_load_model(model_path)
+        model = _analysis_load_model(model_path, device_use=device_use)
     except Exception as exc:
         with ANALYSIS_LOCK:
             ANALYSIS_SESSIONS[session_id]["running"] = False
@@ -536,26 +561,36 @@ def _analysis_process_video(session_id: str, video_path: str):
         return
 
     os.makedirs(ANALYSIS_RESULT_DIR, exist_ok=True)
-    source_paths: List[str] = [video_path]
+    source_paths: List[str] = [str(entry.get("path")) for entry in source_entries if entry.get("path")]
+    source_labels: List[str] = [str(entry.get("label") or f"stream-{idx + 1}") for idx, entry in enumerate(source_entries) if entry.get("path")]
+    if not source_paths:
+        source_paths = [video_path]
+        source_labels = ["main"]
     tmp_sources: List[str] = []
     streams = _analysis_ffprobe_video_streams(video_path)
-    if len(streams) > 1:
+    if len(source_paths) == 1 and len(streams) > 1:
         source_paths = []
+        source_labels = []
         for idx, st in enumerate(streams):
             extracted = os.path.join(ANALYSIS_UPLOAD_DIR, f"{session_id}_stream{idx}.mp4")
             if _analysis_extract_video_stream(video_path, int(st.get("index", idx)), extracted):
                 source_paths.append(extracted)
                 tmp_sources.append(extracted)
+                source_labels.append("left" if idx == 0 else ("right" if idx == 1 else f"stream-{idx + 1}"))
         if not source_paths:
             source_paths = [video_path]
+            source_labels = ["main"]
 
     caps: List[cv2.VideoCapture] = []
-    for p in source_paths:
+    open_labels: List[str] = []
+    for idx, p in enumerate(source_paths):
         cap = cv2.VideoCapture(p)
         if cap.isOpened():
             caps.append(cap)
+            open_labels.append(str(source_labels[idx] if idx < len(source_labels) else f"stream-{idx + 1}").strip().lower())
         else:
             cap.release()
+    source_labels = open_labels
 
     if not caps:
         with ANALYSIS_LOCK:
@@ -566,18 +601,40 @@ def _analysis_process_video(session_id: str, video_path: str):
 
     fps_list = [(cap.get(cv2.CAP_PROP_FPS) or ANALYSIS_TARGET_FPS) for cap in caps]
     frame_count_list = [int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) for cap in caps]
+    dual_master_mode = len(caps) >= 2 and {"left", "right"}.issubset(set(source_labels))
+    left_stream_idx = source_labels.index("left") if "left" in source_labels else None
+    right_stream_idx = source_labels.index("right") if "right" in source_labels else None
+    master_canvas_cfg = MasterCanvasConfig()
     total_frames = max([n for n in frame_count_list if n > 0] or [0])
     src_fps = max([f for f in fps_list if f > 0] or [ANALYSIS_TARGET_FPS])
+    media_duration_sec = min(
+        [n / f for n, f in zip(frame_count_list, fps_list) if n > 0 and f > 0] or [0.0]
+    )
+    start_sec = max(0.0, analysis_start_min * 60.0)
+    if media_duration_sec > 0:
+        start_sec = min(start_sec, max(0.0, media_duration_sec - 0.25))
+    end_sec = analysis_end_min * 60.0 if analysis_end_min > 0 else 0.0
+    if end_sec <= 0.0 and analysis_minutes > 0:
+        end_sec = start_sec + (analysis_minutes * 60.0)
+    if media_duration_sec > 0 and end_sec > 0.0:
+        end_sec = min(end_sec, media_duration_sec)
+    if end_sec > 0.0 and end_sec <= start_sec:
+        end_sec = min(media_duration_sec, start_sec + 60.0) if media_duration_sec > 0 else (start_sec + 60.0)
+    analysis_limit_sec = max(0.0, end_sec - start_sec) if end_sec > 0.0 else max(0.0, media_duration_sec - start_sec if media_duration_sec > 0 else 0.0)
+    analysis_limit_frames = int(round(analysis_limit_sec * src_fps)) if analysis_limit_sec > 0 and src_fps > 0 else 0
+    if analysis_limit_frames > 0:
+        total_frames = analysis_limit_frames
     proc_times = deque(maxlen=50)
     last_seen_ts = None
-    lost_hold_sec = 1.8
+    lost_hold_sec = 2.2 if model_meta.backend == "rfdetr" else 1.8
     focus_stream = 0
-    smooth_alpha = 0.90
+    smooth_alpha = 0.88
     smooth_cx = None
     smooth_cy = None
     smooth_vx = 0.0
     smooth_vy = 0.0
     max_pan_ratio = 0.05
+    smooth_zoom = max(1.0, min(4.0, zoom))
     out_size = None
     writer = None
     segment_paths: List[str] = []
@@ -585,15 +642,25 @@ def _analysis_process_video(session_id: str, video_path: str):
     segment_frame_count = 0
     segment_index = 0
     frame_idx = 0
-    stream_best_cache: Dict[int, tuple] = {}
-    stream_last_seen_ts: Dict[int, float] = {}
-    fast_cache_hold_sec = 0.35
-    fast_track_hold_sec = 0.9
-    fast_search_expand = 2.6
+    max_track_misses = 12
+    non_focus_scan_multiplier = 2 if model_meta.backend == "rfdetr" else 1
+    master_layout_fixed = None
+    master_layout_shape = None
+    stream_states = [
+        {
+            "center": None,
+            "velocity": (0.0, 0.0),
+            "box": None,
+            "last_conf": 0.0,
+            "misses": max_track_misses + 1,
+            "last_seen_ts": 0.0,
+        }
+        for _ in caps
+    ]
     segment_dir = os.path.join(ANALYSIS_RESULT_DIR, f"analysis_{session_id}_parts")
     os.makedirs(segment_dir, exist_ok=True)
     stitched_avi = os.path.join(segment_dir, f"{session_id}_stitched.avi")
-    stem = Path(video_path).stem
+    stem = Path(source_paths[0] if source_paths else video_path).stem
     ts = time.strftime("%Y%m%d_%H%M%S")
     final_mp4 = os.path.join(ANALYSIS_RESULT_DIR, f"{stem}_analysis_{ts}_{session_id}.mp4")
 
@@ -602,6 +669,10 @@ def _analysis_process_video(session_id: str, video_path: str):
         ANALYSIS_SESSIONS[session_id]["device_used"] = device_use
         ANALYSIS_SESSIONS[session_id]["input_fps"] = float(src_fps)
         ANALYSIS_SESSIONS[session_id]["total_frames"] = float(total_frames)
+        ANALYSIS_SESSIONS[session_id]["analysis_minutes"] = analysis_minutes
+        ANALYSIS_SESSIONS[session_id]["analysis_start_min"] = analysis_start_min
+        ANALYSIS_SESSIONS[session_id]["analysis_end_min"] = analysis_end_min if analysis_end_min > 0 else None
+        ANALYSIS_SESSIONS[session_id]["analysis_limit_sec"] = analysis_limit_sec if analysis_limit_sec > 0 else None
         ANALYSIS_SESSIONS[session_id]["progress_pct"] = 0.0
         ANALYSIS_SESSIONS[session_id]["eta_sec"] = None
         ANALYSIS_SESSIONS[session_id]["stream_count"] = len(caps)
@@ -610,38 +681,11 @@ def _analysis_process_video(session_id: str, video_path: str):
         ANALYSIS_SESSIONS[session_id]["imgsz"] = infer_imgsz
         ANALYSIS_SESSIONS[session_id]["output_path"] = None
         ANALYSIS_SESSIONS[session_id]["recovery_dir"] = segment_dir
+        ANALYSIS_SESSIONS[session_id]["model_backend"] = model_meta.backend
+        ANALYSIS_SESSIONS[session_id]["focus_stream_label"] = source_labels[0] if source_labels else "main"
+        ANALYSIS_SESSIONS[session_id]["render_mode"] = "master-canvas" if dual_master_mode else "single-stream"
 
-    def _detect_best_box(roi_img, off_x: int, off_y: int, imgsz_local: int):
-        if roi_img is None or roi_img.size == 0:
-            return None
-        results = model(
-            roi_img,
-            imgsz=imgsz_local,
-            conf=conf,
-            iou=iou,
-            verbose=False,
-            device=predict_device,
-            half=use_half,
-        )
-        best = None
-        if results and results[0].boxes:
-            for box in results[0].boxes:
-                if class_id is not None and int(box.cls[0]) != int(class_id):
-                    continue
-                score = float(box.conf[0])
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                gx1 = off_x + x1
-                gy1 = off_y + y1
-                gx2 = off_x + x2
-                gy2 = off_y + y2
-                gcx = (gx1 + gx2) // 2
-                gcy = (gy1 + gy2) // 2
-                cand = (score, gx1, gy1, gx2, gy2, gcx, gcy)
-                if best is None or score > best[0]:
-                    best = cand
-        return best
-
-    if device_use.startswith("cuda"):
+    if device_use.startswith("cuda") and model_meta.backend == "yolo":
         if device_use in ("cuda", "cuda:0"):
             predict_device = "0"
         elif device_use.startswith("cuda:") and device_use.split(":", 1)[1].isdigit():
@@ -650,11 +694,152 @@ def _analysis_process_video(session_id: str, video_path: str):
             predict_device = device_use
     else:
         predict_device = device_use
-    use_half = device_use.startswith("cuda")
+
+    def _blend_width_for_overlap(overlap_px: int) -> int:
+        width = int(round(overlap_px * master_canvas_cfg.seam_blend_ratio))
+        return max(master_canvas_cfg.min_blend_px, min(master_canvas_cfg.max_blend_px, max(1, width)))
+
+    def _build_fixed_master_layout(
+        left_shape: tuple[int, int],
+        right_shape: tuple[int, int],
+        right_offset_x: int,
+        left_crop_y: int,
+        right_crop_y: int,
+    ) -> MasterCanvasLayout:
+        left_h, left_w = int(left_shape[0]), int(left_shape[1])
+        right_h, right_w = int(right_shape[0]), int(right_shape[1])
+        right_offset_x = max(0, min(left_w - 32, int(right_offset_x)))
+        left_crop_y = max(0, min(left_h - 1, int(left_crop_y)))
+        right_crop_y = max(0, min(right_h - 1, int(right_crop_y)))
+        overlap_px = max(32, min(left_w - right_offset_x, right_w))
+        width = max(left_w, right_offset_x + right_w)
+        height = max(1, min(left_h - left_crop_y, right_h - right_crop_y))
+        seam_x = right_offset_x + (overlap_px // 2)
+        blend_width = _blend_width_for_overlap(overlap_px)
+        blend_start_x = max(right_offset_x, seam_x - (blend_width // 2))
+        blend_end_x = min(right_offset_x + overlap_px, blend_start_x + blend_width)
+        return MasterCanvasLayout(
+            width=width,
+            height=height,
+            overlap_px=overlap_px,
+            left_offset_x=0,
+            left_crop_y=left_crop_y,
+            right_offset_x=right_offset_x,
+            right_crop_y=right_crop_y,
+            left_width=left_w,
+            right_width=right_w,
+            seam_x=seam_x,
+            blend_start_x=blend_start_x,
+            blend_end_x=blend_end_x,
+        )
+
+    def _calibrate_master_layout_from_samples() -> Optional[MasterCanvasLayout]:
+        if not dual_master_mode or left_stream_idx is None or right_stream_idx is None:
+            return None
+        left_path = source_paths[left_stream_idx]
+        right_path = source_paths[right_stream_idx]
+        left_cap = cv2.VideoCapture(left_path)
+        right_cap = cv2.VideoCapture(right_path)
+        if not left_cap.isOpened() or not right_cap.isOpened():
+            left_cap.release()
+            right_cap.release()
+            return None
+        try:
+            sample_ts = []
+            base_ts = max(0.0, start_sec)
+            for offset_sec in (0.0, 1.2, 2.6, 4.0):
+                ts = base_ts + offset_sec
+                if media_duration_sec > 0:
+                    ts = min(max(0.0, media_duration_sec - 0.35), ts)
+                sample_ts.append(ts)
+            layouts: List[MasterCanvasLayout] = []
+            left_shape = None
+            right_shape = None
+            for ts in sample_ts:
+                try:
+                    left_cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
+                    right_cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
+                except Exception:
+                    pass
+                ok_left, left_frame = left_cap.read()
+                ok_right, right_frame = right_cap.read()
+                if not ok_left or left_frame is None or not ok_right or right_frame is None:
+                    continue
+                left_shape = left_frame.shape[:2]
+                right_shape = right_frame.shape[:2]
+                layouts.append(estimate_master_canvas_layout(left_frame, right_frame, master_canvas_cfg))
+            if not layouts or left_shape is None or right_shape is None:
+                return None
+            right_offset_x = int(round(statistics.median(layout.right_offset_x for layout in layouts)))
+            left_crop_y = int(round(statistics.median(layout.left_crop_y for layout in layouts)))
+            right_crop_y = int(round(statistics.median(layout.right_crop_y for layout in layouts)))
+            return _build_fixed_master_layout(left_shape, right_shape, right_offset_x, left_crop_y, right_crop_y)
+        finally:
+            left_cap.release()
+            right_cap.release()
+
+    master_layout_fixed = _calibrate_master_layout_from_samples()
+
+    def _pick_best_detection(
+        detections: List[AnalysisDetection],
+        state: dict,
+        off_x: int,
+        off_y: int,
+        frame_w: int,
+        frame_h: int,
+    ):
+        best = None
+        best_score = -1e9
+        ref_center = state.get("center")
+        for det in detections:
+            gx1 = off_x + int(det.x1)
+            gy1 = off_y + int(det.y1)
+            gx2 = off_x + int(det.x2)
+            gy2 = off_y + int(det.y2)
+            candidate = AnalysisDetection(
+                class_id=int(det.class_id),
+                confidence=float(det.confidence),
+                x1=gx1,
+                y1=gy1,
+                x2=gx2,
+                y2=gy2,
+                label=det.label,
+            )
+            score = candidate.confidence * 1.35
+            if ref_center is not None:
+                dist = math.hypot(candidate.cx - ref_center[0], candidate.cy - ref_center[1])
+                limit = max(80.0, min(frame_w, frame_h) * 0.22)
+                score -= min(0.42, dist / limit * 0.18)
+            score -= min(0.10, candidate.area / max(1.0, frame_w * frame_h) * 0.6)
+            if score > best_score:
+                best_score = score
+                best = (score, candidate)
+        return best
+
+    def _run_detection(search_img, off_x: int, off_y: int, imgsz_local: int, state: dict, frame_w: int, frame_h: int):
+        if search_img is None or search_img.size == 0:
+            return None
+        detections = model.predict(
+            search_img,
+            conf=conf,
+            iou=iou,
+            imgsz=imgsz_local,
+            class_id=class_id,
+            device=predict_device,
+        )
+        return _pick_best_detection(detections, state, off_x, off_y, frame_w, frame_h)
 
     try:
+        if start_sec > 0:
+            for cap in caps:
+                try:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
+                except Exception:
+                    pass
         while True:
             t0 = time.time()
+            if total_frames > 0 and frame_idx >= total_frames:
+                break
             frame_idx += 1
             frames = []
             any_open = False
@@ -667,11 +852,32 @@ def _analysis_process_video(session_id: str, video_path: str):
                     frames.append(None)
             if not any_open:
                 break
+            active_ref_frame = frames[focus_stream] if focus_stream < len(frames) and frames[focus_stream] is not None else None
+            if active_ref_frame is None:
+                active_ref_frame = next((frame for frame in frames if frame is not None), None)
+            if active_ref_frame is None:
+                continue
+            master_frame = None
+            master_layout = None
+            if dual_master_mode and left_stream_idx is not None and right_stream_idx is not None:
+                left_frame = frames[left_stream_idx] if left_stream_idx < len(frames) else None
+                right_frame = frames[right_stream_idx] if right_stream_idx < len(frames) else None
+                if left_frame is not None and right_frame is not None:
+                    shape_key = (left_frame.shape[:2], right_frame.shape[:2])
+                    if master_layout_fixed is None:
+                        master_layout_fixed = estimate_master_canvas_layout(left_frame, right_frame, master_canvas_cfg)
+                        master_layout_shape = shape_key
+                    elif master_layout_shape is None:
+                        master_layout_shape = shape_key
+                    master_frame, master_layout = assemble_master_canvas(
+                        left_frame,
+                        right_frame,
+                        master_canvas_cfg,
+                        layout=master_layout_fixed,
+                    )
 
-            detected = False
             last_conf = 0.0
-            stream_best = {}  # idx -> (score, x1, y1, x2, y2, cx, cy)
-
+            stream_best = {}
             now_ts = time.time()
             for idx, frame in enumerate(frames):
                 if frame is None:
@@ -689,97 +895,156 @@ def _analysis_process_video(session_id: str, video_path: str):
                 if roi.size == 0:
                     continue
 
-                do_full_scan = (frame_idx % detect_every) == 0
+                state = stream_states[idx]
                 best_for_stream = None
+                scan_mod = detect_every
+                if idx != focus_stream and len(caps) > 1:
+                    scan_mod = max(1, detect_every * non_focus_scan_multiplier)
+                do_full_scan = (frame_idx % scan_mod) == 0 or state["box"] is None or state["misses"] > 1
 
-                if speed_up:
-                    # Smart fast-tracking: first search around last known ball area, then periodic full scan.
-                    cached = stream_best_cache.get(idx)
-                    cached_ts = stream_last_seen_ts.get(idx, 0.0)
-                    if cached is not None and (now_ts - cached_ts) <= fast_track_hold_sec:
-                        _, bx1, by1, bx2, by2, bcx, bcy = cached
-                        bw = max(8, bx2 - bx1)
-                        bh = max(8, by2 - by1)
-                        sw = max(120, int(bw * fast_search_expand))
-                        sh = max(120, int(bh * fast_search_expand))
-                        sx1 = _analysis_clamp(int(bcx - sw // 2), rx, rx + rw - 2)
-                        sy1 = _analysis_clamp(int(bcy - sh // 2), ry, ry + rh - 2)
-                        sx2 = _analysis_clamp(sx1 + sw, sx1 + 1, rx + rw)
-                        sy2 = _analysis_clamp(sy1 + sh, sy1 + 1, ry + rh)
-                        search_roi = frame[sy1:sy2, sx1:sx2]
-                        best_for_stream = _detect_best_box(search_roi, sx1, sy1, max(256, infer_imgsz - 64))
+                if state["box"] is not None and (now_ts - float(state["last_seen_ts"] or 0.0)) <= lost_hold_sec:
+                    bx1, by1, bx2, by2 = state["box"]
+                    bw = max(8, bx2 - bx1)
+                    bh = max(8, by2 - by1)
+                    pvx, pvy = state["velocity"]
+                    pcx = float(state["center"][0] if state["center"] is not None else (bx1 + bx2) / 2.0) + float(pvx)
+                    pcy = float(state["center"][1] if state["center"] is not None else (by1 + by2) / 2.0) + float(pvy)
+                    search_expand = 3.4 if model_meta.backend == "rfdetr" else 2.8
+                    sw = max(140, int(bw * search_expand))
+                    sh = max(140, int(bh * search_expand))
+                    sx1 = _analysis_clamp(int(pcx - sw // 2), rx, rx + rw - 2)
+                    sy1 = _analysis_clamp(int(pcy - sh // 2), ry, ry + rh - 2)
+                    sx2 = _analysis_clamp(sx1 + sw, sx1 + 1, rx + rw)
+                    sy2 = _analysis_clamp(sy1 + sh, sy1 + 1, ry + rh)
+                    search_roi = frame[sy1:sy2, sx1:sx2]
+                    best_for_stream = _run_detection(search_roi, sx1, sy1, max(256, infer_imgsz - 96), state, w, h)
 
-                    if best_for_stream is None and do_full_scan:
-                        best_for_stream = _detect_best_box(roi, rx, ry, infer_imgsz)
-                else:
-                    best_for_stream = _detect_best_box(roi, rx, ry, infer_imgsz)
+                if best_for_stream is None and do_full_scan:
+                    best_for_stream = _run_detection(roi, rx, ry, infer_imgsz, state, w, h)
 
                 if best_for_stream is not None:
-                    stream_best_cache[idx] = best_for_stream
-                    stream_last_seen_ts[idx] = now_ts
-                    stream_best[idx] = best_for_stream
+                    score, det = best_for_stream
+                    prev_center = state["center"]
+                    if prev_center is not None:
+                        raw_vx = det.cx - prev_center[0]
+                        raw_vy = det.cy - prev_center[1]
+                        old_vx, old_vy = state["velocity"]
+                        state["velocity"] = (old_vx * 0.65 + raw_vx * 0.35, old_vy * 0.65 + raw_vy * 0.35)
+                    state["center"] = (det.cx, det.cy)
+                    state["box"] = (det.x1, det.y1, det.x2, det.y2)
+                    state["last_conf"] = det.confidence
+                    state["misses"] = 0
+                    state["last_seen_ts"] = now_ts
+                    stream_best[idx] = {
+                        "kind": "detected",
+                        "score": score,
+                        "det": det,
+                        "vx": state["velocity"][0],
+                        "vy": state["velocity"][1],
+                        "stream_idx": idx,
+                        "stream_label": source_labels[idx] if idx < len(source_labels) else f"stream-{idx + 1}",
+                    }
                 else:
-                    # Short grace reuse only; prevents stale lock-on while still smoothing misses.
-                    cached = stream_best_cache.get(idx)
-                    cached_ts = stream_last_seen_ts.get(idx, 0.0)
-                    if cached is not None and (now_ts - cached_ts) <= fast_cache_hold_sec:
-                        stream_best[idx] = cached
-                    else:
-                        stream_best_cache.pop(idx, None)
-                        stream_last_seen_ts.pop(idx, None)
+                    state["misses"] += 1
+                    if state["center"] is not None and state["box"] is not None and state["misses"] <= max_track_misses and (now_ts - float(state["last_seen_ts"] or 0.0)) <= lost_hold_sec:
+                        pvx, pvy = state["velocity"]
+                        pcx = state["center"][0] + pvx
+                        pcy = state["center"][1] + pvy
+                        bx1, by1, bx2, by2 = state["box"]
+                        bw = max(8, bx2 - bx1)
+                        bh = max(8, by2 - by1)
+                        px1 = _analysis_clamp(int(pcx - bw / 2), rx, rx + rw - 2)
+                        py1 = _analysis_clamp(int(pcy - bh / 2), ry, ry + rh - 2)
+                        px2 = _analysis_clamp(px1 + bw, px1 + 1, rx + rw)
+                        py2 = _analysis_clamp(py1 + bh, py1 + 1, ry + rh)
+                        pred = AnalysisDetection(
+                            class_id=int(class_id or 0),
+                            confidence=max(0.01, float(state["last_conf"]) * (0.84 ** state["misses"])),
+                            x1=px1,
+                            y1=py1,
+                            x2=px2,
+                            y2=py2,
+                            label="predicted",
+                        )
+                        state["center"] = (pred.cx, pred.cy)
+                        state["box"] = (pred.x1, pred.y1, pred.x2, pred.y2)
+                        state["velocity"] = (pvx * 0.88, pvy * 0.88)
+                        stream_best[idx] = {
+                            "kind": "predicted",
+                            "score": pred.confidence * 0.82,
+                            "det": pred,
+                            "vx": state["velocity"][0],
+                            "vy": state["velocity"][1],
+                            "stream_idx": idx,
+                            "stream_label": source_labels[idx] if idx < len(source_labels) else f"stream-{idx + 1}",
+                        }
 
             chosen = None
-            if stream_best:
-                cur_best = stream_best.get(focus_stream)
-                if allow_switch:
-                    global_best_stream = max(stream_best.keys(), key=lambda k: stream_best[k][0])
-                    global_best = stream_best[global_best_stream]
-                    switch_margin = 0.08
-                    if cur_best is None:
-                        focus_stream = global_best_stream
-                        chosen = global_best
-                    else:
-                        if global_best_stream != focus_stream and global_best[0] > (cur_best[0] + switch_margin):
-                            focus_stream = global_best_stream
-                            chosen = global_best
-                        else:
-                            chosen = cur_best
-                else:
-                    chosen = cur_best
+            detected_streams = {idx: item for idx, item in stream_best.items() if item["kind"] == "detected"}
+            predicted_streams = {idx: item for idx, item in stream_best.items() if item["kind"] == "predicted"}
+            if detected_streams:
+                cur_best = detected_streams.get(focus_stream)
+                best_stream = max(detected_streams.keys(), key=lambda key: detected_streams[key]["score"])
+                if len(caps) == 1 or not allow_switch:
+                    focus_stream = focus_stream if cur_best is not None else best_stream
+                elif cur_best is None or (best_stream != focus_stream and detected_streams[best_stream]["score"] > (cur_best["score"] + 0.08)):
+                    focus_stream = best_stream
+                chosen = detected_streams.get(focus_stream) or detected_streams[best_stream]
+            elif predicted_streams:
+                if focus_stream not in predicted_streams:
+                    focus_stream = max(predicted_streams.keys(), key=lambda key: predicted_streams[key]["score"])
+                chosen = predicted_streams[focus_stream]
+
+            detected = bool(chosen and chosen["kind"] == "detected")
+            remembered = bool(chosen and chosen["kind"] == "predicted")
+            render_det = chosen["det"] if chosen is not None else None
+            render_target_cx = render_det.cx if render_det is not None else None
+            render_target_cy = render_det.cy if render_det is not None else None
+            render_stream_label = chosen.get("stream_label") if chosen is not None else None
+            if chosen is not None and master_layout is not None and render_stream_label in {"left", "right"}:
+                det = chosen["det"]
+                mx1, my1, mx2, my2 = map_box_to_master(render_stream_label, (det.x1, det.y1, det.x2, det.y2), master_layout)
+                render_det = AnalysisDetection(
+                    class_id=det.class_id,
+                    confidence=det.confidence,
+                    x1=mx1,
+                    y1=my1,
+                    x2=mx2,
+                    y2=my2,
+                    label=det.label,
+                )
+                render_target_cx, render_target_cy = map_point_to_master(render_stream_label, det.cx, det.cy, master_layout)
 
             if chosen is not None:
-                detected = True
-                last_conf = chosen[0]
-                target_cx = chosen[5]
-                target_cy = chosen[6]
+                last_conf = render_det.confidence if render_det is not None else chosen["det"].confidence
+                target_cx = float(render_target_cx) + (chosen["vx"] * 0.6 if remembered else chosen["vx"] * 0.35)
+                target_cy = float(render_target_cy) + (chosen["vy"] * 0.6 if remembered else chosen["vy"] * 0.35)
                 if smooth_cx is None:
                     smooth_cx, smooth_cy = target_cx, target_cy
                 else:
-                    # Damped follow: smooth + limited per-frame pan to avoid hard jumps.
                     want_x = smooth_alpha * smooth_cx + (1.0 - smooth_alpha) * target_cx
                     want_y = smooth_alpha * smooth_cy + (1.0 - smooth_alpha) * target_cy
                     dx = want_x - smooth_cx
                     dy = want_y - smooth_cy
-                    # Deadzone avoids tiny left-right jitter when the ball is near center.
-                    deadzone = max(2.0, min(fw if 'fw' in locals() else 1920, fh if 'fh' in locals() else 1080) * 0.012)
+                    deadzone = max(2.0, min(active_ref_frame.shape[1], active_ref_frame.shape[0]) * 0.01)
                     if abs(dx) < deadzone:
                         dx = 0.0
                     if abs(dy) < deadzone:
                         dy = 0.0
-                    max_pan = max(8.0, min(fw if 'fw' in locals() else 1920, fh if 'fh' in locals() else 1080) * max_pan_ratio)
-                    if dx > max_pan:
-                        dx = max_pan
-                    elif dx < -max_pan:
-                        dx = -max_pan
-                    if dy > max_pan:
-                        dy = max_pan
-                    elif dy < -max_pan:
-                        dy = -max_pan
-                    smooth_vx = 0.75 * smooth_vx + 0.25 * dx
-                    smooth_vy = 0.75 * smooth_vy + 0.25 * dy
-                    smooth_cx = int(smooth_cx + smooth_vx)
-                    smooth_cy = int(smooth_cy + smooth_vy)
-                last_seen_ts = time.time()
+                    max_pan = max(8.0, min(active_ref_frame.shape[1], active_ref_frame.shape[0]) * max_pan_ratio)
+                    dx = max(-max_pan, min(max_pan, dx))
+                    dy = max(-max_pan, min(max_pan, dy))
+                    smooth_vx = 0.72 * smooth_vx + 0.28 * dx
+                    smooth_vy = 0.72 * smooth_vy + 0.28 * dy
+                    smooth_cx = float(smooth_cx + smooth_vx)
+                    smooth_cy = float(smooth_cy + smooth_vy)
+                last_seen_ts = now_ts
+            else:
+                if smooth_cx is not None:
+                    smooth_cx = smooth_cx * 0.96 + (active_ref_frame.shape[1] / 2.0) * 0.04
+                    smooth_cy = smooth_cy * 0.96 + (active_ref_frame.shape[0] / 2.0) * 0.04
+                smooth_vx *= 0.8
+                smooth_vy *= 0.8
 
             source_frame = None
             if focus_stream < len(frames):
@@ -792,45 +1057,77 @@ def _analysis_process_video(session_id: str, video_path: str):
             if source_frame is None:
                 continue
 
-            fh, fw = source_frame.shape[:2]
-            rx = int(float(crop.get("x", 0.0)) * fw)
-            ry = int(float(crop.get("y", 0.0)) * fh)
-            rw = int(float(crop.get("w", 1.0)) * fw)
-            rh = int(float(crop.get("h", 1.0)) * fh)
-            rx = _analysis_clamp(rx, 0, fw - 1)
-            ry = _analysis_clamp(ry, 0, fh - 1)
-            rw = _analysis_clamp(rw, 1, fw - rx)
-            rh = _analysis_clamp(rh, 1, fh - ry)
+            render_frame = master_frame if master_frame is not None else source_frame
+            fh, fw = render_frame.shape[:2]
+            rx = 0
+            ry = 0
+            rw = fw
+            rh = fh
+            if master_frame is None:
+                rx = int(float(crop.get("x", 0.0)) * fw)
+                ry = int(float(crop.get("y", 0.0)) * fh)
+                rw = int(float(crop.get("w", 1.0)) * fw)
+                rh = int(float(crop.get("h", 1.0)) * fh)
+                rx = _analysis_clamp(rx, 0, fw - 1)
+                ry = _analysis_clamp(ry, 0, fh - 1)
+                rw = _analysis_clamp(rw, 1, fw - rx)
+                rh = _analysis_clamp(rh, 1, fh - ry)
             vis = None
             if not speed_up:
-                vis = source_frame.copy()
-                cv2.rectangle(vis, (rx, ry), (rx + rw, ry + rh), (255, 190, 40), 1)
-                if chosen is not None:
-                    x1, y1, x2, y2 = chosen[1], chosen[2], chosen[3], chosen[4]
-                    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 220, 0), 2)
-                    cv2.putText(vis, f"BALL {last_conf:.2f}", (x1, max(16, y1 - 8)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 2)
+                vis = render_frame.copy()
+                if master_frame is None:
+                    cv2.rectangle(vis, (rx, ry), (rx + rw, ry + rh), (255, 190, 40), 1)
+                if render_det is not None:
+                    det = render_det
+                    color = (0, 220, 0) if detected else (0, 165, 255)
+                    label = "BALL" if detected else "BALL predicted"
+                    cv2.rectangle(vis, (det.x1, det.y1), (det.x2, det.y2), color, 2)
+                    cv2.putText(vis, f"{label} {last_conf:.2f}", (det.x1, max(16, det.y1 - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 elif last_seen_ts and (time.time() - last_seen_ts) <= lost_hold_sec:
                     cv2.putText(vis, "BALL remembered", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
                 else:
                     cv2.putText(vis, "BALL lost", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                cv2.putText(vis, f"Stream {focus_stream + 1}/{len(caps)}", (12, fh - 14),
+                focus_label = source_labels[focus_stream].upper() if focus_stream < len(source_labels) else f"STREAM {focus_stream + 1}"
+                render_label = "MASTER CANVAS" if master_frame is not None else focus_label
+                cv2.putText(vis, f"{render_label} | {model_meta.label}", (12, fh - 14),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 2)
 
             if out_size is None:
-                out_size = (fw, fh)
+                out_size = (source_frame.shape[1], source_frame.shape[0])
             out_w, out_h = out_size
             if smooth_cx is None:
                 smooth_cx = fw // 2
                 smooth_cy = fh // 2
-            zoom_use = max(1.0, min(4.0, zoom))
+            if render_det is not None:
+                det = render_det
+                ball_ratio = math.sqrt(det.area / max(1.0, fw * fh))
+                zoom_bonus = 0.0
+                if ball_ratio < 0.016:
+                    zoom_bonus = 1.35
+                elif ball_ratio < 0.024:
+                    zoom_bonus = 0.95
+                elif ball_ratio < 0.034:
+                    zoom_bonus = 0.55
+                elif ball_ratio < 0.048:
+                    zoom_bonus = 0.2
+                edge_margin = min(det.cx, fw - det.cx, det.cy, fh - det.cy)
+                if edge_margin < min(fw, fh) * 0.12:
+                    zoom_bonus -= 0.22
+                desired_zoom = max(1.0, min(4.0, zoom + zoom_bonus))
+            elif last_seen_ts and (time.time() - last_seen_ts) <= lost_hold_sec:
+                desired_zoom = max(1.0, smooth_zoom * 0.992)
+            else:
+                desired_zoom = max(1.0, smooth_zoom * 0.97)
+            smooth_zoom = smooth_zoom * 0.9 + desired_zoom * 0.1
+            zoom_use = max(1.0, min(4.0, smooth_zoom))
             win_w = int(out_w / zoom_use)
             win_h = int(out_h / zoom_use)
             left = _analysis_clamp(int(smooth_cx - win_w // 2), 0, max(0, fw - win_w))
             top = _analysis_clamp(int(smooth_cy - win_h // 2), 0, max(0, fh - win_h))
-            crop_frame = source_frame[top:top + win_h, left:left + win_w]
+            crop_frame = render_frame[top:top + win_h, left:left + win_w]
             if crop_frame.size == 0:
-                crop_frame = source_frame
+                crop_frame = render_frame
             if speed_up:
                 interp = cv2.INTER_LINEAR
             else:
@@ -841,17 +1138,28 @@ def _analysis_process_video(session_id: str, video_path: str):
                 blur = cv2.GaussianBlur(render, (0, 0), 1.0)
                 render = cv2.addWeighted(render, 1.18, blur, -0.18, 0)
 
-            if speed_up:
-                # Fast path: publish final render directly as preview (skip expensive debug-overlay rendering).
-                preview_frame = render
-            else:
-                # Preview mirrors final zoom framing but keeps debug overlays.
-                vis_zoom_src = vis[top:top + win_h, left:left + win_w]
-                if vis_zoom_src.size == 0:
-                    vis_zoom_src = vis
-                preview_frame = cv2.resize(vis_zoom_src, (out_w, out_h), interpolation=interp)
-                cv2.putText(preview_frame, "Preview: final zoom + tracking overlay", (12, 24),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 220, 255), 2)
+            # Publish the clean final render to the UI preview. Debug overlays stay
+            # out of the default preview so the stitched field matches the actual
+            # output composition more closely.
+            preview_frame = render
+
+            publish_preview = False
+            master_debug_frame = None
+            with ANALYSIS_LOCK:
+                sess = ANALYSIS_SESSIONS.get(session_id)
+                if not sess:
+                    break
+                publish_preview = (frame_idx % preview_stride) == 0 or sess.get("frame") is None or sess.get("frame_master") is None
+
+            if publish_preview:
+                debug_src = master_frame if master_frame is not None else render_frame
+                if debug_src is not None:
+                    master_debug_frame = debug_src.copy()
+                    dbg_h, dbg_w = master_debug_frame.shape[:2]
+                    dbg_max_w = 960
+                    if dbg_w > dbg_max_w:
+                        dbg_h = max(1, int(round(dbg_h * (dbg_max_w / float(dbg_w)))))
+                        master_debug_frame = cv2.resize(master_debug_frame, (dbg_max_w, dbg_h), interpolation=cv2.INTER_AREA)
 
             if writer is None:
                 segment_path = os.path.join(segment_dir, f"part_{segment_index:04d}.avi")
@@ -885,15 +1193,23 @@ def _analysis_process_video(session_id: str, video_path: str):
                 sess["detections"] = float(sess.get("detections", 0.0) + (1.0 if detected else 0.0))
                 sess["fps"] = fps_proc
                 sess["last_conf"] = last_conf
-                sess["state"] = "BALL" if detected else ("REMEMBERED" if last_seen_ts and (time.time() - last_seen_ts) <= lost_hold_sec else "LOST")
+                sess["state"] = "BALL" if detected else ("REMEMBERED" if remembered or (last_seen_ts and (time.time() - last_seen_ts) <= lost_hold_sec) else "LOST")
                 sess["last_seen_sec"] = (time.time() - last_seen_ts) if last_seen_ts else None
+                focus_label = source_labels[focus_stream] if focus_stream < len(source_labels) else f"stream-{focus_stream + 1}"
+                sess["focus_stream_label"] = focus_label
+                if chosen is not None:
+                    det = chosen["det"]
+                    sess["view_half"] = "left" if det.cx < (fw / 2.0) else "right"
+                    sess["field_side"] = focus_label if focus_label in ("left", "right") else sess["view_half"]
+                sess["zoom_live"] = zoom_use
                 if total_frames > 0:
                     done = float(sess["frames"])
                     pct = min(100.0, (done / float(total_frames)) * 100.0)
                     sess["progress_pct"] = pct
                     sess["eta_sec"] = ((float(total_frames) - done) / fps_proc) if fps_proc > 0 and done < total_frames else 0.0
-                if (frame_idx % preview_stride) == 0 or sess.get("frame") is None:
+                if publish_preview:
                     sess["frame"] = preview_frame
+                    sess["frame_master"] = master_debug_frame if master_debug_frame is not None else preview_frame
 
             # Offline analysis: run at full speed, no realtime pacing delay.
     except Exception as exc:
@@ -2331,7 +2647,7 @@ ANALYSIS_HTML = r"""
     <div class="top">
       <div>
         <h1 style="margin:0;font-size:26px;">AI Analysis</h1>
-        <div style="color:var(--muted);font-size:13px;">Upload a video, define crop/ROI, and run ball tracking after recording.</div>
+        <div style="color:var(--muted);font-size:13px;">Upload left/right camera videos, pick a model, and run stable post-analysis with smart zoom.</div>
       </div>
       <div class="top-actions">
         <a class="nav-btn" href="/">Back to Home</a>
@@ -2339,9 +2655,17 @@ ANALYSIS_HTML = r"""
     </div>
     <section class="grid">
       <div class="card">
-        <h3>Upload + Crop</h3>
-        <label>Video File</label>
-        <input id="videoFile" type="file" accept="video/*"/>
+        <h3>Inputs + Crop</h3>
+        <div class="row">
+          <div>
+            <label>Left Camera</label>
+            <input id="videoFileLeft" type="file" accept="video/*"/>
+          </div>
+          <div>
+            <label>Right Camera</label>
+            <input id="videoFileRight" type="file" accept="video/*"/>
+          </div>
+        </div>
         <div class="row">
           <div>
             <label>Class</label>
@@ -2382,7 +2706,7 @@ ANALYSIS_HTML = r"""
             <label>Speed Up</label>
             <select id="speedUp">
               <option value="false">Off (best quality preview)</option>
-              <option value="true">On (faster analysis)</option>
+              <option value="true" selected>On (faster analysis)</option>
             </select>
           </div>
         </div>
@@ -2395,17 +2719,46 @@ ANALYSIS_HTML = r"""
           <input id="cropW" type="number" value="1.00" step="0.01" min="0.05" max="1"/>
           <input id="cropH" type="number" value="1.00" step="0.01" min="0.05" max="1"/>
         </div>
+        <label>Analysis Window (minutes)</label>
+        <div class="row">
+          <div>
+            <label style="margin-top:0;">Start Minute</label>
+            <div class="row" style="align-items:center;">
+              <input id="analysisStartRange" type="range" value="0" min="0" max="0" step="0.1"/>
+              <input id="analysisStart" type="number" value="0" min="0" max="0" step="0.1"/>
+            </div>
+          </div>
+          <div>
+            <label style="margin-top:0;">End Minute</label>
+            <div class="row" style="align-items:center;">
+              <input id="analysisEndRange" type="range" value="0" min="0" max="0" step="0.1"/>
+              <input id="analysisEnd" type="number" value="0" min="0" max="0" step="0.1"/>
+            </div>
+          </div>
+        </div>
+        <label>Legacy Length (minutes)</label>
+        <div class="row" style="align-items:center;">
+          <input id="analysisMinutesRange" type="range" value="0" min="0" max="0" step="0.1"/>
+          <input id="analysisMinutes" type="number" value="0" min="0" max="0" step="0.1"/>
+        </div>
+        <div class="status" id="analysisMinutesHint">Set start/end to inspect a short section fast. End minute 0 means until the file ends. Legacy length is still supported.</div>
         <button id="startBtn">Start Analysis</button>
         <div class="status" id="line">idle</div>
       </div>
       <div class="card">
         <h3>Tracking Preview</h3>
         <div class="preview"><img id="stream" alt="analysis stream"/><span id="streamHint">No session started yet</span></div>
+        <h3 style="margin-top:14px;">Master Canvas Debug</h3>
+        <div class="preview"><img id="streamMaster" alt="analysis master canvas stream"/><span id="streamMasterHint">Combined full-field canvas will appear here</span></div>
         <div class="stats">
           <div class="chip" id="stState">state:-</div>
           <div class="chip" id="stProg">progress:0%</div>
           <div class="chip" id="stFps">fps:0</div>
           <div class="chip" id="stEta">eta:-</div>
+          <div class="chip" id="stBackend">backend:-</div>
+          <div class="chip" id="stSource">source:-</div>
+          <div class="chip" id="stField">field:-</div>
+          <div class="chip" id="stZoom">zoom:1.0</div>
           <div class="chip" id="stFrames">frames:0</div>
           <div class="chip" id="stTotal">total:0</div>
           <div class="chip" id="stDet">detections:0</div>
@@ -2444,13 +2797,94 @@ ANALYSIS_HTML = r"""
     const $ = (id) => document.getElementById(id);
     let sid = null;
     let timer = null;
+    let modelMetaByPath = {};
+    let maxAnalysisMinutes = 0;
+
+    const setAnalysisMinutesLimits = (minutes) => {
+      maxAnalysisMinutes = Math.max(0, Number.isFinite(minutes) ? minutes : 0);
+      $("analysisMinutesRange").max = String(maxAnalysisMinutes);
+      $("analysisMinutes").max = String(maxAnalysisMinutes);
+      $("analysisStartRange").max = String(maxAnalysisMinutes);
+      $("analysisStart").max = String(maxAnalysisMinutes);
+      $("analysisEndRange").max = String(maxAnalysisMinutes);
+      $("analysisEnd").max = String(maxAnalysisMinutes);
+      const current = Math.max(0, Math.min(Number($("analysisMinutes").value || 0), maxAnalysisMinutes));
+      const currentStart = Math.max(0, Math.min(Number($("analysisStart").value || 0), maxAnalysisMinutes));
+      const currentEndRaw = Number($("analysisEnd").value || 0);
+      const currentEnd = currentEndRaw <= 0 ? maxAnalysisMinutes : Math.max(currentStart, Math.min(currentEndRaw, maxAnalysisMinutes));
+      $("analysisMinutesRange").value = String(current);
+      $("analysisMinutes").value = String(current);
+      $("analysisStartRange").value = String(currentStart);
+      $("analysisStart").value = String(currentStart);
+      $("analysisEndRange").value = String(currentEnd);
+      $("analysisEnd").value = String(currentEndRaw <= 0 ? 0 : currentEnd);
+      const maxText = maxAnalysisMinutes > 0 ? `${maxAnalysisMinutes.toFixed(1)} min detected from upload` : "0 = full file length";
+      $("analysisMinutesHint").textContent = `Use Start/End Minute for fast testing. End minute 0 means until file end. Max selectable: ${maxText}.`;
+    };
+
+    const syncAnalysisMinutes = (source) => {
+      const raw = Number(source.value || 0);
+      const clamped = Math.max(0, Math.min(Number.isFinite(raw) ? raw : 0, maxAnalysisMinutes || raw || 0));
+      $("analysisMinutesRange").value = String(clamped);
+      $("analysisMinutes").value = String(clamped);
+    };
+
+    const syncAnalysisWindow = (source, kind) => {
+      const maxValue = maxAnalysisMinutes || 0;
+      let start = Number($("analysisStart").value || 0);
+      let end = Number($("analysisEnd").value || 0);
+      if (kind === "start") start = Number(source.value || 0);
+      if (kind === "end") end = Number(source.value || 0);
+      start = Math.max(0, Math.min(Number.isFinite(start) ? start : 0, maxValue));
+      if (end > 0) end = Math.max(start, Math.min(Number.isFinite(end) ? end : 0, maxValue));
+      $("analysisStartRange").value = String(start);
+      $("analysisStart").value = String(start);
+      $("analysisEndRange").value = String(end > 0 ? end : start);
+      $("analysisEnd").value = String(end);
+    };
+
+    const readFileDurationMinutes = (file) => new Promise((resolve) => {
+      if (!file) {
+        resolve(null);
+        return;
+      }
+      const url = URL.createObjectURL(file);
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.onloadedmetadata = () => {
+        const minutes = Number(video.duration) > 0 ? video.duration / 60 : null;
+        URL.revokeObjectURL(url);
+        resolve(minutes);
+      };
+      video.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(null);
+      };
+      video.src = url;
+    });
+
+    const refreshAnalysisMinutes = async () => {
+      const leftFile = $("videoFileLeft").files[0];
+      const rightFile = $("videoFileRight").files[0];
+      const durations = await Promise.all([
+        readFileDurationMinutes(leftFile),
+        readFileDurationMinutes(rightFile),
+      ]);
+      const valid = durations.filter((value) => value != null && Number.isFinite(value) && value > 0);
+      if (!valid.length) {
+        setAnalysisMinutesLimits(0);
+        return;
+      }
+      setAnalysisMinutesLimits(Math.min(...valid));
+    };
 
     const loadClasses = async () => {
-      const modelPath = $("modelPath").value || "models/football-ball-detection.pt";
+      const modelPath = $("modelPath").value || "models/ballscope.pt";
       try {
         const r = await fetch(`/api/analysis/classes?model_path=${encodeURIComponent(modelPath)}`);
         if (!r.ok) return;
         const j = await r.json();
+        const meta = modelMetaByPath[modelPath] || {};
         const sel = $("classId");
         const current = sel.value;
         sel.innerHTML = "";
@@ -2465,9 +2899,11 @@ ANALYSIS_HTML = r"""
           opt.value = String(c.id);
           opt.textContent = `${c.id}: ${c.label}`;
           if ((c.label || "").toLowerCase() === "sports ball") sportsBallId = String(c.id);
+          if ((c.label || "").toLowerCase() === "soccerball") sportsBallId = String(c.id);
           sel.appendChild(opt);
         }
         if ([...sel.options].some(o => o.value === current)) sel.value = current;
+        else if (meta.default_class_id != null && [...sel.options].some(o => o.value === String(meta.default_class_id))) sel.value = String(meta.default_class_id);
         else if (sportsBallId) sel.value = sportsBallId;
       } catch (e) {}
     };
@@ -2479,10 +2915,12 @@ ANALYSIS_HTML = r"""
         const j = await r.json();
         const sel = $("modelPath");
         sel.innerHTML = "";
+        modelMetaByPath = {};
         for (const m of (j.models || [])) {
+          modelMetaByPath[m.path] = m;
           const opt = document.createElement("option");
-          opt.value = m;
-          opt.textContent = m;
+          opt.value = m.path;
+          opt.textContent = `${m.path} (${m.label || m.backend || "model"})`;
           sel.appendChild(opt);
         }
         if (j.default && [...sel.options].some(o => o.value === j.default)) {
@@ -2521,6 +2959,10 @@ ANALYSIS_HTML = r"""
         $("stProg").textContent = `progress:${(j.progress_pct || 0).toFixed(1)}%`;
         $("stFps").textContent = `fps:${(j.fps || 0).toFixed(1)}`;
         $("stEta").textContent = `eta:${j.eta_sec == null ? "-" : Math.max(0, j.eta_sec).toFixed(1) + "s"}`;
+        $("stBackend").textContent = `backend:${j.model_backend || "-"}`;
+        $("stSource").textContent = `source:${j.focus_stream_label || "-"}`;
+        $("stField").textContent = `field:${j.field_side || j.view_half || "-"}`;
+        $("stZoom").textContent = `zoom:${(j.zoom_live || 1).toFixed(2)}`;
         $("stFrames").textContent = `frames:${(j.frames || 0).toFixed(0)}`;
         $("stTotal").textContent = `total:${(j.total_frames || 0).toFixed(0)}`;
         $("stDet").textContent = `detections:${(j.detections || 0).toFixed(0)}`;
@@ -2542,9 +2984,10 @@ ANALYSIS_HTML = r"""
     };
 
     $("startBtn").onclick = async () => {
-      const file = $("videoFile").files[0];
-      if (!file) {
-        $("line").textContent = "Please select a video first.";
+      const leftFile = $("videoFileLeft").files[0];
+      const rightFile = $("videoFileRight").files[0];
+      if (!leftFile && !rightFile) {
+        $("line").textContent = "Please select at least one camera video.";
         return;
       }
       const params = new URLSearchParams({
@@ -2558,15 +3001,20 @@ ANALYSIS_HTML = r"""
         crop_y: $("cropY").value,
         crop_w: $("cropW").value,
         crop_h: $("cropH").value,
+        analysis_start_min: $("analysisStart").value,
+        analysis_end_min: $("analysisEnd").value,
+        analysis_minutes: $("analysisMinutes").value,
       });
       if ($("classId").value !== "") params.set("class_id", $("classId").value);
-      $("line").textContent = `Uploading ... (0 / ${Math.round(file.size / (1024 * 1024))} MB)`;
+      const totalBytes = (leftFile ? leftFile.size : 0) + (rightFile ? rightFile.size : 0);
+      const form = new FormData();
+      if (leftFile) form.append("left_video", leftFile);
+      if (rightFile) form.append("right_video", rightFile);
+      $("line").textContent = `Uploading ... (0 / ${Math.max(1, Math.round(totalBytes / (1024 * 1024)))} MB)`;
       try {
         const j = await new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
           xhr.open("POST", `/api/analysis/upload?${params.toString()}`);
-          xhr.setRequestHeader("Content-Type", "application/octet-stream");
-          xhr.setRequestHeader("X-Filename", file.name || "upload.mp4");
           xhr.responseType = "json";
           xhr.upload.onprogress = (ev) => {
             if (!ev.lengthComputable) return;
@@ -2582,13 +3030,16 @@ ANALYSIS_HTML = r"""
             }
             resolve(xhr.response || JSON.parse(xhr.responseText || "{}"));
           };
-          xhr.send(file);
+          xhr.send(form);
         });
         sid = j.session_id;
         $("resultLink").style.display = "none";
         $("stream").src = `/video/analysis/${sid}.mjpg`;
         $("stream").style.display = "block";
         $("streamHint").style.display = "none";
+        $("streamMaster").src = `/video/analysis/${sid}/master.mjpg`;
+        $("streamMaster").style.display = "block";
+        $("streamMasterHint").style.display = "none";
         $("line").textContent = `Analysis started (${sid})`;
         if (timer) clearInterval(timer);
         timer = setInterval(poll, 350);
@@ -2598,6 +3049,15 @@ ANALYSIS_HTML = r"""
     };
 
     $("modelPath").onchange = loadClasses;
+    $("analysisMinutesRange").oninput = (ev) => syncAnalysisMinutes(ev.target);
+    $("analysisMinutes").oninput = (ev) => syncAnalysisMinutes(ev.target);
+    $("analysisStartRange").oninput = (ev) => syncAnalysisWindow(ev.target, "start");
+    $("analysisStart").oninput = (ev) => syncAnalysisWindow(ev.target, "start");
+    $("analysisEndRange").oninput = (ev) => syncAnalysisWindow(ev.target, "end");
+    $("analysisEnd").oninput = (ev) => syncAnalysisWindow(ev.target, "end");
+    $("videoFileLeft").onchange = refreshAnalysisMinutes;
+    $("videoFileRight").onchange = refreshAnalysisMinutes;
+    setAnalysisMinutesLimits(0);
     loadModels();
     loadDevices();
   </script>
@@ -4591,7 +5051,13 @@ def analysis_page():
 
 @app.get("/api/analysis/models")
 def analysis_models():
-    models = _analysis_list_model_files()
+    paths = _analysis_list_model_files()
+    models = []
+    for path in paths:
+        try:
+            models.append(_analysis_model_meta(path).to_dict())
+        except Exception:
+            models.append({"path": path, "backend": "unknown", "label": "Unknown", "class_names": []})
     return {"models": models, "default": ANALYSIS_DEFAULT_MODEL}
 
 
@@ -4607,9 +5073,39 @@ def analysis_devices():
     return {"devices": devices, "default": "auto"}
 
 
+async def _analysis_save_upload(session_id: str, upload: UploadFile, slot: str, max_bytes: int) -> tuple[str, int]:
+    filename = upload.filename or f"{slot}.mp4"
+    ext = Path(filename).suffix.lower() or ".mp4"
+    if ext not in {".mp4", ".mov", ".mkv", ".avi", ".m4v"}:
+        ext = ".mp4"
+    target_path = os.path.join(ANALYSIS_UPLOAD_DIR, f"{session_id}_{slot}{ext}")
+    written = 0
+    try:
+        with open(target_path, "wb") as out:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    raise HTTPException(status_code=413, detail="Upload too large.")
+                out.write(chunk)
+    finally:
+        await upload.close()
+    if written <= 0:
+        try:
+            os.remove(target_path)
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=f"Empty upload body for {slot}.")
+    return target_path, written
+
+
 @app.post("/api/analysis/upload")
 async def analysis_upload(
-    request: Request,
+    left_video: Optional[UploadFile] = File(default=None),
+    right_video: Optional[UploadFile] = File(default=None),
+    video: Optional[UploadFile] = File(default=None),
     class_id: Optional[int] = None,
     conf: float = 0.32,
     iou: float = 0.35,
@@ -4621,48 +5117,61 @@ async def analysis_upload(
     crop_y: float = 0.0,
     crop_w: float = 1.0,
     crop_h: float = 1.0,
+    analysis_start_min: float = 0.0,
+    analysis_end_min: float = 0.0,
+    analysis_minutes: float = 0.0,
 ):
     os.makedirs(ANALYSIS_UPLOAD_DIR, exist_ok=True)
     available_models = set(_analysis_list_model_files())
     if model_path not in available_models:
         model_path = ANALYSIS_DEFAULT_MODEL
-    upload_filename = request.headers.get("x-filename", "upload.mp4")
-    ext = Path(upload_filename).suffix.lower() or ".mp4"
-    if ext not in {".mp4", ".mov", ".mkv", ".avi", ".m4v"}:
-        ext = ".mp4"
     session_id = uuid.uuid4().hex[:10]
-    target_path = os.path.join(ANALYSIS_UPLOAD_DIR, f"{session_id}{ext}")
     max_bytes = 8 * 1024 * 1024 * 1024  # 8 GB guardrail for Jetson sessions
-    written = 0
-    try:
-        with open(target_path, "wb") as out:
-            async for chunk in request.stream():
-                if not chunk:
-                    continue
-                written += len(chunk)
-                if written > max_bytes:
-                    raise HTTPException(status_code=413, detail="Upload too large.")
-                out.write(chunk)
-    except HTTPException:
+    target_path = None
+    sources: List[Dict[str, Any]] = []
+    total_written = 0
+
+    if class_id is None:
         try:
-            os.remove(target_path)
+            class_id = _analysis_model_meta(model_path).default_class_id
         except Exception:
-            pass
+            class_id = None
+
+    uploads = []
+    if left_video is not None:
+        uploads.append(("left", left_video))
+    if right_video is not None:
+        uploads.append(("right", right_video))
+    if not uploads and video is not None:
+        uploads.append(("main", video))
+    if not uploads:
+        raise HTTPException(status_code=400, detail="Please upload at least one video.")
+
+    try:
+        for label, upload in uploads:
+            saved_path, written = await _analysis_save_upload(session_id, upload, label, max_bytes)
+            sources.append({"path": saved_path, "label": label})
+            total_written += written
+            if target_path is None:
+                target_path = saved_path
+    except HTTPException:
+        for item in sources:
+            try:
+                os.remove(item["path"])
+            except Exception:
+                pass
         raise
     except Exception as exc:
-        try:
-            os.remove(target_path)
-        except Exception:
-            pass
+        for item in sources:
+            try:
+                os.remove(item["path"])
+            except Exception:
+                pass
         raise HTTPException(status_code=500, detail=f"Upload failed: {exc}")
 
-    if written <= 0:
-        try:
-            os.remove(target_path)
-        except Exception:
-            pass
-        raise HTTPException(status_code=400, detail="Empty upload body.")
-    print(f"[analysis] upload complete sid={session_id} file={target_path} bytes={written}")
+    if not target_path or total_written <= 0:
+        raise HTTPException(status_code=400, detail="No upload data received.")
+    print(f"[analysis] upload complete sid={session_id} files={len(sources)} bytes={total_written}")
 
     crop = {
         "x": max(0.0, min(1.0, float(crop_x))),
@@ -4679,6 +5188,7 @@ async def analysis_upload(
         ANALYSIS_SESSIONS[session_id] = {
             "session_id": session_id,
             "video_path": target_path,
+            "sources": sources,
             "model_path": model_path,
             "class_id": class_id,
             "conf": max(0.01, min(1.0, float(conf))),
@@ -4686,7 +5196,11 @@ async def analysis_upload(
             "device": device,
             "zoom": max(1.0, min(4.0, float(zoom))),
             "speed_up": bool(speed_up),
+            "allow_switch": len(sources) > 1,
             "crop": crop,
+            "analysis_start_min": max(0.0, float(analysis_start_min)),
+            "analysis_end_min": max(0.0, float(analysis_end_min)),
+            "analysis_minutes": max(0.0, float(analysis_minutes)),
             "running": False,
             "state": "queued",
             "frames": 0.0,
@@ -4702,13 +5216,19 @@ async def analysis_upload(
             "output_path": None,
             "recovery_dir": None,
             "last_error": None,
+            "focus_stream_label": sources[0]["label"],
+            "field_side": None,
+            "view_half": None,
+            "zoom_live": max(1.0, min(4.0, float(zoom))),
+            "frame": None,
+            "frame_master": None,
         }
 
     thread = threading.Thread(target=_analysis_process_video, args=(session_id, target_path), daemon=True)
     thread.start()
     print(
         f"[analysis] job started sid={session_id} model={model_path} class_id={class_id} "
-        f"device={device} zoom={zoom} speed_up={bool(speed_up)}"
+        f"device={device} zoom={zoom} speed_up={bool(speed_up)} sources={','.join(item['label'] for item in sources)}"
     )
     return {"ok": True, "session_id": session_id}
 
@@ -4738,6 +5258,16 @@ def analysis_status(session_id: str):
             "segments_saved": sess.get("segments_saved", 0),
             "last_conf": sess.get("last_conf", 0.0),
             "last_seen_sec": sess.get("last_seen_sec"),
+            "model_backend": sess.get("model_backend"),
+            "focus_stream_label": sess.get("focus_stream_label"),
+            "field_side": sess.get("field_side"),
+            "view_half": sess.get("view_half"),
+            "zoom_live": sess.get("zoom_live"),
+            "analysis_start_min": sess.get("analysis_start_min"),
+            "analysis_end_min": sess.get("analysis_end_min"),
+            "analysis_minutes": sess.get("analysis_minutes"),
+            "analysis_limit_sec": sess.get("analysis_limit_sec"),
+            "render_mode": sess.get("render_mode"),
             "output_path": sess.get("output_path"),
             "output_url": f"/api/analysis/result/{session_id}" if sess.get("output_path") else None,
             "last_error": sess.get("last_error"),
@@ -4782,5 +5312,34 @@ def analysis_stream(session_id: str):
                 continue
             yield b"--frame\r\nContent-Type:image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n"
             time.sleep(0.01)
+
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/video/analysis/{session_id}/master.mjpg")
+def analysis_master_stream(session_id: str):
+    with ANALYSIS_LOCK:
+        if session_id not in ANALYSIS_SESSIONS:
+            raise HTTPException(status_code=404, detail="Unknown session_id")
+
+    def gen():
+        while True:
+            with ANALYSIS_LOCK:
+                sess = ANALYSIS_SESSIONS.get(session_id)
+                if not sess:
+                    break
+                frame = sess.get("frame_master")
+                running = bool(sess.get("running"))
+            if frame is None:
+                if not running:
+                    break
+                time.sleep(0.03)
+                continue
+            ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                time.sleep(0.02)
+                continue
+            yield b"--frame\r\nContent-Type:image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n"
+            time.sleep(0.02)
 
     return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
