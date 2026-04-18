@@ -78,7 +78,7 @@ Dependencies are split by role:
 - Creates/uses `.venv`
 - Installs platform-specific dependencies
   - macOS: Homebrew packages including `ffmpeg`, `gstreamer`, common GStreamer plugins, `node`, and `uvcc` (used for recording/audio support and BRIO camera controls)
-- Downloads model files (`models/*.pt`) from Hugging Face:
+- Downloads model files (`models/*.pt`, including `models/ballscope-ai.pt`) from Hugging Face:
   - `https://huggingface.co/RafaelReverberi/ballscope-assets/tree/main/models`
 - On Jetson: ensures PyTorch CUDA is installed before other Python packages
 - Installs both YOLO and RF-DETR analysis dependencies into the local `.venv`
@@ -156,7 +156,7 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 - The `Analysis` page accepts separate `Left Camera` and `Right Camera` uploads.
 - Analysis can optionally be limited to the first N minutes of the uploaded files for fast debugging on long recordings.
 - BallScope detects whether a model is a YOLO checkpoint or an RF-DETR checkpoint and uses the matching runtime automatically.
-- `models/ballscope.pt` is detected as RF-DETR and is the default analysis model.
+- `models/ballscope-ai.pt` is detected as RF-DETR and is the default analysis model.
 - Dual-camera analysis is per-camera first: left/right detections stay separate, are fused in master-canvas space, and the final broadcast crop is rendered from the master canvas.
 - Full-frame global reacquire scans keep original frame resolution so small-ball detectability is not destroyed by downscaling.
 - Short ball losses are handled with bounded prediction and phased camera behavior (`TRACKED`, `HOLD_SHORT`, `LOST_SHORT`, `LOST_LONG`, `UNKNOWN`) so the view widens gradually instead of snapping away.

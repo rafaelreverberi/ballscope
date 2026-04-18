@@ -110,7 +110,7 @@ ANALYSIS_LOCK = threading.Lock()
 ANALYSIS_MODELS: Dict[str, object] = {}
 ANALYSIS_MODEL_LOCK = threading.Lock()
 ANALYSIS_MODEL_META: Dict[str, object] = {}
-ANALYSIS_DEFAULT_MODEL = "models/ballscope.pt"
+ANALYSIS_DEFAULT_MODEL = "models/ballscope-ai.pt"
 ANALYSIS_TARGET_FPS = 30
 ANALYSIS_ENCODE_CRF = 14
 ANALYSIS_ENCODE_PRESET = "slow"
@@ -2491,7 +2491,7 @@ ANALYSIS_HTML = r"""
     };
 
     const loadClasses = async () => {
-      const modelPath = $("modelPath").value || "models/ballscope.pt";
+      const modelPath = $("modelPath").value || "models/ballscope-ai.pt";
       try {
         const r = await fetch(`/api/analysis/classes?model_path=${encodeURIComponent(modelPath)}`);
         if (!r.ok) return;

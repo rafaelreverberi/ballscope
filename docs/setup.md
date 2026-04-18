@@ -48,6 +48,9 @@ The Linux camera-control stack is also installed automatically by `setup.sh`, in
 into local:
 - `models/`
 
+This includes the default analysis checkpoint:
+- `models/ballscope-ai.pt`
+
 The same setup run also installs both supported post-analysis runtimes into `.venv`:
 - YOLO (`ultralytics`)
 - RF-DETR (`rfdetr`)
@@ -77,7 +80,7 @@ Notes:
 - The page accepts separate `Left Camera` and `Right Camera` video uploads.
 - You can limit analysis to the first N minutes with a slider / numeric input, which is useful for testing 90-minute source files quickly.
 - Model selection is automatic by checkpoint type. BallScope distinguishes YOLO checkpoints from RF-DETR checkpoints and uses the matching backend.
-- `models/ballscope.pt` is the default analysis model and is treated as RF-DETR.
+- `models/ballscope-ai.pt` is the default analysis model and is treated as RF-DETR.
 - Dual-camera analysis runs per-camera detection first, fuses ball hypotheses in master-canvas space, and renders the final output from the master canvas.
 - Full-frame reacquire scans preserve original frame resolution; only ROI follow-up passes are allowed to use a reduced inference size.
 - The analysis preview shows fused state, field side, live zoom factor, and the master-canvas debug view.
