@@ -14,8 +14,9 @@ from typing import Any, Dict, Optional, List
 from contextlib import asynccontextmanager
 
 import cv2
+import numpy as np
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse, Response
 
 from ballscope.config import (
     QUALITY_PRESETS,
@@ -107,6 +108,7 @@ ANALYSIS_UPLOAD_DIR = "uploads"
 ANALYSIS_RESULT_DIR = "recordings"
 ANALYSIS_SESSIONS: Dict[str, dict] = {}
 ANALYSIS_LOCK = threading.Lock()
+ANALYSIS_PREVIEW_SESSIONS: Dict[str, dict] = {}
 ANALYSIS_MODELS: Dict[str, object] = {}
 ANALYSIS_MODEL_LOCK = threading.Lock()
 ANALYSIS_MODEL_META: Dict[str, object] = {}
@@ -116,6 +118,13 @@ ANALYSIS_ENCODE_CRF = 14
 ANALYSIS_ENCODE_PRESET = "slow"
 CAMERA_PRESET_FILE = Path(os.getenv("BALLSCOPE_CAMERA_PRESET_FILE", "camera_presets.json"))
 CAMERA_PRESET_LOCK = threading.Lock()
+ANALYSIS_STITCHING_DEFAULTS: Dict[str, float] = {
+    "overlap_ratio": 0.525,
+    "seam_blend_ratio": 0.01,
+    "left_crop_y_ratio": 0.01,
+    "right_crop_y_ratio": 0.07,
+    "bottom_crop_ratio": MasterCanvasConfig.base_bottom_crop_ratio,
+}
 CAMERA_INT_SETTING_KEYS = [
     "brightness",
     "contrast",
@@ -152,6 +161,157 @@ def _analysis_load_model(model_path: str, device_use: str = "cpu"):
 
 def _analysis_clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
+
+
+def _analysis_clamp_float(value: Any, lo: float, hi: float, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    return max(float(lo), min(float(hi), parsed))
+
+
+def _analysis_stitching_config_from_values(values: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    raw = values or {}
+    return {
+        "overlap_ratio": _analysis_clamp_float(
+            raw.get("overlap_ratio"),
+            MasterCanvasConfig.min_overlap_ratio,
+            MasterCanvasConfig.max_overlap_ratio,
+            ANALYSIS_STITCHING_DEFAULTS["overlap_ratio"],
+        ),
+        "seam_blend_ratio": _analysis_clamp_float(
+            raw.get("seam_blend_ratio"),
+            0.0,
+            0.12,
+            ANALYSIS_STITCHING_DEFAULTS["seam_blend_ratio"],
+        ),
+        "left_crop_y_ratio": _analysis_clamp_float(
+            raw.get("left_crop_y_ratio"),
+            0.0,
+            0.35,
+            ANALYSIS_STITCHING_DEFAULTS["left_crop_y_ratio"],
+        ),
+        "right_crop_y_ratio": _analysis_clamp_float(
+            raw.get("right_crop_y_ratio"),
+            0.0,
+            0.35,
+            ANALYSIS_STITCHING_DEFAULTS["right_crop_y_ratio"],
+        ),
+        "bottom_crop_ratio": _analysis_clamp_float(
+            raw.get("bottom_crop_ratio"),
+            0.0,
+            0.35,
+            ANALYSIS_STITCHING_DEFAULTS["bottom_crop_ratio"],
+        ),
+    }
+
+
+def _analysis_stitching_config_from_query(raw: Optional[str]) -> Dict[str, float]:
+    if not raw:
+        return dict(ANALYSIS_STITCHING_DEFAULTS)
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    return _analysis_stitching_config_from_values(parsed)
+
+
+def _analysis_master_canvas_config(session: Dict[str, Any]) -> MasterCanvasConfig:
+    stitching = _analysis_stitching_config_from_values(session.get("stitching"))
+    return MasterCanvasConfig(
+        overlap_ratio=stitching["overlap_ratio"],
+        seam_blend_ratio=stitching["seam_blend_ratio"],
+        base_top_crop_ratio=ANALYSIS_STITCHING_DEFAULTS["left_crop_y_ratio"],
+        base_bottom_crop_ratio=stitching["bottom_crop_ratio"],
+        manual_overlap_ratio=stitching["overlap_ratio"],
+        manual_left_crop_y_ratio=stitching["left_crop_y_ratio"],
+        manual_right_crop_y_ratio=stitching["right_crop_y_ratio"],
+        manual_bottom_crop_ratio=stitching["bottom_crop_ratio"],
+    )
+
+
+def _analysis_preview_render_view(
+    master_frame: Any,
+    mode: str,
+) -> Any:
+    frame = master_frame.copy()
+    h, w = frame.shape[:2]
+    if mode == "full":
+        return frame
+    if mode in {"main", "stream"}:
+        zoom = 1.25
+        crop_w = max(1, int(round(w / zoom)))
+        crop_h = max(1, int(round(h / zoom)))
+        left = max(0, min(w - crop_w, int(round((w - crop_w) / 2.0))))
+        top = max(0, min(h - crop_h, int(round((h - crop_h) / 2.0))))
+        crop = frame[top:top + crop_h, left:left + crop_w]
+        render = cv2.resize(crop, (w, h), interpolation=cv2.INTER_LANCZOS4)
+        blur = cv2.GaussianBlur(render, (0, 0), 1.0)
+        render = cv2.addWeighted(render, 1.15, blur, -0.15, 0)
+        if mode == "main":
+            box_w = int(round(w * 0.72))
+            box_h = int(round(h * 0.72))
+            box_x = int(round((w - box_w) / 2.0))
+            box_y = int(round((h - box_h) / 2.0))
+            cv2.rectangle(render, (box_x, box_y), (box_x + box_w, box_y + box_h), (255, 255, 255), 2)
+        return render
+    return frame
+
+
+def _analysis_preview_frame(
+    left_path: str,
+    right_path: str,
+    time_sec: float,
+    stitching: Dict[str, Any],
+    view: str,
+) -> Optional[Any]:
+    left_cap = cv2.VideoCapture(left_path)
+    right_cap = cv2.VideoCapture(right_path)
+    if not left_cap.isOpened() or not right_cap.isOpened():
+        left_cap.release()
+        right_cap.release()
+        return None
+    try:
+        ts_ms = max(0.0, float(time_sec)) * 1000.0
+        left_cap.set(cv2.CAP_PROP_POS_MSEC, ts_ms)
+        right_cap.set(cv2.CAP_PROP_POS_MSEC, ts_ms)
+        ok_left, left_frame = left_cap.read()
+        ok_right, right_frame = right_cap.read()
+        if not ok_left or left_frame is None or not ok_right or right_frame is None:
+            left_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            right_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok_left, left_frame = left_cap.read()
+            ok_right, right_frame = right_cap.read()
+            if not ok_left or left_frame is None or not ok_right or right_frame is None:
+                return None
+        preview_session = {"stitching": _analysis_stitching_config_from_values(stitching)}
+        cfg = _analysis_master_canvas_config(preview_session)
+        master_frame, master_layout = build_master_frame(
+            frames=[left_frame, right_frame],
+            source_labels=["left", "right"],
+            layout=None,
+            config=cfg,
+        )
+        if master_frame is None:
+            return None
+        render = _analysis_preview_render_view(master_frame, "stream" if view == "stream" else ("main" if view == "main" else "full"))
+        if view == "guide" and master_layout is not None:
+            guide = master_frame.copy()
+            cv2.line(guide, (master_layout.seam_x, 0), (master_layout.seam_x, guide.shape[0]), (220, 200, 60), 2)
+            x1 = max(0, master_layout.right_offset_x)
+            x2 = min(guide.shape[1], master_layout.right_offset_x + master_layout.overlap_px)
+            if x2 > x1:
+                overlay = guide.copy()
+                overlay[:, x1:x2] = cv2.addWeighted(guide[:, x1:x2], 0.72, 255 * np.ones_like(guide[:, x1:x2]), 0.08, 0)
+                guide = overlay
+            render = guide
+        return render
+    finally:
+        left_cap.release()
+        right_cap.release()
 
 
 def _camera_preset_store_default() -> Dict[str, Any]:
@@ -597,7 +757,7 @@ def _analysis_process_video(session_id: str, video_path: str):
     fps_list = [(cap.get(cv2.CAP_PROP_FPS) or ANALYSIS_TARGET_FPS) for cap in caps]
     frame_count_list = [int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) for cap in caps]
     dual_master_mode = len(caps) >= 2 and {"left", "right"}.issubset(set(source_labels))
-    master_canvas_cfg = MasterCanvasConfig()
+    master_canvas_cfg = _analysis_master_canvas_config(session)
     total_frames = max([n for n in frame_count_list if n > 0] or [0])
     src_fps = max([f for f in fps_list if f > 0] or [ANALYSIS_TARGET_FPS])
     media_duration_sec = min([n / f for n, f in zip(frame_count_list, fps_list) if n > 0 and f > 0] or [0.0])
@@ -676,6 +836,7 @@ def _analysis_process_video(session_id: str, video_path: str):
         ANALYSIS_SESSIONS[session_id]["focus_stream_label"] = source_labels[0] if source_labels else "main"
         ANALYSIS_SESSIONS[session_id]["render_mode"] = "master-canvas" if dual_master_mode else "single-stream"
         ANALYSIS_SESSIONS[session_id]["fusion_mode"] = "per-camera-master-fusion"
+        ANALYSIS_SESSIONS[session_id]["stitching"] = _analysis_stitching_config_from_values(session.get("stitching"))
 
     proc_times = deque(maxlen=50)
     frame_idx = 0
@@ -2213,6 +2374,15 @@ ANALYSIS_HTML = r"""
       outline: 2px solid var(--accent-2);
       outline-offset: 2px;
     }
+    button.secondary {
+      border-color: var(--stroke);
+      background: color-mix(in srgb, var(--panel-2) 92%, transparent);
+      color: var(--text);
+    }
+    button.secondary:hover {
+      border-color: var(--stroke-strong);
+      background: color-mix(in srgb, var(--panel-2) 84%, var(--accent-2) 16%);
+    }
     .status { font-family:"JetBrains Mono", monospace; font-size:12px; color:var(--muted); margin-top:10px; min-height:16px; }
     .preview {
       border-radius:16px; overflow:hidden; border:1px solid var(--stroke); background:
@@ -2246,9 +2416,155 @@ ANALYSIS_HTML = r"""
       backdrop-filter: none;
     }
     .result-link:hover { border-color: var(--stroke-strong); background: color-mix(in srgb, var(--panel-2) 84%, var(--accent-2) 16%); }
+    .inline-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+    .inline-actions button { width:auto; margin-top:0; }
+    .stitch-summary { margin-top:10px; color:var(--muted); font-size:12px; font-family:"JetBrains Mono", monospace; }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      background: rgba(5, 10, 16, 0.72);
+      backdrop-filter: blur(12px);
+      z-index: 999;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal-card {
+      width: min(1120px, 100%);
+      max-height: calc(100vh - 36px);
+      overflow: auto;
+      border-radius: 20px;
+      border: 1px solid var(--stroke-strong);
+      padding: 16px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.09), rgba(255,255,255,0) 40%),
+        linear-gradient(120deg, rgba(103,214,255,.05), rgba(255,180,84,.04)),
+        var(--panel);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.06), var(--shadow);
+    }
+    .modal-head {
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap:12px;
+      margin-bottom:14px;
+    }
+    .modal-head p {
+      margin:6px 0 0;
+      color:var(--muted);
+      font-size:13px;
+    }
+    .modal-grid {
+      display:grid;
+      grid-template-columns: minmax(0, 1.5fr) minmax(300px, .9fr);
+      gap: 14px;
+    }
+    .modal-stage {
+      border-radius:16px;
+      overflow:hidden;
+      border:1px solid var(--stroke);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,0)),
+        var(--panel-2);
+      aspect-ratio: 16 / 9;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+    }
+    .modal-stage canvas {
+      width:100%;
+      height:100%;
+      display:block;
+    }
+    .preview-grid {
+      display:grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .preview-card {
+      border:1px solid var(--stroke);
+      border-radius:14px;
+      padding:10px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,0)),
+        var(--panel-2);
+    }
+    .preview-card h4 {
+      margin:0 0 8px;
+      font-size:11px;
+      letter-spacing:.12em;
+      text-transform:uppercase;
+      color:var(--muted);
+    }
+    .preview-mini {
+      border-radius:12px;
+      overflow:hidden;
+      border:1px solid var(--stroke);
+      background: rgba(5,10,16,.68);
+      aspect-ratio: 16 / 9;
+    }
+    .preview-mini canvas {
+      width:100%;
+      height:100%;
+      display:block;
+    }
+    .preview-copy {
+      margin-top:8px;
+      font-size:12px;
+      color:var(--muted);
+      line-height:1.4;
+    }
+    .timeline-row {
+      display:grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap:10px;
+      align-items:center;
+      margin-top:10px;
+    }
+    .timeline-row button { width:auto; margin-top:0; }
+    .range-value {
+      display:flex;
+      gap:8px;
+      align-items:center;
+    }
+    .range-value input[type="range"] {
+      flex: 1 1 auto;
+      padding: 0;
+    }
+    .range-value .mini {
+      width: 92px;
+      flex: 0 0 92px;
+    }
+    .control-grid {
+      display:grid;
+      gap:10px;
+    }
+    .modal-foot {
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+      margin-top:14px;
+    }
+    .modal-foot .inline-actions { margin-top:0; }
+    .hidden-media {
+      position: fixed;
+      left: -9999px;
+      top: -9999px;
+      width: 2px;
+      height: 2px;
+      opacity: 0.001;
+      pointer-events: none;
+    }
     @media (max-width: 980px) {
       .grid { grid-template-columns:1fr; }
       .top { align-items:flex-start; flex-direction: column; }
+      .modal-grid { grid-template-columns: 1fr; }
+      .preview-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 680px) {
       .row { grid-template-columns: 1fr; }
@@ -2331,6 +2647,11 @@ ANALYSIS_HTML = r"""
           <input id="cropW" type="number" value="1.00" step="0.01" min="0.05" max="1"/>
           <input id="cropH" type="number" value="1.00" step="0.01" min="0.05" max="1"/>
         </div>
+        <div class="inline-actions">
+          <button id="stitchSetupBtn" class="secondary" type="button">Set Up Stitching</button>
+          <button id="stitchResetBtn" class="secondary" type="button">Reset Stitching</button>
+        </div>
+        <div class="stitch-summary" id="stitchSummary">Using default session stitching values.</div>
         <label>Analysis Window (minutes)</label>
         <div class="row">
           <div>
@@ -2384,6 +2705,92 @@ ANALYSIS_HTML = r"""
       </div>
     </section>
   </div>
+  <div id="stitchModal" class="modal-backdrop" aria-hidden="true">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <h3 style="margin:0;">Set Up Stitching</h3>
+          <p>Preview both uploads as one stitched field view, tune the seam and crop alignment live, then save the values for this browser session.</p>
+        </div>
+        <button id="stitchCloseBtn" class="secondary" type="button">Close</button>
+      </div>
+      <div class="modal-grid">
+        <div>
+          <div class="modal-stage">
+            <canvas id="stitchCanvas" width="1280" height="720"></canvas>
+          </div>
+          <div class="preview-grid">
+            <div class="preview-card">
+              <h4>Full Field</h4>
+              <div class="preview-mini"><canvas id="stitchCanvasClean" width="640" height="360"></canvas></div>
+              <div class="preview-copy">The full stitched master field without overlays, so you can judge the real seam and horizon match.</div>
+            </div>
+            <div class="preview-card">
+              <h4>Seam Guide</h4>
+              <div class="preview-mini"><canvas id="stitchCanvasGuide" width="640" height="360"></canvas></div>
+              <div class="preview-copy">Shows the overlap zone and seam position so you can line up both clips precisely.</div>
+            </div>
+            <div class="preview-card">
+              <h4>Stream Look</h4>
+              <div class="preview-mini"><canvas id="stitchCanvasZoom" width="640" height="360"></canvas></div>
+              <div class="preview-copy">Uses the same center-crop and sharpen style as the analysis output, so this is much closer to the actual stream look.</div>
+            </div>
+          </div>
+          <div class="timeline-row">
+            <button id="stitchPlayBtn" class="secondary" type="button">Play</button>
+            <input id="stitchSeek" type="range" min="0" max="0" step="0.01" value="0"/>
+            <div id="stitchTimeLabel" class="status" style="margin-top:0; min-width:84px; text-align:right;">0.0s</div>
+          </div>
+          <div class="status" id="stitchPreviewStatus">Load both left and right videos to preview the stitched result.</div>
+        </div>
+        <div class="control-grid">
+          <div>
+            <label>Overlap</label>
+            <div class="range-value">
+              <input id="stitchOverlap" type="range" min="0.22" max="0.68" step="0.005" value="0.44"/>
+              <input id="stitchOverlapNumber" class="mini" type="number" min="0.22" max="0.68" step="0.005" value="0.44"/>
+            </div>
+          </div>
+          <div>
+            <label>Blend Width</label>
+            <div class="range-value">
+              <input id="stitchBlend" type="range" min="0" max="0.12" step="0.0025" value="0.02"/>
+              <input id="stitchBlendNumber" class="mini" type="number" min="0" max="0.12" step="0.0025" value="0.02"/>
+            </div>
+          </div>
+          <div>
+            <label>Left Top Crop</label>
+            <div class="range-value">
+              <input id="stitchLeftCrop" type="range" min="0" max="0.35" step="0.005" value="0.06"/>
+              <input id="stitchLeftCropNumber" class="mini" type="number" min="0" max="0.35" step="0.005" value="0.06"/>
+            </div>
+          </div>
+          <div>
+            <label>Right Top Crop</label>
+            <div class="range-value">
+              <input id="stitchRightCrop" type="range" min="0" max="0.35" step="0.005" value="0.06"/>
+              <input id="stitchRightCropNumber" class="mini" type="number" min="0" max="0.35" step="0.005" value="0.06"/>
+            </div>
+          </div>
+          <div>
+            <label>Bottom Crop</label>
+            <div class="range-value">
+              <input id="stitchBottomCrop" type="range" min="0" max="0.35" step="0.005" value="0.12"/>
+              <input id="stitchBottomCropNumber" class="mini" type="number" min="0" max="0.35" step="0.005" value="0.12"/>
+            </div>
+          </div>
+          <div class="status" id="stitchSaveStatus">Default values stay active until you save different ones.</div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <div class="status" id="stitchAppliedLabel">Current session values match the defaults.</div>
+        <div class="inline-actions">
+          <button id="stitchRestoreDefaultsBtn" class="secondary" type="button">Restore Defaults</button>
+          <button id="stitchSaveBtn" type="button">Save for This Session</button>
+        </div>
+      </div>
+    </div>
+  </div>
   <script>
     (() => {
       const KEY = "ballscope-theme";
@@ -2411,6 +2818,335 @@ ANALYSIS_HTML = r"""
     let timer = null;
     let modelMetaByPath = {};
     let maxAnalysisMinutes = 0;
+    const STITCH_STORAGE_KEY = "ballscope-analysis-stitching";
+    const STITCH_DEFAULTS = {
+      overlap_ratio: 0.525,
+      seam_blend_ratio: 0.01,
+      left_crop_y_ratio: 0.01,
+      right_crop_y_ratio: 0.07,
+      bottom_crop_ratio: 0.12,
+    };
+    const stitchCanvas = $("stitchCanvas");
+    const stitchCtx = stitchCanvas.getContext("2d");
+    const stitchCanvasClean = $("stitchCanvasClean");
+    const stitchCanvasGuide = $("stitchCanvasGuide");
+    const stitchCanvasZoom = $("stitchCanvasZoom");
+    const stitchCtxClean = stitchCanvasClean.getContext("2d");
+    const stitchCtxGuide = stitchCanvasGuide.getContext("2d");
+    const stitchCtxZoom = stitchCanvasZoom.getContext("2d");
+    let stitchPlaybackTimer = null;
+    let stitchPreviewSessionId = null;
+    let stitchPreviewDuration = 0;
+    let stitchPreviewFilesKey = "";
+    let stitchPreviewRenderToken = 0;
+    let stitchCurrentTime = 0;
+    let stitchRenderInFlight = false;
+    let stitchQueuedRender = null;
+    let stitchSecondaryTimer = null;
+
+    const clamp = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
+    const formatSeconds = (value) => `${Math.max(0, Number(value || 0)).toFixed(1)}s`;
+    const stitchControlMap = [
+      ["stitchOverlap", "stitchOverlapNumber", "overlap_ratio", 0.525],
+      ["stitchBlend", "stitchBlendNumber", "seam_blend_ratio", 0.01],
+      ["stitchLeftCrop", "stitchLeftCropNumber", "left_crop_y_ratio", 0.01],
+      ["stitchRightCrop", "stitchRightCropNumber", "right_crop_y_ratio", 0.07],
+      ["stitchBottomCrop", "stitchBottomCropNumber", "bottom_crop_ratio", 0.12],
+    ];
+
+    const getSavedStitching = () => {
+      try {
+        const raw = sessionStorage.getItem(STITCH_STORAGE_KEY);
+        if (!raw) return { ...STITCH_DEFAULTS };
+        const parsed = JSON.parse(raw);
+        return {
+          overlap_ratio: clamp(Number(parsed.overlap_ratio ?? STITCH_DEFAULTS.overlap_ratio), 0.22, 0.68),
+          seam_blend_ratio: clamp(Number(parsed.seam_blend_ratio ?? STITCH_DEFAULTS.seam_blend_ratio), 0, 0.12),
+          left_crop_y_ratio: clamp(Number(parsed.left_crop_y_ratio ?? STITCH_DEFAULTS.left_crop_y_ratio), 0, 0.35),
+          right_crop_y_ratio: clamp(Number(parsed.right_crop_y_ratio ?? STITCH_DEFAULTS.right_crop_y_ratio), 0, 0.35),
+          bottom_crop_ratio: clamp(Number(parsed.bottom_crop_ratio ?? STITCH_DEFAULTS.bottom_crop_ratio), 0, 0.35),
+        };
+      } catch (e) {
+        return { ...STITCH_DEFAULTS };
+      }
+    };
+
+    const setStitchControls = (cfg) => {
+      for (const [rangeId, numberId, key, fallback] of stitchControlMap) {
+        const value = Number(cfg?.[key] ?? fallback);
+        $(rangeId).value = String(value);
+        $(numberId).value = String(value);
+      }
+    };
+
+    const getStitchControls = () => ({
+      overlap_ratio: clamp(Number($("stitchOverlapNumber").value || STITCH_DEFAULTS.overlap_ratio), 0.22, 0.68),
+      seam_blend_ratio: clamp(Number($("stitchBlendNumber").value || STITCH_DEFAULTS.seam_blend_ratio), 0, 0.12),
+      left_crop_y_ratio: clamp(Number($("stitchLeftCropNumber").value || STITCH_DEFAULTS.left_crop_y_ratio), 0, 0.35),
+      right_crop_y_ratio: clamp(Number($("stitchRightCropNumber").value || STITCH_DEFAULTS.right_crop_y_ratio), 0, 0.35),
+      bottom_crop_ratio: clamp(Number($("stitchBottomCropNumber").value || STITCH_DEFAULTS.bottom_crop_ratio), 0, 0.35),
+    });
+
+    const updateStitchSummary = () => {
+      const cfg = getSavedStitching();
+      const isDefault = JSON.stringify(cfg) === JSON.stringify(STITCH_DEFAULTS);
+      $("stitchSummary").textContent = isDefault
+        ? "Using default session stitching values."
+        : `Session stitching saved: overlap ${cfg.overlap_ratio.toFixed(3)}, blend ${cfg.seam_blend_ratio.toFixed(3)}, top ${cfg.left_crop_y_ratio.toFixed(3)}/${cfg.right_crop_y_ratio.toFixed(3)}, bottom ${cfg.bottom_crop_ratio.toFixed(3)}.`;
+      $("stitchAppliedLabel").textContent = isDefault
+        ? "Current session values match the defaults."
+        : "Current session values differ from the defaults and will be used for the next analysis run.";
+    };
+
+    const syncRangePair = (rangeId, numberId, onChange) => {
+      const rangeEl = $(rangeId);
+      const numberEl = $(numberId);
+      const apply = (source) => {
+        const value = source.value;
+        rangeEl.value = value;
+        numberEl.value = value;
+        onChange();
+      };
+      rangeEl.addEventListener("input", () => apply(rangeEl));
+      numberEl.addEventListener("input", () => apply(numberEl));
+    };
+
+    const stitchFileSignature = (file) => file ? `${file.name}:${file.size}:${file.lastModified}` : "";
+
+    const getStitchFiles = () => {
+      const leftFile = $("videoFileLeft").files[0];
+      const rightFile = $("videoFileRight").files[0];
+      return {
+        leftFile,
+        rightFile,
+        filesKey: `${stitchFileSignature(leftFile)}|${stitchFileSignature(rightFile)}`,
+      };
+    };
+
+    const syncStitchSeekBounds = () => {
+      const boundedTime = clamp(stitchCurrentTime, 0, stitchPreviewDuration || 0);
+      $("stitchSeek").max = String(Math.max(0, stitchPreviewDuration || 0));
+      $("stitchSeek").value = String(boundedTime);
+      $("stitchTimeLabel").textContent = formatSeconds(boundedTime);
+      stitchCurrentTime = boundedTime;
+    };
+
+    const resetStitchPreviewSession = () => {
+      stitchPreviewSessionId = null;
+      stitchPreviewDuration = 0;
+      stitchPreviewFilesKey = "";
+      stitchCurrentTime = 0;
+      syncStitchSeekBounds();
+    };
+
+    const ensureStitchPreviewSession = async () => {
+      const { leftFile, rightFile, filesKey } = getStitchFiles();
+      if (!leftFile || !rightFile) {
+        resetStitchPreviewSession();
+        $("stitchPreviewStatus").textContent = "Choose both left and right videos first.";
+        return false;
+      }
+      if (stitchPreviewSessionId && stitchPreviewFilesKey === filesKey) {
+        return true;
+      }
+      $("stitchPreviewStatus").textContent = "Loading left and right videos for stitching preview...";
+      const form = new FormData();
+      form.append("left_video", leftFile);
+      form.append("right_video", rightFile);
+      try {
+        const response = await fetch("/api/analysis/stitch-preview/upload", {
+          method: "POST",
+          body: form,
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        stitchPreviewSessionId = payload.session_id || null;
+        stitchPreviewDuration = Math.max(0, Number(payload.duration_sec || 0));
+        stitchPreviewFilesKey = filesKey;
+        stitchCurrentTime = clamp(stitchCurrentTime, 0, stitchPreviewDuration || 0);
+        syncStitchSeekBounds();
+        return Boolean(stitchPreviewSessionId);
+      } catch (e) {
+        resetStitchPreviewSession();
+        $("stitchPreviewStatus").textContent = "Stitching preview could not load these videos.";
+        return false;
+      }
+    };
+
+    const warmUpStitchPreview = async () => {
+      const ready = await ensureStitchPreviewSession();
+      if (!ready) return false;
+      await drawStitchPreview(true);
+      return true;
+    };
+
+    const pauseStitchPlayback = () => {
+      if (stitchPlaybackTimer) {
+        clearInterval(stitchPlaybackTimer);
+        stitchPlaybackTimer = null;
+      }
+      if (stitchSecondaryTimer) {
+        clearTimeout(stitchSecondaryTimer);
+        stitchSecondaryTimer = null;
+      }
+      $("stitchPlayBtn").textContent = "Play";
+    };
+
+    const paintWaiting = (ctx, canvas, text) => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "rgba(8, 12, 18, 1)";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "rgba(255,255,255,0.72)";
+      ctx.font = '24px Rubik';
+      ctx.textAlign = "center";
+      ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+    };
+
+    const drawPreviewImage = (ctx, canvas, blob) => new Promise((resolve, reject) => {
+      const imageUrl = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "rgba(8, 12, 18, 1)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
+        const drawW = Math.max(1, Math.round(img.width * scale));
+        const drawH = Math.max(1, Math.round(img.height * scale));
+        const drawX = Math.round((canvas.width - drawW) / 2);
+        const drawY = Math.round((canvas.height - drawH) / 2);
+        ctx.drawImage(img, drawX, drawY, drawW, drawH);
+        URL.revokeObjectURL(imageUrl);
+        resolve();
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(imageUrl);
+        reject(new Error("image decode failed"));
+      };
+      img.src = imageUrl;
+    });
+
+    const fetchStitchPreviewFrame = async (view, timeSec, cfg) => {
+      if (!stitchPreviewSessionId) {
+        throw new Error("missing preview session");
+      }
+      const params = new URLSearchParams({
+        time_sec: String(Math.max(0, timeSec)),
+        view,
+        stitching_config: JSON.stringify(cfg),
+      });
+      const response = await fetch(`/api/analysis/stitch-preview/frame/${encodeURIComponent(stitchPreviewSessionId)}?${params.toString()}`);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      return response.blob();
+    };
+
+    const drawStitchPreview = async (includeSecondary = true) => {
+      const token = ++stitchPreviewRenderToken;
+      if (!(await ensureStitchPreviewSession())) {
+        paintWaiting(stitchCtx, stitchCanvas, "Stitching preview waits for both videos.");
+        if (includeSecondary) {
+          paintWaiting(stitchCtxClean, stitchCanvasClean, "Clean field");
+          paintWaiting(stitchCtxGuide, stitchCanvasGuide, "Seam guide");
+          paintWaiting(stitchCtxZoom, stitchCanvasZoom, "Broadcast zoom");
+        }
+        return false;
+      }
+      const cfg = getStitchControls();
+      const timeSec = clamp(Number($("stitchSeek").value || stitchCurrentTime || 0), 0, stitchPreviewDuration || 0);
+      stitchCurrentTime = timeSec;
+      syncStitchSeekBounds();
+      const views = [{ view: "main", ctx: stitchCtx, canvas: stitchCanvas }];
+      if (includeSecondary) {
+        views.push(
+          { view: "full", ctx: stitchCtxClean, canvas: stitchCanvasClean },
+          { view: "guide", ctx: stitchCtxGuide, canvas: stitchCanvasGuide },
+          { view: "stream", ctx: stitchCtxZoom, canvas: stitchCanvasZoom },
+        );
+      }
+      try {
+        const blobs = await Promise.all(views.map((item) => fetchStitchPreviewFrame(item.view, timeSec, cfg)));
+        if (token !== stitchPreviewRenderToken) return false;
+        await Promise.all(blobs.map((blob, index) => drawPreviewImage(views[index].ctx, views[index].canvas, blob)));
+        if (token !== stitchPreviewRenderToken) return false;
+        $("stitchPreviewStatus").textContent = `Preview at ${formatSeconds(timeSec)} with overlap ${cfg.overlap_ratio.toFixed(3)} and blend ${cfg.seam_blend_ratio.toFixed(3)}. The top view matches the stream-style crop, the lower views show full field, seam guide, and final stream look.`;
+        $("stitchTimeLabel").textContent = formatSeconds(timeSec);
+        return true;
+      } catch (e) {
+        if (token !== stitchPreviewRenderToken) return false;
+        $("stitchPreviewStatus").textContent = "Stitching preview could not render this frame.";
+        paintWaiting(stitchCtx, stitchCanvas, "Preview failed");
+        if (includeSecondary) {
+          paintWaiting(stitchCtxClean, stitchCanvasClean, "Preview failed");
+          paintWaiting(stitchCtxGuide, stitchCanvasGuide, "Preview failed");
+          paintWaiting(stitchCtxZoom, stitchCanvasZoom, "Preview failed");
+        }
+        return false;
+      }
+    };
+
+    const flushQueuedStitchRender = async () => {
+      if (!stitchQueuedRender) return;
+      const next = stitchQueuedRender;
+      stitchQueuedRender = null;
+      await runQueuedStitchRender(next.includeSecondary);
+    };
+
+    const runQueuedStitchRender = async (includeSecondary = true) => {
+      if (stitchRenderInFlight) {
+        stitchQueuedRender = {
+          includeSecondary: Boolean(includeSecondary || stitchQueuedRender?.includeSecondary),
+        };
+        return false;
+      }
+      stitchRenderInFlight = true;
+      try {
+        return await drawStitchPreview(includeSecondary);
+      } finally {
+        stitchRenderInFlight = false;
+        await flushQueuedStitchRender();
+      }
+    };
+
+    const queueStitchPreviewRender = ({ includeSecondary = true, debounceMs = 0 } = {}) => {
+      const schedule = () => {
+        void runQueuedStitchRender(includeSecondary);
+      };
+      if (debounceMs > 0) {
+        if (stitchSecondaryTimer) clearTimeout(stitchSecondaryTimer);
+        stitchSecondaryTimer = setTimeout(() => {
+          stitchSecondaryTimer = null;
+          schedule();
+        }, debounceMs);
+        return;
+      }
+      schedule();
+    };
+
+    const queueLiveStitchPreview = () => {
+      const cfg = getStitchControls();
+      $("stitchPreviewStatus").textContent = `Updating preview... overlap ${cfg.overlap_ratio.toFixed(3)}, blend ${cfg.seam_blend_ratio.toFixed(3)}.`;
+      syncStitchSeekBounds();
+      queueStitchPreviewRender({ includeSecondary: false });
+      queueStitchPreviewRender({ includeSecondary: true, debounceMs: 180 });
+    };
+
+    const openStitchModal = async () => {
+      setStitchControls(getSavedStitching());
+      updateStitchSummary();
+      $("stitchSaveStatus").textContent = "Default values stay active until you save different ones.";
+      $("stitchModal").classList.add("open");
+      $("stitchModal").setAttribute("aria-hidden", "false");
+      await warmUpStitchPreview();
+    };
+
+    const closeStitchModal = () => {
+      pauseStitchPlayback();
+      $("stitchModal").classList.remove("open");
+      $("stitchModal").setAttribute("aria-hidden", "true");
+    };
 
     const setAnalysisMinutesLimits = (minutes) => {
       maxAnalysisMinutes = Math.max(0, Number.isFinite(minutes) ? minutes : 0);
@@ -2488,6 +3224,13 @@ ANALYSIS_HTML = r"""
         return;
       }
       setAnalysisMinutesLimits(Math.min(...valid));
+    };
+
+    const saveStitchingForSession = () => {
+      const cfg = getStitchControls();
+      sessionStorage.setItem(STITCH_STORAGE_KEY, JSON.stringify(cfg));
+      updateStitchSummary();
+      $("stitchSaveStatus").textContent = "Stitching saved for this browser session.";
     };
 
     const loadClasses = async () => {
@@ -2613,6 +3356,7 @@ ANALYSIS_HTML = r"""
         analysis_start_min: $("analysisStart").value,
         analysis_end_min: $("analysisEnd").value,
         analysis_minutes: $("analysisMinutes").value,
+        stitching_config: JSON.stringify(getSavedStitching()),
       });
       if ($("classId").value !== "") params.set("class_id", $("classId").value);
       const totalBytes = (leftFile ? leftFile.size : 0) + (rightFile ? rightFile.size : 0);
@@ -2664,9 +3408,76 @@ ANALYSIS_HTML = r"""
     $("analysisStart").oninput = (ev) => syncAnalysisWindow(ev.target, "start");
     $("analysisEndRange").oninput = (ev) => syncAnalysisWindow(ev.target, "end");
     $("analysisEnd").oninput = (ev) => syncAnalysisWindow(ev.target, "end");
-    $("videoFileLeft").onchange = refreshAnalysisMinutes;
-    $("videoFileRight").onchange = refreshAnalysisMinutes;
+    $("videoFileLeft").onchange = async () => {
+      pauseStitchPlayback();
+      resetStitchPreviewSession();
+      await refreshAnalysisMinutes();
+      await warmUpStitchPreview();
+    };
+    $("videoFileRight").onchange = async () => {
+      pauseStitchPlayback();
+      resetStitchPreviewSession();
+      await refreshAnalysisMinutes();
+      await warmUpStitchPreview();
+    };
+    for (const [rangeId, numberId] of stitchControlMap) {
+      syncRangePair(rangeId, numberId, queueLiveStitchPreview);
+    }
+    $("stitchSetupBtn").addEventListener("click", openStitchModal);
+    $("stitchCloseBtn").addEventListener("click", closeStitchModal);
+    $("stitchModal").addEventListener("click", (ev) => {
+      if (ev.target === $("stitchModal")) closeStitchModal();
+    });
+    $("stitchResetBtn").addEventListener("click", () => {
+      sessionStorage.removeItem(STITCH_STORAGE_KEY);
+      updateStitchSummary();
+      $("stitchSaveStatus").textContent = "Session stitching reset to defaults.";
+    });
+    $("stitchRestoreDefaultsBtn").addEventListener("click", () => {
+      setStitchControls(STITCH_DEFAULTS);
+      queueStitchPreviewRender({ includeSecondary: true });
+      $("stitchSaveStatus").textContent = "Preview reset to the default values.";
+    });
+    $("stitchSaveBtn").addEventListener("click", () => {
+      saveStitchingForSession();
+    });
+    $("stitchPlayBtn").addEventListener("click", async () => {
+      if (!(await warmUpStitchPreview())) return;
+      if (stitchPlaybackTimer) {
+        pauseStitchPlayback();
+        queueStitchPreviewRender({ includeSecondary: true });
+        return;
+      }
+      $("stitchPlayBtn").textContent = "Pause";
+      const startedAt = performance.now();
+      const baseTime = stitchCurrentTime;
+      let tick = 0;
+      stitchPlaybackTimer = setInterval(() => {
+        const elapsed = (performance.now() - startedAt) / 1000;
+        const nextTime = clamp(baseTime + elapsed, 0, stitchPreviewDuration || 0);
+        stitchCurrentTime = nextTime;
+        $("stitchSeek").value = String(nextTime);
+        queueStitchPreviewRender({ includeSecondary: false });
+        tick += 1;
+        if (tick % 5 === 0) {
+          queueStitchPreviewRender({ includeSecondary: true, debounceMs: 80 });
+        }
+        const maxSeek = Number($("stitchSeek").max || 0);
+        if (maxSeek > 0 && nextTime >= maxSeek) {
+          pauseStitchPlayback();
+          queueStitchPreviewRender({ includeSecondary: true });
+        }
+      }, 120);
+    });
+    $("stitchSeek").addEventListener("input", async (ev) => {
+      const target = clamp(Number(ev.target.value || 0), 0, stitchPreviewDuration || 0);
+      pauseStitchPlayback();
+      stitchCurrentTime = target;
+      queueLiveStitchPreview();
+    });
     setAnalysisMinutesLimits(0);
+    setStitchControls(getSavedStitching());
+    updateStitchSummary();
     loadModels();
     loadDevices();
   </script>
@@ -4729,6 +5540,7 @@ async def analysis_upload(
     analysis_start_min: float = 0.0,
     analysis_end_min: float = 0.0,
     analysis_minutes: float = 0.0,
+    stitching_config: Optional[str] = None,
 ):
     del speed_up
     os.makedirs(ANALYSIS_UPLOAD_DIR, exist_ok=True)
@@ -4793,6 +5605,7 @@ async def analysis_upload(
         crop["w"] = max(0.05, 1.0 - crop["x"])
     if crop["y"] + crop["h"] > 1.0:
         crop["h"] = max(0.05, 1.0 - crop["y"])
+    stitching = _analysis_stitching_config_from_query(stitching_config)
 
     with ANALYSIS_LOCK:
         ANALYSIS_SESSIONS[session_id] = {
@@ -4810,6 +5623,7 @@ async def analysis_upload(
             "analysis_start_min": max(0.0, float(analysis_start_min)),
             "analysis_end_min": max(0.0, float(analysis_end_min)),
             "analysis_minutes": max(0.0, float(analysis_minutes)),
+            "stitching": stitching,
             "running": False,
             "state": "queued",
             "frames": 0.0,
@@ -4840,6 +5654,80 @@ async def analysis_upload(
         f"device={device} zoom={zoom} sources={','.join(item['label'] for item in sources)}"
     )
     return {"ok": True, "session_id": session_id}
+
+
+@app.post("/api/analysis/stitch-preview/upload")
+async def analysis_stitch_preview_upload(
+    left_video: UploadFile = File(...),
+    right_video: UploadFile = File(...),
+):
+    os.makedirs(ANALYSIS_UPLOAD_DIR, exist_ok=True)
+    session_id = f"preview_{uuid.uuid4().hex[:10]}"
+    max_bytes = 8 * 1024 * 1024 * 1024
+    sources: List[Dict[str, Any]] = []
+    try:
+        left_path, _ = await _analysis_save_upload(session_id, left_video, "left_preview", max_bytes)
+        right_path, _ = await _analysis_save_upload(session_id, right_video, "right_preview", max_bytes)
+        sources = [
+            {"label": "left", "path": left_path},
+            {"label": "right", "path": right_path},
+        ]
+    except Exception:
+        for item in sources:
+            try:
+                os.remove(item["path"])
+            except Exception:
+                pass
+        raise
+
+    durations = []
+    for item in sources:
+        cap = cv2.VideoCapture(item["path"])
+        if cap.isOpened():
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+            if fps > 0 and frames > 0:
+                durations.append(frames / fps)
+        cap.release()
+    duration_sec = min(durations) if durations else 0.0
+
+    with ANALYSIS_LOCK:
+        ANALYSIS_PREVIEW_SESSIONS[session_id] = {
+            "session_id": session_id,
+            "sources": sources,
+            "duration_sec": duration_sec,
+        }
+    return {"ok": True, "session_id": session_id, "duration_sec": duration_sec}
+
+
+@app.get("/api/analysis/stitch-preview/frame/{session_id}")
+def analysis_stitch_preview_frame(
+    session_id: str,
+    time_sec: float = 0.0,
+    view: str = "main",
+    stitching_config: Optional[str] = None,
+):
+    with ANALYSIS_LOCK:
+        session = ANALYSIS_PREVIEW_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Unknown preview session")
+    sources = session.get("sources") or []
+    if len(sources) < 2:
+        raise HTTPException(status_code=400, detail="Preview session is incomplete")
+    stitching = _analysis_stitching_config_from_query(stitching_config)
+    frame = _analysis_preview_frame(
+        left_path=str(sources[0]["path"]),
+        right_path=str(sources[1]["path"]),
+        time_sec=max(0.0, float(time_sec)),
+        stitching=stitching,
+        view=str(view or "main").strip().lower(),
+    )
+    if frame is None:
+        raise HTTPException(status_code=500, detail="Could not render preview frame")
+    ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not encode preview frame")
+    return Response(content=jpg.tobytes(), media_type="image/jpeg")
 
 
 @app.get("/api/analysis/status/{session_id}")
@@ -4880,6 +5768,7 @@ def analysis_status(session_id: str):
             "output_url": f"/api/analysis/result/{session_id}" if sess.get("output_path") else None,
             "last_error": sess.get("last_error"),
             "crop": sess.get("crop"),
+            "stitching": _analysis_stitching_config_from_values(sess.get("stitching")),
         }
 
 

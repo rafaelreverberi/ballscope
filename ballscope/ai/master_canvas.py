@@ -22,6 +22,10 @@ class MasterCanvasConfig:
     orb_features: int = 3000
     base_top_crop_ratio: float = 0.06
     base_bottom_crop_ratio: float = 0.12
+    manual_overlap_ratio: Optional[float] = None
+    manual_left_crop_y_ratio: Optional[float] = None
+    manual_right_crop_y_ratio: Optional[float] = None
+    manual_bottom_crop_ratio: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -256,7 +260,7 @@ def estimate_master_canvas_layout(
     seam_x = right_offset_x + (overlap_px // 2)
     blend_start_x = max(right_offset_x, seam_x - (blend_width // 2))
     blend_end_x = min(right_offset_x + overlap_px, blend_start_x + blend_width)
-    return MasterCanvasLayout(
+    layout = MasterCanvasLayout(
         width=width,
         height=height,
         overlap_px=overlap_px,
@@ -266,6 +270,73 @@ def estimate_master_canvas_layout(
         right_crop_y=right_crop_y,
         left_width=left.shape[1],
         right_width=right.shape[1],
+        seam_x=seam_x,
+        blend_start_x=blend_start_x,
+        blend_end_x=blend_end_x,
+    )
+    return _apply_layout_overrides(layout, left.shape[:2], right.shape[:2], cfg)
+
+
+def _apply_layout_overrides(
+    layout: MasterCanvasLayout,
+    left_shape: Tuple[int, int],
+    right_shape: Tuple[int, int],
+    cfg: MasterCanvasConfig,
+) -> MasterCanvasLayout:
+    use_manual = any(
+        value is not None
+        for value in (
+            cfg.manual_overlap_ratio,
+            cfg.manual_left_crop_y_ratio,
+            cfg.manual_right_crop_y_ratio,
+            cfg.manual_bottom_crop_ratio,
+        )
+    )
+    if not use_manual:
+        return layout
+
+    left_h, left_w = int(left_shape[0]), int(left_shape[1])
+    right_h, right_w = int(right_shape[0]), int(right_shape[1])
+    overlap_ratio = cfg.manual_overlap_ratio if cfg.manual_overlap_ratio is not None else (
+        layout.overlap_px / float(max(1, min(left_w, right_w)))
+    )
+    overlap_ratio = max(cfg.min_overlap_ratio, min(cfg.max_overlap_ratio, float(overlap_ratio)))
+    overlap_px = max(32, int(round(min(left_w, right_w) * overlap_ratio)))
+    overlap_px = min(overlap_px, min(left_w - 1, right_w - 1))
+    right_offset_x = max(0, left_w - overlap_px)
+
+    left_crop_ratio = cfg.manual_left_crop_y_ratio if cfg.manual_left_crop_y_ratio is not None else (
+        layout.left_crop_y / float(max(1, left_h))
+    )
+    right_crop_ratio = cfg.manual_right_crop_y_ratio if cfg.manual_right_crop_y_ratio is not None else (
+        layout.right_crop_y / float(max(1, right_h))
+    )
+    bottom_crop_ratio = cfg.manual_bottom_crop_ratio if cfg.manual_bottom_crop_ratio is not None else cfg.base_bottom_crop_ratio
+
+    left_crop_y = max(0, min(left_h - 1, int(round(left_h * max(0.0, float(left_crop_ratio))))))
+    right_crop_y = max(0, min(right_h - 1, int(round(right_h * max(0.0, float(right_crop_ratio))))))
+    left_bottom_crop = max(0, int(round(left_h * max(0.0, float(bottom_crop_ratio)))))
+    right_bottom_crop = max(0, int(round(right_h * max(0.0, float(bottom_crop_ratio)))))
+    height = min(
+        max(1, left_h - left_crop_y - left_bottom_crop),
+        max(1, right_h - right_crop_y - right_bottom_crop),
+    )
+    width = max(left_w, right_offset_x + right_w)
+    blend_width = int(round(overlap_px * cfg.seam_blend_ratio))
+    blend_width = max(cfg.min_blend_px, min(cfg.max_blend_px, max(1, blend_width)))
+    seam_x = right_offset_x + (overlap_px // 2)
+    blend_start_x = max(right_offset_x, seam_x - (blend_width // 2))
+    blend_end_x = min(right_offset_x + overlap_px, blend_start_x + blend_width)
+    return MasterCanvasLayout(
+        width=width,
+        height=height,
+        overlap_px=overlap_px,
+        left_offset_x=0,
+        left_crop_y=left_crop_y,
+        right_offset_x=right_offset_x,
+        right_crop_y=right_crop_y,
+        left_width=left_w,
+        right_width=right_w,
         seam_x=seam_x,
         blend_start_x=blend_start_x,
         blend_end_x=blend_end_x,
@@ -296,6 +367,7 @@ def assemble_master_canvas(
     left = _resize_to_height(left_frame, target_h)
     right = _resize_to_height(right_frame, target_h)
     use_layout = layout or estimate_master_canvas_layout(left, right, cfg)
+    use_layout = _apply_layout_overrides(use_layout, left.shape[:2], right.shape[:2], cfg)
 
     left_crop_y = max(0, min(use_layout.left_crop_y, max(0, left.shape[0] - 1)))
     right_crop_y = max(0, min(use_layout.right_crop_y, max(0, right.shape[0] - 1)))

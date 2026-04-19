@@ -78,6 +78,8 @@ Open `Analysis` from the home screen for offline post-processing.
 
 Notes:
 - The page accepts separate `Left Camera` and `Right Camera` video uploads.
+- The `Set Up Stitching` button opens a local stitched preview for the selected uploads so overlap, blend width, and left/right crop alignment can be adjusted before analysis starts.
+- Saved stitch values apply to the current browser session only; if you keep the defaults, the standard automatic BallScope stitch behavior is used unchanged.
 - You can limit analysis to the first N minutes with a slider / numeric input, which is useful for testing 90-minute source files quickly.
 - Model selection is automatic by checkpoint type. BallScope distinguishes YOLO checkpoints from RF-DETR checkpoints and uses the matching backend.
 - `models/ballscope-ai.pt` is the default analysis model and is treated as RF-DETR.

@@ -16,6 +16,7 @@ BallScope is an AI-assisted multi-camera football tracking project. It captures 
 - Record processed output and raw camera streams.
 - Analyze uploaded videos in the web UI.
 - Run post-analysis on separate left/right camera videos in the web UI.
+- Preview and tune dual-camera stitching in the Analysis workspace, then save the stitch values for the current browser session.
 - Tune both cameras in a dedicated Camera Settings workspace, keep those settings for the current session, and save named camera presets for later reuse.
 
 ## Supported Platforms
@@ -154,6 +155,8 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 
 ## Analysis Workspace
 - The `Analysis` page accepts separate `Left Camera` and `Right Camera` uploads.
+- The `Set Up Stitching` action opens a stitched preview player for the selected left/right uploads so overlap, blend width, and vertical crop alignment can be tuned before starting analysis.
+- Saved stitching values stay active for the current browser session and are sent into the same dual-camera analysis pipeline on both Apple Silicon macOS and Jetson.
 - Analysis can optionally be limited to the first N minutes of the uploaded files for fast debugging on long recordings.
 - BallScope detects whether a model is a YOLO checkpoint or an RF-DETR checkpoint and uses the matching runtime automatically.
 - `models/ballscope-ai.pt` is detected as RF-DETR and is the default analysis model.
