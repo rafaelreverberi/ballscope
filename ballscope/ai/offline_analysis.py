@@ -969,7 +969,8 @@ class OfflineAnalysisEngine:
 def calibrate_master_layout(
     left_path: str,
     right_path: str,
-    start_sec: float,
+    left_start_sec: float,
+    right_start_sec: float,
     media_duration_sec: float,
     config: Optional[MasterCanvasConfig] = None,
 ) -> Optional[MasterCanvasLayout]:
@@ -985,11 +986,13 @@ def calibrate_master_layout(
         left_shape = None
         right_shape = None
         for offset_sec in (0.0, 1.2, 2.6, 4.0):
-            ts = max(0.0, start_sec) + offset_sec
+            left_ts = max(0.0, left_start_sec) + offset_sec
+            right_ts = max(0.0, right_start_sec) + offset_sec
             if media_duration_sec > 0:
-                ts = min(max(0.0, media_duration_sec - 0.35), ts)
-            left_cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
-            right_cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
+                left_ts = min(max(0.0, media_duration_sec - 0.35), left_ts)
+                right_ts = min(max(0.0, media_duration_sec - 0.35), right_ts)
+            left_cap.set(cv2.CAP_PROP_POS_MSEC, left_ts * 1000.0)
+            right_cap.set(cv2.CAP_PROP_POS_MSEC, right_ts * 1000.0)
             ok_left, left_frame = left_cap.read()
             ok_right, right_frame = right_cap.read()
             if not ok_left or left_frame is None or not ok_right or right_frame is None:

@@ -157,6 +157,9 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 - The `Analysis` page accepts separate `Left Camera` and `Right Camera` uploads.
 - The `Set Up Stitching` action opens a stitched preview player for the selected left/right uploads so overlap, blend width, and vertical crop alignment can be tuned before starting analysis.
 - Saved stitching values stay active for the current browser session and are sent into the same dual-camera analysis pipeline on both Apple Silicon macOS and Jetson.
+- Dual-source analysis estimates a left/right time offset automatically before rendering, so seam transitions stay continuous even when the uploaded camera files do not start at exactly the same moment.
+- The Stitching modal also exposes a manual `Right Delay (sec)` control. Positive values mean the right clip starts later and should be shifted forward to match the left clip.
+- Final analysis export trims the chosen audio source to the same effective start as the rendered video instead of remuxing unaligned audio from the raw upload.
 - Analysis can optionally be limited to the first N minutes of the uploaded files for fast debugging on long recordings.
 - BallScope detects whether a model is a YOLO checkpoint or an RF-DETR checkpoint and uses the matching runtime automatically.
 - `models/ballscope-ai.pt` is detected as RF-DETR and is the default analysis model.

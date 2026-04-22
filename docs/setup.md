@@ -80,6 +80,9 @@ Notes:
 - The page accepts separate `Left Camera` and `Right Camera` video uploads.
 - The `Set Up Stitching` button opens a local stitched preview for the selected uploads so overlap, blend width, and left/right crop alignment can be adjusted before analysis starts.
 - Saved stitch values apply to the current browser session only; if you keep the defaults, the standard automatic BallScope stitch behavior is used unchanged.
+- Dual-source analysis estimates a visual left/right time offset automatically and aligns both streams onto one common timeline before the master-canvas render starts.
+- If the automatic sync is still off on a specific clip pair, use the `Right Delay (sec)` control in the Stitching modal. Positive values mean the right upload should be read later than the left upload.
+- Final analysis export trims audio to the same effective aligned start time used by the render pipeline, which avoids large delayed-audio remux errors.
 - You can limit analysis to the first N minutes with a slider / numeric input, which is useful for testing 90-minute source files quickly.
 - Model selection is automatic by checkpoint type. BallScope distinguishes YOLO checkpoints from RF-DETR checkpoints and uses the matching backend.
 - `models/ballscope-ai.pt` is the default analysis model and is treated as RF-DETR.

@@ -267,6 +267,7 @@ def _analysis_preview_frame(
     time_sec: float,
     stitching: Dict[str, Any],
     view: str,
+    sync_offset_sec: float = 0.0,
 ) -> Optional[Any]:
     left_cap = cv2.VideoCapture(left_path)
     right_cap = cv2.VideoCapture(right_path)
@@ -275,9 +276,11 @@ def _analysis_preview_frame(
         right_cap.release()
         return None
     try:
-        ts_ms = max(0.0, float(time_sec)) * 1000.0
-        left_cap.set(cv2.CAP_PROP_POS_MSEC, ts_ms)
-        right_cap.set(cv2.CAP_PROP_POS_MSEC, ts_ms)
+        sync_offset_sec = float(sync_offset_sec or 0.0)
+        left_ts = max(0.0, float(time_sec) + max(0.0, -sync_offset_sec))
+        right_ts = max(0.0, float(time_sec) + max(0.0, sync_offset_sec))
+        left_cap.set(cv2.CAP_PROP_POS_MSEC, left_ts * 1000.0)
+        right_cap.set(cv2.CAP_PROP_POS_MSEC, right_ts * 1000.0)
         ok_left, left_frame = left_cap.read()
         ok_right, right_frame = right_cap.read()
         if not ok_left or left_frame is None or not ok_right or right_frame is None:
@@ -460,6 +463,234 @@ def _analysis_ffprobe_video_streams(path: str) -> List[dict]:
         return streams
     except Exception:
         return []
+
+
+def _analysis_ffprobe_streams(path: str) -> List[dict]:
+    if not shutil.which("ffprobe"):
+        return []
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_streams",
+        path,
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if res.returncode != 0:
+            return []
+        data = json.loads(res.stdout or "{}")
+        streams = data.get("streams", [])
+        return streams if isinstance(streams, list) else []
+    except Exception:
+        return []
+
+
+def _analysis_has_audio_stream(path: str) -> bool:
+    return any(str(st.get("codec_type") or "").strip().lower() == "audio" for st in _analysis_ffprobe_streams(path))
+
+
+def _analysis_crop_motion_region(frame: np.ndarray, side: str) -> np.ndarray:
+    h, w = frame.shape[:2]
+    if h < 8 or w < 8:
+        return frame
+    y1 = int(round(h * 0.18))
+    y2 = int(round(h * 0.84))
+    if side == "right":
+        x1 = int(round(w * 0.58))
+        x2 = int(round(w * 0.96))
+    else:
+        x1 = int(round(w * 0.04))
+        x2 = int(round(w * 0.42))
+    y1 = max(0, min(h - 2, y1))
+    y2 = max(y1 + 1, min(h, y2))
+    x1 = max(0, min(w - 2, x1))
+    x2 = max(x1 + 1, min(w, x2))
+    roi = frame[y1:y2, x1:x2]
+    return roi if roi.size else frame
+
+
+def _analysis_sample_overlap_frames(
+    path: str,
+    start_sec: float,
+    duration_sec: float,
+    side: str,
+    sample_fps: float = 4.0,
+    max_samples: int = 192,
+) -> tuple[np.ndarray, float]:
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        cap.release()
+        return np.zeros((0, 0), dtype=np.float32), 0.0
+    try:
+        sample_period = 1.0 / float(max(0.5, sample_fps))
+        usable_duration = max(0.0, float(duration_sec))
+        if usable_duration <= 0:
+            frame_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or ANALYSIS_TARGET_FPS or 30.0)
+            if frame_count > 0 and fps > 0:
+                usable_duration = frame_count / fps
+        usable_duration = min(usable_duration, sample_period * float(max_samples))
+        if usable_duration <= sample_period:
+            return np.zeros((0, 0), dtype=np.float32), sample_period
+
+        frames_out: List[np.ndarray] = []
+        num_samples = max(2, min(max_samples, int(usable_duration / sample_period)))
+        for sample_idx in range(num_samples):
+            ts = max(0.0, start_sec + sample_idx * sample_period)
+            cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            roi = _analysis_crop_motion_region(frame, side)
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            gray = cv2.resize(gray, (48, 28), interpolation=cv2.INTER_AREA)
+            frames_out.append(gray.astype(np.float32) / 255.0)
+        if not frames_out:
+            return np.zeros((0, 0), dtype=np.float32), sample_period
+        return np.asarray(frames_out, dtype=np.float32), sample_period
+    finally:
+        cap.release()
+
+
+def _analysis_motion_fingerprints(frames: np.ndarray) -> np.ndarray:
+    if frames.ndim != 3 or frames.shape[0] < 2:
+        return np.zeros((0, 0), dtype=np.float32)
+    diffs = np.abs(np.diff(frames, axis=0))
+    diffs = np.where(diffs > 0.03, diffs, 0.0)
+    return diffs.reshape(diffs.shape[0], -1).astype(np.float32)
+
+
+def _analysis_foreground_masks(frames: np.ndarray) -> np.ndarray:
+    if frames.ndim != 3 or frames.shape[0] < 4:
+        return np.zeros((0, 0), dtype=np.float32)
+    background = np.median(frames, axis=0).astype(np.float32)
+    fg = np.abs(frames - background)
+    fg = np.where(fg > 0.08, 1.0, 0.0).astype(np.float32)
+    return fg.reshape(fg.shape[0], -1)
+
+
+def _analysis_best_fingerprint_offset(
+    left_prints: np.ndarray,
+    right_prints: np.ndarray,
+    sample_period: float,
+    max_offset_sec: float,
+) -> tuple[float, float]:
+    if left_prints.ndim != 2 or right_prints.ndim != 2 or left_prints.shape[0] < 12 or right_prints.shape[0] < 12:
+        return 0.0, 0.0
+
+    max_lag = max(0, int(round(max_offset_sec / max(1e-6, sample_period))))
+    min_overlap = max(10, min(left_prints.shape[0], right_prints.shape[0]) // 3)
+    best_lag = 0
+    best_score = -1.0
+    for lag in range(-max_lag, max_lag + 1):
+        if lag >= 0:
+            a = left_prints[: left_prints.shape[0] - lag] if lag < left_prints.shape[0] else left_prints[:0]
+            b = right_prints[lag:]
+        else:
+            shift = -lag
+            a = left_prints[shift:]
+            b = right_prints[: right_prints.shape[0] - shift] if shift < right_prints.shape[0] else right_prints[:0]
+        if a.shape[0] < min_overlap or b.shape[0] < min_overlap:
+            continue
+        score_sum = 0.0
+        score_count = 0
+        for idx in range(a.shape[0]):
+            va = a[idx]
+            vb = b[idx]
+            na = float(np.linalg.norm(va))
+            nb = float(np.linalg.norm(vb))
+            if na < 1e-6 or nb < 1e-6:
+                continue
+            score_sum += float(np.dot(va, vb) / (na * nb))
+            score_count += 1
+        if score_count < max(8, min_overlap // 2):
+            continue
+        score = score_sum / float(score_count)
+        if score > best_score:
+            best_score = score
+            best_lag = lag
+    return float(best_lag) * sample_period, max(0.0, best_score)
+
+
+def _analysis_best_mask_offset(
+    left_masks: np.ndarray,
+    right_masks: np.ndarray,
+    sample_period: float,
+    max_offset_sec: float,
+) -> tuple[float, float]:
+    if left_masks.ndim != 2 or right_masks.ndim != 2 or left_masks.shape[0] < 12 or right_masks.shape[0] < 12:
+        return 0.0, 0.0
+    max_lag = max(0, int(round(max_offset_sec / max(1e-6, sample_period))))
+    min_overlap = max(10, min(left_masks.shape[0], right_masks.shape[0]) // 3)
+    best_lag = 0
+    best_score = -1.0
+    for lag in range(-max_lag, max_lag + 1):
+        if lag >= 0:
+            a = left_masks[: left_masks.shape[0] - lag] if lag < left_masks.shape[0] else left_masks[:0]
+            b = right_masks[lag:]
+        else:
+            shift = -lag
+            a = left_masks[shift:]
+            b = right_masks[: right_masks.shape[0] - shift] if shift < right_masks.shape[0] else right_masks[:0]
+        if a.shape[0] < min_overlap or b.shape[0] < min_overlap:
+            continue
+        score_sum = 0.0
+        score_count = 0
+        for idx in range(a.shape[0]):
+            va = a[idx]
+            vb = b[idx]
+            union = float(np.maximum(va, vb).sum())
+            if union < 20.0:
+                continue
+            inter = float(np.minimum(va, vb).sum())
+            score_sum += inter / union
+            score_count += 1
+        if score_count < max(8, min_overlap // 2):
+            continue
+        score = score_sum / float(score_count)
+        if score > best_score:
+            best_score = score
+            best_lag = lag
+    return float(best_lag) * sample_period, max(0.0, best_score)
+
+
+def _analysis_estimate_dual_stream_offset(
+    left_path: str,
+    right_path: str,
+    start_sec: float,
+    media_duration_sec: float,
+) -> tuple[float, float]:
+    duration = max(0.0, media_duration_sec - max(0.0, start_sec)) if media_duration_sec > 0 else 24.0
+    duration = min(max(8.0, duration), 48.0)
+    left_frames, sample_period = _analysis_sample_overlap_frames(left_path, start_sec, duration, side="right")
+    right_frames, _ = _analysis_sample_overlap_frames(right_path, start_sec, duration, side="left")
+    left_prints = _analysis_motion_fingerprints(left_frames)
+    right_prints = _analysis_motion_fingerprints(right_frames)
+    fp_offset_sec, fp_score = _analysis_best_fingerprint_offset(
+        left_prints=left_prints,
+        right_prints=right_prints,
+        sample_period=sample_period,
+        max_offset_sec=12.0,
+    )
+    left_masks = _analysis_foreground_masks(left_frames)
+    right_masks = _analysis_foreground_masks(right_frames)
+    mask_offset_sec, mask_score = _analysis_best_mask_offset(
+        left_masks=left_masks,
+        right_masks=right_masks,
+        sample_period=sample_period,
+        max_offset_sec=12.0,
+    )
+    if mask_score >= max(0.12, fp_score * 0.7):
+        chosen_offset, chosen_score = mask_offset_sec, mask_score
+    else:
+        chosen_offset, chosen_score = fp_offset_sec, fp_score
+    if chosen_score < 0.18:
+        return 0.0, chosen_score
+    return chosen_offset, chosen_score
 
 
 def _analysis_extract_video_stream(input_path: str, stream_idx: int, output_path: str) -> bool:
@@ -672,6 +903,54 @@ def _analysis_concat_segments(segment_paths: List[str], stitched_path: str) -> b
             pass
 
 
+def _analysis_mux_video_with_audio(
+    video_path: str,
+    output_path: str,
+    audio_source_path: Optional[str],
+    audio_trim_sec: float,
+) -> bool:
+    if not os.path.exists(video_path):
+        return False
+    if not shutil.which("ffmpeg"):
+        return False
+
+    cmd = ["ffmpeg", "-y", "-i", video_path]
+    has_audio = bool(audio_source_path and os.path.exists(audio_source_path) and _analysis_has_audio_stream(audio_source_path))
+    if has_audio:
+        if audio_trim_sec > 0.001:
+            cmd += ["-ss", f"{audio_trim_sec:.6f}"]
+        cmd += ["-i", audio_source_path]
+    cmd += [
+        "-map",
+        "0:v:0",
+    ]
+    if has_audio:
+        cmd += ["-map", "1:a:0?"]
+    cmd += [
+        "-c:v",
+        "libx264",
+        "-preset",
+        ANALYSIS_ENCODE_PRESET,
+        "-crf",
+        str(ANALYSIS_ENCODE_CRF),
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if has_audio:
+        cmd += [
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+        ]
+    else:
+        cmd += ["-an"]
+    cmd.append(output_path)
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return res.returncode == 0 and os.path.exists(output_path)
+
+
 def _analysis_process_video(session_id: str, video_path: str):
     with ANALYSIS_LOCK:
         session = ANALYSIS_SESSIONS.get(session_id)
@@ -760,7 +1039,8 @@ def _analysis_process_video(session_id: str, video_path: str):
     master_canvas_cfg = _analysis_master_canvas_config(session)
     total_frames = max([n for n in frame_count_list if n > 0] or [0])
     src_fps = max([f for f in fps_list if f > 0] or [ANALYSIS_TARGET_FPS])
-    media_duration_sec = min([n / f for n, f in zip(frame_count_list, fps_list) if n > 0 and f > 0] or [0.0])
+    duration_list = [n / f for n, f in zip(frame_count_list, fps_list) if n > 0 and f > 0]
+    media_duration_sec = min(duration_list or [0.0])
     start_sec = max(0.0, analysis_start_min * 60.0)
     if media_duration_sec > 0:
         start_sec = min(start_sec, max(0.0, media_duration_sec - 0.25))
@@ -771,7 +1051,36 @@ def _analysis_process_video(session_id: str, video_path: str):
         end_sec = min(end_sec, media_duration_sec)
     if end_sec > 0.0 and end_sec <= start_sec:
         end_sec = min(media_duration_sec, start_sec + 60.0) if media_duration_sec > 0 else (start_sec + 60.0)
-    analysis_limit_sec = max(0.0, end_sec - start_sec) if end_sec > 0.0 else max(0.0, media_duration_sec - start_sec if media_duration_sec > 0 else 0.0)
+    requested_limit_sec = max(0.0, end_sec - start_sec) if end_sec > 0.0 else max(0.0, media_duration_sec - start_sec if media_duration_sec > 0 else 0.0)
+    sync_offset_sec = 0.0
+    sync_score = 0.0
+    sync_mode = "off"
+    stream_start_offsets = [0.0 for _ in caps]
+    manual_sync_offset_sec = float(session.get("sync_offset_sec", 0.0) or 0.0)
+    if dual_master_mode:
+        left_idx = source_labels.index("left")
+        right_idx = source_labels.index("right")
+        if abs(manual_sync_offset_sec) >= 0.05:
+            sync_offset_sec = manual_sync_offset_sec
+            sync_score = 1.0
+            sync_mode = "manual"
+        else:
+            sync_offset_sec = 0.0
+            sync_score = 0.0
+            sync_mode = "off"
+        if sync_offset_sec >= 0.0:
+            stream_start_offsets[right_idx] = sync_offset_sec
+        else:
+            stream_start_offsets[left_idx] = -sync_offset_sec
+
+    aligned_duration_candidates = []
+    for idx, dur in enumerate(duration_list):
+        trim = float(stream_start_offsets[idx]) if idx < len(stream_start_offsets) else 0.0
+        aligned_duration_candidates.append(max(0.0, dur - start_sec - trim))
+    aligned_duration_sec = min(aligned_duration_candidates or [0.0])
+    analysis_limit_sec = requested_limit_sec if requested_limit_sec > 0.0 else aligned_duration_sec
+    if aligned_duration_sec > 0.0 and analysis_limit_sec > 0.0:
+        analysis_limit_sec = min(analysis_limit_sec, aligned_duration_sec)
     analysis_limit_frames = int(round(analysis_limit_sec * src_fps)) if analysis_limit_sec > 0 and src_fps > 0 else 0
     if analysis_limit_frames > 0:
         total_frames = analysis_limit_frames
@@ -780,6 +1089,7 @@ def _analysis_process_video(session_id: str, video_path: str):
         {
             "cap": cap,
             "fps": float(fps_list[idx] if idx < len(fps_list) and fps_list[idx] > 0 else ANALYSIS_TARGET_FPS),
+            "start_offset_sec": float(stream_start_offsets[idx]) if idx < len(stream_start_offsets) else 0.0,
             "rel_idx": -1,
             "last_frame": None,
             "ended": False,
@@ -804,8 +1114,12 @@ def _analysis_process_video(session_id: str, video_path: str):
         master_layout_fixed = calibrate_master_layout(
             left_path=source_paths[left_idx],
             right_path=source_paths[right_idx],
-            start_sec=start_sec,
-            media_duration_sec=media_duration_sec,
+            left_start_sec=start_sec + float(stream_start_offsets[left_idx]),
+            right_start_sec=start_sec + float(stream_start_offsets[right_idx]),
+            media_duration_sec=min(
+                (duration_list[left_idx] if left_idx < len(duration_list) else media_duration_sec),
+                (duration_list[right_idx] if right_idx < len(duration_list) else media_duration_sec),
+            ),
             config=master_canvas_cfg,
         )
 
@@ -825,6 +1139,10 @@ def _analysis_process_video(session_id: str, video_path: str):
         ANALYSIS_SESSIONS[session_id]["analysis_start_min"] = analysis_start_min
         ANALYSIS_SESSIONS[session_id]["analysis_end_min"] = analysis_end_min if analysis_end_min > 0 else None
         ANALYSIS_SESSIONS[session_id]["analysis_limit_sec"] = analysis_limit_sec if analysis_limit_sec > 0 else None
+        ANALYSIS_SESSIONS[session_id]["sync_offset_sec"] = sync_offset_sec
+        ANALYSIS_SESSIONS[session_id]["sync_score"] = sync_score
+        ANALYSIS_SESSIONS[session_id]["sync_mode"] = sync_mode
+        ANALYSIS_SESSIONS[session_id]["stream_start_offsets"] = [float(v) for v in stream_start_offsets]
         ANALYSIS_SESSIONS[session_id]["progress_pct"] = 0.0
         ANALYSIS_SESSIONS[session_id]["eta_sec"] = None
         ANALYSIS_SESSIONS[session_id]["stream_count"] = len(caps)
@@ -868,9 +1186,10 @@ def _analysis_process_video(session_id: str, video_path: str):
 
     try:
         if start_sec > 0:
-            for cap in caps:
+            for idx, cap in enumerate(caps):
                 try:
-                    cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
+                    seek_sec = start_sec + float(stream_start_offsets[idx] if idx < len(stream_start_offsets) else 0.0)
+                    cap.set(cv2.CAP_PROP_POS_MSEC, seek_sec * 1000.0)
                 except Exception:
                     pass
         while True:
@@ -885,7 +1204,7 @@ def _analysis_process_video(session_id: str, video_path: str):
                 if runtime["ended"]:
                     frames.append(None)
                     continue
-                desired_rel_idx = max(0, int(round(timeline_sec * runtime["fps"])))
+                desired_rel_idx = max(0, int(round((timeline_sec + float(runtime["start_offset_sec"])) * runtime["fps"])))
                 while runtime["rel_idx"] < desired_rel_idx and not runtime["ended"]:
                     ok, frame = runtime["cap"].read()
                     if not ok or frame is None:
@@ -998,34 +1317,23 @@ def _analysis_process_video(session_id: str, video_path: str):
         if writer is not None:
             writer.release()
         stitched_ok = _analysis_concat_segments(segment_paths, stitched_avi)
-        if stitched_ok and shutil.which("ffmpeg"):
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                stitched_avi,
-                "-i",
-                video_path,
-                "-map",
-                "0:v:0",
-                "-map",
-                "1:a:0?",
-                "-c:v",
-                "libx264",
-                "-preset",
-                ANALYSIS_ENCODE_PRESET,
-                "-crf",
-                str(ANALYSIS_ENCODE_CRF),
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-shortest",
-                final_mp4,
-            ]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        audio_source_path = None
+        audio_trim_sec = start_sec
+        for idx, path in enumerate(source_paths):
+            if _analysis_has_audio_stream(path):
+                audio_source_path = path
+                audio_trim_sec = start_sec + float(stream_start_offsets[idx] if idx < len(stream_start_offsets) else 0.0)
+                break
+        if audio_source_path is None and _analysis_has_audio_stream(video_path):
+            audio_source_path = video_path
+            audio_trim_sec = start_sec
+        if stitched_ok:
+            _analysis_mux_video_with_audio(
+                video_path=stitched_avi,
+                output_path=final_mp4,
+                audio_source_path=audio_source_path,
+                audio_trim_sec=audio_trim_sec,
+            )
         if not os.path.exists(final_mp4) and stitched_ok:
             try:
                 shutil.copyfile(stitched_avi, final_mp4)
@@ -2698,6 +3006,7 @@ ANALYSIS_HTML = r"""
           <div class="chip" id="stSeg">segments:0</div>
           <div class="chip" id="stConf">conf:0</div>
           <div class="chip" id="stSeen">last seen:-</div>
+          <div class="chip" id="stSync">sync:-</div>
         </div>
         <div style="margin-top:12px;">
           <a id="resultLink" class="result-link" href="#">Download Result MP4</a>
@@ -2779,6 +3088,13 @@ ANALYSIS_HTML = r"""
               <input id="stitchBottomCropNumber" class="mini" type="number" min="0" max="0.35" step="0.005" value="0.12"/>
             </div>
           </div>
+          <div>
+            <label>Right Delay (sec)</label>
+            <div class="range-value">
+              <input id="stitchSyncOffset" type="range" min="-12" max="12" step="0.1" value="0"/>
+              <input id="stitchSyncOffsetNumber" class="mini" type="number" min="-12" max="12" step="0.1" value="0"/>
+            </div>
+          </div>
           <div class="status" id="stitchSaveStatus">Default values stay active until you save different ones.</div>
         </div>
       </div>
@@ -2819,13 +3135,14 @@ ANALYSIS_HTML = r"""
     let modelMetaByPath = {};
     let maxAnalysisMinutes = 0;
     const STITCH_STORAGE_KEY = "ballscope-analysis-stitching";
-    const STITCH_DEFAULTS = {
-      overlap_ratio: 0.525,
-      seam_blend_ratio: 0.01,
-      left_crop_y_ratio: 0.01,
-      right_crop_y_ratio: 0.07,
-      bottom_crop_ratio: 0.12,
-    };
+	    const STITCH_DEFAULTS = {
+	      overlap_ratio: 0.525,
+	      seam_blend_ratio: 0.01,
+	      left_crop_y_ratio: 0.01,
+	      right_crop_y_ratio: 0.07,
+	      bottom_crop_ratio: 0.12,
+          sync_offset_sec: 0.0,
+	    };
     const stitchCanvas = $("stitchCanvas");
     const stitchCtx = stitchCanvas.getContext("2d");
     const stitchCanvasClean = $("stitchCanvasClean");
@@ -2846,26 +3163,28 @@ ANALYSIS_HTML = r"""
 
     const clamp = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
     const formatSeconds = (value) => `${Math.max(0, Number(value || 0)).toFixed(1)}s`;
-    const stitchControlMap = [
-      ["stitchOverlap", "stitchOverlapNumber", "overlap_ratio", 0.525],
-      ["stitchBlend", "stitchBlendNumber", "seam_blend_ratio", 0.01],
-      ["stitchLeftCrop", "stitchLeftCropNumber", "left_crop_y_ratio", 0.01],
-      ["stitchRightCrop", "stitchRightCropNumber", "right_crop_y_ratio", 0.07],
-      ["stitchBottomCrop", "stitchBottomCropNumber", "bottom_crop_ratio", 0.12],
-    ];
+	    const stitchControlMap = [
+	      ["stitchOverlap", "stitchOverlapNumber", "overlap_ratio", 0.525],
+	      ["stitchBlend", "stitchBlendNumber", "seam_blend_ratio", 0.01],
+	      ["stitchLeftCrop", "stitchLeftCropNumber", "left_crop_y_ratio", 0.01],
+	      ["stitchRightCrop", "stitchRightCropNumber", "right_crop_y_ratio", 0.07],
+	      ["stitchBottomCrop", "stitchBottomCropNumber", "bottom_crop_ratio", 0.12],
+          ["stitchSyncOffset", "stitchSyncOffsetNumber", "sync_offset_sec", 0.0],
+	    ];
 
     const getSavedStitching = () => {
       try {
         const raw = sessionStorage.getItem(STITCH_STORAGE_KEY);
         if (!raw) return { ...STITCH_DEFAULTS };
         const parsed = JSON.parse(raw);
-        return {
-          overlap_ratio: clamp(Number(parsed.overlap_ratio ?? STITCH_DEFAULTS.overlap_ratio), 0.22, 0.68),
-          seam_blend_ratio: clamp(Number(parsed.seam_blend_ratio ?? STITCH_DEFAULTS.seam_blend_ratio), 0, 0.12),
-          left_crop_y_ratio: clamp(Number(parsed.left_crop_y_ratio ?? STITCH_DEFAULTS.left_crop_y_ratio), 0, 0.35),
-          right_crop_y_ratio: clamp(Number(parsed.right_crop_y_ratio ?? STITCH_DEFAULTS.right_crop_y_ratio), 0, 0.35),
-          bottom_crop_ratio: clamp(Number(parsed.bottom_crop_ratio ?? STITCH_DEFAULTS.bottom_crop_ratio), 0, 0.35),
-        };
+	        return {
+	          overlap_ratio: clamp(Number(parsed.overlap_ratio ?? STITCH_DEFAULTS.overlap_ratio), 0.22, 0.68),
+	          seam_blend_ratio: clamp(Number(parsed.seam_blend_ratio ?? STITCH_DEFAULTS.seam_blend_ratio), 0, 0.12),
+	          left_crop_y_ratio: clamp(Number(parsed.left_crop_y_ratio ?? STITCH_DEFAULTS.left_crop_y_ratio), 0, 0.35),
+	          right_crop_y_ratio: clamp(Number(parsed.right_crop_y_ratio ?? STITCH_DEFAULTS.right_crop_y_ratio), 0, 0.35),
+	          bottom_crop_ratio: clamp(Number(parsed.bottom_crop_ratio ?? STITCH_DEFAULTS.bottom_crop_ratio), 0, 0.35),
+              sync_offset_sec: clamp(Number(parsed.sync_offset_sec ?? STITCH_DEFAULTS.sync_offset_sec), -12, 12),
+	        };
       } catch (e) {
         return { ...STITCH_DEFAULTS };
       }
@@ -2879,20 +3198,21 @@ ANALYSIS_HTML = r"""
       }
     };
 
-    const getStitchControls = () => ({
-      overlap_ratio: clamp(Number($("stitchOverlapNumber").value || STITCH_DEFAULTS.overlap_ratio), 0.22, 0.68),
-      seam_blend_ratio: clamp(Number($("stitchBlendNumber").value || STITCH_DEFAULTS.seam_blend_ratio), 0, 0.12),
-      left_crop_y_ratio: clamp(Number($("stitchLeftCropNumber").value || STITCH_DEFAULTS.left_crop_y_ratio), 0, 0.35),
-      right_crop_y_ratio: clamp(Number($("stitchRightCropNumber").value || STITCH_DEFAULTS.right_crop_y_ratio), 0, 0.35),
-      bottom_crop_ratio: clamp(Number($("stitchBottomCropNumber").value || STITCH_DEFAULTS.bottom_crop_ratio), 0, 0.35),
-    });
+	    const getStitchControls = () => ({
+	      overlap_ratio: clamp(Number($("stitchOverlapNumber").value || STITCH_DEFAULTS.overlap_ratio), 0.22, 0.68),
+	      seam_blend_ratio: clamp(Number($("stitchBlendNumber").value || STITCH_DEFAULTS.seam_blend_ratio), 0, 0.12),
+	      left_crop_y_ratio: clamp(Number($("stitchLeftCropNumber").value || STITCH_DEFAULTS.left_crop_y_ratio), 0, 0.35),
+	      right_crop_y_ratio: clamp(Number($("stitchRightCropNumber").value || STITCH_DEFAULTS.right_crop_y_ratio), 0, 0.35),
+	      bottom_crop_ratio: clamp(Number($("stitchBottomCropNumber").value || STITCH_DEFAULTS.bottom_crop_ratio), 0, 0.35),
+          sync_offset_sec: clamp(Number($("stitchSyncOffsetNumber").value || STITCH_DEFAULTS.sync_offset_sec), -12, 12),
+	    });
 
     const updateStitchSummary = () => {
       const cfg = getSavedStitching();
       const isDefault = JSON.stringify(cfg) === JSON.stringify(STITCH_DEFAULTS);
-      $("stitchSummary").textContent = isDefault
-        ? "Using default session stitching values."
-        : `Session stitching saved: overlap ${cfg.overlap_ratio.toFixed(3)}, blend ${cfg.seam_blend_ratio.toFixed(3)}, top ${cfg.left_crop_y_ratio.toFixed(3)}/${cfg.right_crop_y_ratio.toFixed(3)}, bottom ${cfg.bottom_crop_ratio.toFixed(3)}.`;
+	      $("stitchSummary").textContent = isDefault
+	        ? "Using default session stitching values."
+	        : `Session stitching saved: overlap ${cfg.overlap_ratio.toFixed(3)}, blend ${cfg.seam_blend_ratio.toFixed(3)}, top ${cfg.left_crop_y_ratio.toFixed(3)}/${cfg.right_crop_y_ratio.toFixed(3)}, bottom ${cfg.bottom_crop_ratio.toFixed(3)}, right delay ${cfg.sync_offset_sec.toFixed(1)}s.`;
       $("stitchAppliedLabel").textContent = isDefault
         ? "Current session values match the defaults."
         : "Current session values differ from the defaults and will be used for the next analysis run.";
@@ -2939,7 +3259,7 @@ ANALYSIS_HTML = r"""
       syncStitchSeekBounds();
     };
 
-    const ensureStitchPreviewSession = async () => {
+	    const ensureStitchPreviewSession = async () => {
       const { leftFile, rightFile, filesKey } = getStitchFiles();
       if (!leftFile || !rightFile) {
         resetStitchPreviewSession();
@@ -2961,13 +3281,20 @@ ANALYSIS_HTML = r"""
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
-        const payload = await response.json();
-        stitchPreviewSessionId = payload.session_id || null;
-        stitchPreviewDuration = Math.max(0, Number(payload.duration_sec || 0));
-        stitchPreviewFilesKey = filesKey;
-        stitchCurrentTime = clamp(stitchCurrentTime, 0, stitchPreviewDuration || 0);
-        syncStitchSeekBounds();
-        return Boolean(stitchPreviewSessionId);
+	        const payload = await response.json();
+	        stitchPreviewSessionId = payload.session_id || null;
+	        stitchPreviewDuration = Math.max(0, Number(payload.duration_sec || 0));
+	        stitchPreviewFilesKey = filesKey;
+            if (Math.abs(Number(getSavedStitching().sync_offset_sec || 0)) < 0.05 && Number.isFinite(Number(payload.suggested_sync_offset_sec))) {
+              const nextCfg = {
+                ...getSavedStitching(),
+                sync_offset_sec: clamp(Number(payload.suggested_sync_offset_sec || 0), -12, 12),
+              };
+              setStitchControls(nextCfg);
+            }
+	        stitchCurrentTime = clamp(stitchCurrentTime, 0, stitchPreviewDuration || 0);
+	        syncStitchSeekBounds();
+	        return Boolean(stitchPreviewSessionId);
       } catch (e) {
         resetStitchPreviewSession();
         $("stitchPreviewStatus").textContent = "Stitching preview could not load these videos.";
@@ -3027,15 +3354,16 @@ ANALYSIS_HTML = r"""
       img.src = imageUrl;
     });
 
-    const fetchStitchPreviewFrame = async (view, timeSec, cfg) => {
+	    const fetchStitchPreviewFrame = async (view, timeSec, cfg) => {
       if (!stitchPreviewSessionId) {
         throw new Error("missing preview session");
       }
-      const params = new URLSearchParams({
-        time_sec: String(Math.max(0, timeSec)),
-        view,
-        stitching_config: JSON.stringify(cfg),
-      });
+	      const params = new URLSearchParams({
+	        time_sec: String(Math.max(0, timeSec)),
+	        view,
+	        stitching_config: JSON.stringify(cfg),
+            sync_offset_sec: String(cfg.sync_offset_sec || 0),
+	      });
       const response = await fetch(`/api/analysis/stitch-preview/frame/${encodeURIComponent(stitchPreviewSessionId)}?${params.toString()}`);
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
@@ -3071,7 +3399,7 @@ ANALYSIS_HTML = r"""
         if (token !== stitchPreviewRenderToken) return false;
         await Promise.all(blobs.map((blob, index) => drawPreviewImage(views[index].ctx, views[index].canvas, blob)));
         if (token !== stitchPreviewRenderToken) return false;
-        $("stitchPreviewStatus").textContent = `Preview at ${formatSeconds(timeSec)} with overlap ${cfg.overlap_ratio.toFixed(3)} and blend ${cfg.seam_blend_ratio.toFixed(3)}. The top view matches the stream-style crop, the lower views show full field, seam guide, and final stream look.`;
+	        $("stitchPreviewStatus").textContent = `Preview at ${formatSeconds(timeSec)} with overlap ${cfg.overlap_ratio.toFixed(3)}, blend ${cfg.seam_blend_ratio.toFixed(3)}, right delay ${cfg.sync_offset_sec.toFixed(1)}s. The top view matches the stream-style crop, the lower views show full field, seam guide, and final stream look.`;
         $("stitchTimeLabel").textContent = formatSeconds(timeSec);
         return true;
       } catch (e) {
@@ -3125,12 +3453,12 @@ ANALYSIS_HTML = r"""
       schedule();
     };
 
-    const queueLiveStitchPreview = () => {
-      const cfg = getStitchControls();
-      $("stitchPreviewStatus").textContent = `Updating preview... overlap ${cfg.overlap_ratio.toFixed(3)}, blend ${cfg.seam_blend_ratio.toFixed(3)}.`;
-      syncStitchSeekBounds();
-      queueStitchPreviewRender({ includeSecondary: false });
-      queueStitchPreviewRender({ includeSecondary: true, debounceMs: 180 });
+	    const queueLiveStitchPreview = () => {
+	      const cfg = getStitchControls();
+	      $("stitchPreviewStatus").textContent = `Updating preview... overlap ${cfg.overlap_ratio.toFixed(3)}, blend ${cfg.seam_blend_ratio.toFixed(3)}, right delay ${cfg.sync_offset_sec.toFixed(1)}s.`;
+	      syncStitchSeekBounds();
+	      queueStitchPreviewRender({ includeSecondary: false });
+	      queueStitchPreviewRender({ includeSecondary: true, debounceMs: 180 });
     };
 
     const openStitchModal = async () => {
@@ -3310,6 +3638,12 @@ ANALYSIS_HTML = r"""
         const r = await fetch(`/api/analysis/status/${sid}`);
         if (!r.ok) return;
         const j = await r.json();
+        const syncMode = (j.sync_mode || "off");
+        const syncOffset = Number(j.sync_offset_sec || 0);
+        const syncScore = Number(j.sync_score || 0);
+        const syncLabel = syncMode === "manual"
+          ? `sync:manual ${syncOffset.toFixed(1)}s`
+          : (syncMode === "auto" ? `sync:auto ${syncOffset.toFixed(1)}s` : "sync:off");
         $("stState").textContent = `state:${j.state || "-"}`;
         $("stProg").textContent = `progress:${(j.progress_pct || 0).toFixed(1)}%`;
         $("stFps").textContent = `fps:${(j.fps || 0).toFixed(1)}`;
@@ -3324,9 +3658,12 @@ ANALYSIS_HTML = r"""
         $("stSeg").textContent = `segments:${(j.segments_saved || 0).toFixed(0)}`;
         $("stConf").textContent = `conf:${(j.last_conf || 0).toFixed(2)}`;
         $("stSeen").textContent = `last seen:${j.last_seen_sec == null ? "-" : j.last_seen_sec.toFixed(2) + "s"}`;
+        $("stSync").textContent = syncMode === "auto"
+          ? `${syncLabel} q:${syncScore.toFixed(2)}`
+          : syncLabel;
         if (j.running) {
           const tuneTxt = `imgsz:${j.imgsz || "-"}, detectEvery:${j.detect_every || "-"}`;
-          $("line").textContent = `Analysis running ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 1} stream(s), ${j.device_used || "auto"}, ${tuneTxt})`;
+          $("line").textContent = `Analysis running ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 1} stream(s), ${j.device_used || "auto"}, ${syncLabel}, ${tuneTxt})`;
         }
         if (j.output_url && j.state === "done") {
           $("resultLink").href = j.output_url;
@@ -3344,9 +3681,9 @@ ANALYSIS_HTML = r"""
         $("line").textContent = "Please select at least one camera video.";
         return;
       }
-      const params = new URLSearchParams({
-        conf: $("conf").value,
-        iou: $("iou").value,
+	      const params = new URLSearchParams({
+	        conf: $("conf").value,
+	        iou: $("iou").value,
         model_path: $("modelPath").value,
         device: $("deviceSel").value,
         crop_x: $("cropX").value,
@@ -3354,10 +3691,11 @@ ANALYSIS_HTML = r"""
         crop_w: $("cropW").value,
         crop_h: $("cropH").value,
         analysis_start_min: $("analysisStart").value,
-        analysis_end_min: $("analysisEnd").value,
-        analysis_minutes: $("analysisMinutes").value,
-        stitching_config: JSON.stringify(getSavedStitching()),
-      });
+	        analysis_end_min: $("analysisEnd").value,
+	        analysis_minutes: $("analysisMinutes").value,
+	        stitching_config: JSON.stringify(getSavedStitching()),
+            sync_offset_sec: String(getSavedStitching().sync_offset_sec || 0),
+	      });
       if ($("classId").value !== "") params.set("class_id", $("classId").value);
       const totalBytes = (leftFile ? leftFile.size : 0) + (rightFile ? rightFile.size : 0);
       const form = new FormData();
@@ -3408,18 +3746,16 @@ ANALYSIS_HTML = r"""
     $("analysisStart").oninput = (ev) => syncAnalysisWindow(ev.target, "start");
     $("analysisEndRange").oninput = (ev) => syncAnalysisWindow(ev.target, "end");
     $("analysisEnd").oninput = (ev) => syncAnalysisWindow(ev.target, "end");
-    $("videoFileLeft").onchange = async () => {
-      pauseStitchPlayback();
-      resetStitchPreviewSession();
-      await refreshAnalysisMinutes();
-      await warmUpStitchPreview();
-    };
-    $("videoFileRight").onchange = async () => {
-      pauseStitchPlayback();
-      resetStitchPreviewSession();
-      await refreshAnalysisMinutes();
-      await warmUpStitchPreview();
-    };
+	    $("videoFileLeft").onchange = async () => {
+	      pauseStitchPlayback();
+	      resetStitchPreviewSession();
+	      await refreshAnalysisMinutes();
+	    };
+	    $("videoFileRight").onchange = async () => {
+	      pauseStitchPlayback();
+	      resetStitchPreviewSession();
+	      await refreshAnalysisMinutes();
+	    };
     for (const [rangeId, numberId] of stitchControlMap) {
       syncRangePair(rangeId, numberId, queueLiveStitchPreview);
     }
@@ -5541,6 +5877,7 @@ async def analysis_upload(
     analysis_end_min: float = 0.0,
     analysis_minutes: float = 0.0,
     stitching_config: Optional[str] = None,
+    sync_offset_sec: float = 0.0,
 ):
     del speed_up
     os.makedirs(ANALYSIS_UPLOAD_DIR, exist_ok=True)
@@ -5624,6 +5961,10 @@ async def analysis_upload(
             "analysis_end_min": max(0.0, float(analysis_end_min)),
             "analysis_minutes": max(0.0, float(analysis_minutes)),
             "stitching": stitching,
+            "sync_offset_sec": float(sync_offset_sec or 0.0),
+            "sync_score": 0.0,
+            "sync_mode": "manual" if abs(float(sync_offset_sec or 0.0)) >= 0.05 else "off",
+            "stream_start_offsets": [],
             "running": False,
             "state": "queued",
             "frames": 0.0,
@@ -5690,14 +6031,21 @@ async def analysis_stitch_preview_upload(
                 durations.append(frames / fps)
         cap.release()
     duration_sec = min(durations) if durations else 0.0
-
     with ANALYSIS_LOCK:
         ANALYSIS_PREVIEW_SESSIONS[session_id] = {
             "session_id": session_id,
             "sources": sources,
             "duration_sec": duration_sec,
+            "suggested_sync_offset_sec": 0.0,
+            "suggested_sync_score": 0.0,
         }
-    return {"ok": True, "session_id": session_id, "duration_sec": duration_sec}
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "duration_sec": duration_sec,
+        "suggested_sync_offset_sec": 0.0,
+        "suggested_sync_score": 0.0,
+    }
 
 
 @app.get("/api/analysis/stitch-preview/frame/{session_id}")
@@ -5706,6 +6054,7 @@ def analysis_stitch_preview_frame(
     time_sec: float = 0.0,
     view: str = "main",
     stitching_config: Optional[str] = None,
+    sync_offset_sec: Optional[float] = None,
 ):
     with ANALYSIS_LOCK:
         session = ANALYSIS_PREVIEW_SESSIONS.get(session_id)
@@ -5721,6 +6070,7 @@ def analysis_stitch_preview_frame(
         time_sec=max(0.0, float(time_sec)),
         stitching=stitching,
         view=str(view or "main").strip().lower(),
+        sync_offset_sec=float(sync_offset_sec if sync_offset_sec is not None else session.get("suggested_sync_offset_sec", 0.0) or 0.0),
     )
     if frame is None:
         raise HTTPException(status_code=500, detail="Could not render preview frame")
@@ -5763,6 +6113,10 @@ def analysis_status(session_id: str):
             "analysis_end_min": sess.get("analysis_end_min"),
             "analysis_minutes": sess.get("analysis_minutes"),
             "analysis_limit_sec": sess.get("analysis_limit_sec"),
+            "sync_offset_sec": sess.get("sync_offset_sec"),
+            "sync_score": sess.get("sync_score"),
+            "sync_mode": sess.get("sync_mode"),
+            "stream_start_offsets": sess.get("stream_start_offsets"),
             "render_mode": sess.get("render_mode"),
             "output_path": sess.get("output_path"),
             "output_url": f"/api/analysis/result/{session_id}" if sess.get("output_path") else None,
