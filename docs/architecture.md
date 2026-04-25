@@ -40,6 +40,7 @@ BallScope is designed to run the same application logic on:
   2. detections are mapped into master-canvas coordinates
   3. hypotheses are fused into one shared ball state
   4. a virtual broadcast camera renders the final output from the master canvas
+- Uploaded left/right videos are advanced on a shared playback-time timeline instead of paired by decoded frame number, which keeps variable-frame-rate exports from drifting apart over time.
 - The Analysis UI can now store session-scoped manual stitch overrides for overlap, seam blend width, and left/right top crop alignment; those values feed the same shared master-canvas backend instead of a separate render path.
 - Full-frame reacquire scans preserve original frame resolution. Only ROI follow-up detection is allowed to use a reduced inference size.
 - Missing-ball handling is stateful: `UNKNOWN` -> `TRACKED` -> `HOLD_SHORT` -> `LOST_SHORT` -> `LOST_LONG`, with the virtual camera widening gradually instead of snapping to center.

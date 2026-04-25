@@ -951,6 +951,75 @@ def _analysis_mux_video_with_audio(
     return res.returncode == 0 and os.path.exists(output_path)
 
 
+def _analysis_capture_timestamp_sec(cap: cv2.VideoCapture) -> Optional[float]:
+    try:
+        pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+    except Exception:
+        return None
+    if not np.isfinite(pos_msec) or pos_msec < 0.0:
+        return None
+    return pos_msec / 1000.0
+
+
+def _analysis_read_frame_at_time(runtime: Dict[str, Any], target_sec: float) -> Optional[np.ndarray]:
+    """Advance one capture to the requested playback time and keep its latest frame.
+
+    Dual-camera uploads may be variable-frame-rate files. Pairing frames by
+    decoded frame number makes clips drift apart when their effective frame
+    counts differ. This routine follows each stream's own playback timestamps
+    during sequential decoding, with a frame-index fallback for cameras/files
+    that do not expose usable timestamps.
+    """
+    if runtime.get("ended"):
+        return runtime.get("last_frame")
+
+    cap = runtime["cap"]
+    target_sec = max(0.0, float(target_sec))
+    last_ts = runtime.get("last_ts_sec")
+    last_frame = runtime.get("last_frame")
+
+    if last_frame is not None and last_ts is not None and float(last_ts) >= target_sec:
+        return last_frame
+
+    use_timestamps = bool(runtime.get("use_timestamps", True))
+    fps = max(1e-6, float(runtime.get("fps") or ANALYSIS_TARGET_FPS))
+    fallback_idx = max(0, int(round(target_sec * fps)))
+
+    while not runtime.get("ended"):
+        if not use_timestamps and int(runtime.get("abs_idx", -1)) >= fallback_idx:
+            break
+
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            runtime["ended"] = True
+            break
+
+        abs_idx = int(runtime.get("abs_idx", -1)) + 1
+        runtime["abs_idx"] = abs_idx
+        runtime["last_frame"] = frame
+        last_frame = frame
+
+        ts_sec = _analysis_capture_timestamp_sec(cap)
+        prev_ts = runtime.get("last_ts_sec")
+        if use_timestamps and ts_sec is not None:
+            if prev_ts is not None and ts_sec + 0.250 < float(prev_ts):
+                use_timestamps = False
+                runtime["use_timestamps"] = False
+                runtime["last_ts_sec"] = abs_idx / fps
+            else:
+                runtime["last_ts_sec"] = ts_sec
+                if ts_sec >= target_sec:
+                    break
+        else:
+            use_timestamps = False
+            runtime["use_timestamps"] = False
+            runtime["last_ts_sec"] = abs_idx / fps
+            if abs_idx >= fallback_idx:
+                break
+
+    return runtime.get("last_frame")
+
+
 def _analysis_process_video(session_id: str, video_path: str):
     with ANALYSIS_LOCK:
         session = ANALYSIS_SESSIONS.get(session_id)
@@ -1090,9 +1159,11 @@ def _analysis_process_video(session_id: str, video_path: str):
             "cap": cap,
             "fps": float(fps_list[idx] if idx < len(fps_list) and fps_list[idx] > 0 else ANALYSIS_TARGET_FPS),
             "start_offset_sec": float(stream_start_offsets[idx]) if idx < len(stream_start_offsets) else 0.0,
-            "rel_idx": -1,
+            "abs_idx": -1,
+            "last_ts_sec": None,
             "last_frame": None,
             "ended": False,
+            "use_timestamps": True,
         }
         for idx, cap in enumerate(caps)
     ]
@@ -1185,11 +1256,15 @@ def _analysis_process_video(session_id: str, video_path: str):
     )
 
     try:
-        if start_sec > 0:
+        if start_sec > 0 or any(abs(float(v)) > 0.001 for v in stream_start_offsets):
             for idx, cap in enumerate(caps):
                 try:
                     seek_sec = start_sec + float(stream_start_offsets[idx] if idx < len(stream_start_offsets) else 0.0)
                     cap.set(cv2.CAP_PROP_POS_MSEC, seek_sec * 1000.0)
+                    if idx < len(stream_runtimes):
+                        stream_runtimes[idx]["abs_idx"] = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0) - 1
+                        stream_runtimes[idx]["last_ts_sec"] = None
+                        stream_runtimes[idx]["last_frame"] = None
                 except Exception:
                     pass
         while True:
@@ -1201,19 +1276,10 @@ def _analysis_process_video(session_id: str, video_path: str):
             any_open = False
             timeline_sec = (frame_idx - 1) / max(1.0, src_fps)
             for runtime in stream_runtimes:
-                if runtime["ended"]:
-                    frames.append(None)
-                    continue
-                desired_rel_idx = max(0, int(round((timeline_sec + float(runtime["start_offset_sec"])) * runtime["fps"])))
-                while runtime["rel_idx"] < desired_rel_idx and not runtime["ended"]:
-                    ok, frame = runtime["cap"].read()
-                    if not ok or frame is None:
-                        runtime["ended"] = True
-                        break
-                    runtime["last_frame"] = frame
-                    runtime["rel_idx"] += 1
-                frames.append(runtime["last_frame"])
-                if runtime["last_frame"] is not None:
+                target_sec = start_sec + timeline_sec + float(runtime["start_offset_sec"])
+                frame = _analysis_read_frame_at_time(runtime, target_sec)
+                frames.append(frame)
+                if frame is not None:
                     any_open = True
             if not any_open:
                 break
