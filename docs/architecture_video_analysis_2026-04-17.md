@@ -55,7 +55,7 @@ The output render is produced from a master canvas, not from a single raw stream
 
 ### Phase 1
 - Build a heuristic blended master canvas from left and right sources.
-- Use a configurable overlap ratio and feathered seam.
+- Use a configurable overlap ratio and a broad feathered seam. The default blend is intentionally wider than a hard cut so players crossing the midfield overlap remain visible across the transition.
 - Add mild seam exposure compensation so the overlap is less visibly split.
 - Map detections from each source into master-canvas coordinates.
 - Drive one virtual camera crop over that canvas.

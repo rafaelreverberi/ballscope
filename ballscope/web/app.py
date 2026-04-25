@@ -120,7 +120,7 @@ CAMERA_PRESET_FILE = Path(os.getenv("BALLSCOPE_CAMERA_PRESET_FILE", "camera_pres
 CAMERA_PRESET_LOCK = threading.Lock()
 ANALYSIS_STITCHING_DEFAULTS: Dict[str, float] = {
     "overlap_ratio": 0.525,
-    "seam_blend_ratio": 0.01,
+    "seam_blend_ratio": 0.065,
     "left_crop_y_ratio": 0.01,
     "right_crop_y_ratio": 0.07,
     "bottom_crop_ratio": MasterCanvasConfig.base_bottom_crop_ratio,
@@ -3129,8 +3129,8 @@ ANALYSIS_HTML = r"""
           <div>
             <label>Blend Width</label>
             <div class="range-value">
-              <input id="stitchBlend" type="range" min="0" max="0.12" step="0.0025" value="0.02"/>
-              <input id="stitchBlendNumber" class="mini" type="number" min="0" max="0.12" step="0.0025" value="0.02"/>
+              <input id="stitchBlend" type="range" min="0" max="0.12" step="0.0025" value="0.065"/>
+              <input id="stitchBlendNumber" class="mini" type="number" min="0" max="0.12" step="0.0025" value="0.065"/>
             </div>
           </div>
           <div>
@@ -3200,10 +3200,10 @@ ANALYSIS_HTML = r"""
     let timer = null;
     let modelMetaByPath = {};
     let maxAnalysisMinutes = 0;
-    const STITCH_STORAGE_KEY = "ballscope-analysis-stitching";
+    const STITCH_STORAGE_KEY = "ballscope-analysis-stitching-v2";
 	    const STITCH_DEFAULTS = {
 	      overlap_ratio: 0.525,
-	      seam_blend_ratio: 0.01,
+	      seam_blend_ratio: 0.065,
 	      left_crop_y_ratio: 0.01,
 	      right_crop_y_ratio: 0.07,
 	      bottom_crop_ratio: 0.12,
@@ -3231,7 +3231,7 @@ ANALYSIS_HTML = r"""
     const formatSeconds = (value) => `${Math.max(0, Number(value || 0)).toFixed(1)}s`;
 	    const stitchControlMap = [
 	      ["stitchOverlap", "stitchOverlapNumber", "overlap_ratio", 0.525],
-	      ["stitchBlend", "stitchBlendNumber", "seam_blend_ratio", 0.01],
+	      ["stitchBlend", "stitchBlendNumber", "seam_blend_ratio", 0.065],
 	      ["stitchLeftCrop", "stitchLeftCropNumber", "left_crop_y_ratio", 0.01],
 	      ["stitchRightCrop", "stitchRightCropNumber", "right_crop_y_ratio", 0.07],
 	      ["stitchBottomCrop", "stitchBottomCropNumber", "bottom_crop_ratio", 0.12],

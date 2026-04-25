@@ -156,6 +156,7 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 ## Analysis Workspace
 - The `Analysis` page accepts separate `Left Camera` and `Right Camera` uploads.
 - The `Set Up Stitching` action opens a stitched preview player for the selected left/right uploads so overlap, blend width, and vertical crop alignment can be tuned before starting analysis.
+- The default stitch uses a wider feathered seam so players crossing the midfield overlap do not hit a hard 1-camera cut.
 - Saved stitching values stay active for the current browser session and are sent into the same dual-camera analysis pipeline on both Apple Silicon macOS and Jetson.
 - Dual-source analysis advances each upload by playback time, not by matching decoded frame numbers, so variable-frame-rate left/right files do not drift apart during longer analysis runs.
 - The Stitching modal also exposes a manual `Right Delay (sec)` control. Positive values mean the right clip starts later and should be shifted forward to match the left clip.

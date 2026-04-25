@@ -12,13 +12,13 @@ class MasterCanvasConfig:
     overlap_ratio: float = 0.44
     min_overlap_ratio: float = 0.22
     max_overlap_ratio: float = 0.68
-    seam_blend_ratio: float = 0.02
+    seam_blend_ratio: float = 0.06
     search_width: int = 960
     max_vertical_shift_ratio: float = 0.08
     color_gain_min: float = 0.88
     color_gain_max: float = 1.14
-    min_blend_px: int = 4
-    max_blend_px: int = 16
+    min_blend_px: int = 8
+    max_blend_px: int = 160
     orb_features: int = 3000
     base_top_crop_ratio: float = 0.06
     base_bottom_crop_ratio: float = 0.12
@@ -44,6 +44,28 @@ class MasterCanvasLayout:
     blend_end_x: int
 
 
+def compute_seam_blend_width(overlap_px: int, config: MasterCanvasConfig) -> int:
+    if overlap_px <= 0 or config.seam_blend_ratio <= 0.0:
+        return 0
+    blend_width = int(round(overlap_px * config.seam_blend_ratio))
+    return max(config.min_blend_px, min(config.max_blend_px, max(1, blend_width)))
+
+
+def compute_seam_blend_bounds(overlap_x1: int, overlap_x2: int, seam_x: int, blend_width: int) -> Tuple[int, int]:
+    if blend_width <= 0:
+        seam_x = max(overlap_x1, min(seam_x, overlap_x2))
+        return seam_x, seam_x
+    blend_start_x = seam_x - (blend_width // 2)
+    blend_end_x = blend_start_x + blend_width
+    if blend_start_x < overlap_x1:
+        blend_start_x = overlap_x1
+        blend_end_x = min(overlap_x2, blend_start_x + blend_width)
+    if blend_end_x > overlap_x2:
+        blend_end_x = overlap_x2
+        blend_start_x = max(overlap_x1, blend_end_x - blend_width)
+    return blend_start_x, blend_end_x
+
+
 def compute_master_canvas_layout(
     left_shape: Tuple[int, int],
     right_shape: Tuple[int, int],
@@ -56,11 +78,9 @@ def compute_master_canvas_layout(
     right_offset_x = max(0, left_w - overlap_px)
     width = max(left_w, right_offset_x + right_w)
     height = min(left_h, right_h)
-    blend_width = int(round(overlap_px * config.seam_blend_ratio))
-    blend_width = max(config.min_blend_px, min(config.max_blend_px, max(1, blend_width)))
+    blend_width = compute_seam_blend_width(overlap_px, config)
     seam_x = right_offset_x + (overlap_px // 2)
-    blend_start_x = max(right_offset_x, seam_x - (blend_width // 2))
-    blend_end_x = min(right_offset_x + overlap_px, blend_start_x + blend_width)
+    blend_start_x, blend_end_x = compute_seam_blend_bounds(right_offset_x, right_offset_x + overlap_px, seam_x, blend_width)
     return MasterCanvasLayout(
         width=width,
         height=max(1, height),
@@ -255,11 +275,9 @@ def estimate_master_canvas_layout(
     height = max(1, height)
 
     width = max(left.shape[1], right_offset_x + right.shape[1])
-    blend_width = int(round(overlap_px * cfg.seam_blend_ratio))
-    blend_width = max(cfg.min_blend_px, min(cfg.max_blend_px, max(1, blend_width)))
+    blend_width = compute_seam_blend_width(overlap_px, cfg)
     seam_x = right_offset_x + (overlap_px // 2)
-    blend_start_x = max(right_offset_x, seam_x - (blend_width // 2))
-    blend_end_x = min(right_offset_x + overlap_px, blend_start_x + blend_width)
+    blend_start_x, blend_end_x = compute_seam_blend_bounds(right_offset_x, right_offset_x + overlap_px, seam_x, blend_width)
     layout = MasterCanvasLayout(
         width=width,
         height=height,
@@ -322,11 +340,9 @@ def _apply_layout_overrides(
         max(1, right_h - right_crop_y - right_bottom_crop),
     )
     width = max(left_w, right_offset_x + right_w)
-    blend_width = int(round(overlap_px * cfg.seam_blend_ratio))
-    blend_width = max(cfg.min_blend_px, min(cfg.max_blend_px, max(1, blend_width)))
+    blend_width = compute_seam_blend_width(overlap_px, cfg)
     seam_x = right_offset_x + (overlap_px // 2)
-    blend_start_x = max(right_offset_x, seam_x - (blend_width // 2))
-    blend_end_x = min(right_offset_x + overlap_px, blend_start_x + blend_width)
+    blend_start_x, blend_end_x = compute_seam_blend_bounds(right_offset_x, right_offset_x + overlap_px, seam_x, blend_width)
     return MasterCanvasLayout(
         width=width,
         height=height,
@@ -417,9 +433,9 @@ def assemble_master_canvas(
     if use_layout.right_offset_x > 0:
         canvas[:, :use_layout.right_offset_x] = left[:, :use_layout.right_offset_x]
 
-    seam_x = use_layout.seam_x
-    blend_start = max(overlap_x1, min(use_layout.blend_start_x, overlap_x2))
-    blend_end = max(blend_start, min(use_layout.blend_end_x, overlap_x2))
+    seam_x = max(overlap_x1, min(use_layout.seam_x, overlap_x2))
+    blend_width = max(0, use_layout.blend_end_x - use_layout.blend_start_x)
+    blend_start, blend_end = compute_seam_blend_bounds(overlap_x1, overlap_x2, seam_x, blend_width)
 
     left_only_rel = max(0, blend_start - overlap_x1)
     blend_start_rel = max(0, blend_start - overlap_x1)

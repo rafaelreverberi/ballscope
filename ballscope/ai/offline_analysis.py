@@ -13,6 +13,8 @@ from .master_canvas import (
     MasterCanvasConfig,
     MasterCanvasLayout,
     assemble_master_canvas,
+    compute_seam_blend_bounds,
+    compute_seam_blend_width,
     estimate_master_canvas_layout,
     map_box_to_master,
     map_point_to_master,
@@ -1012,10 +1014,8 @@ def calibrate_master_layout(
         width = max(left_w, right_offset_x + right_w)
         height = max(1, min(left_h - left_crop_y, right_h - right_crop_y))
         seam_x = right_offset_x + (overlap_px // 2)
-        blend_width = int(round(overlap_px * cfg.seam_blend_ratio))
-        blend_width = max(cfg.min_blend_px, min(cfg.max_blend_px, max(1, blend_width)))
-        blend_start_x = max(right_offset_x, seam_x - (blend_width // 2))
-        blend_end_x = min(right_offset_x + overlap_px, blend_start_x + blend_width)
+        blend_width = compute_seam_blend_width(overlap_px, cfg)
+        blend_start_x, blend_end_x = compute_seam_blend_bounds(right_offset_x, right_offset_x + overlap_px, seam_x, blend_width)
         return MasterCanvasLayout(
             width=width,
             height=height,
