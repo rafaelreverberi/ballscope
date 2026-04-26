@@ -119,7 +119,7 @@ ANALYSIS_ENCODE_PRESET = "slow"
 CAMERA_PRESET_FILE = Path(os.getenv("BALLSCOPE_CAMERA_PRESET_FILE", "camera_presets.json"))
 CAMERA_PRESET_LOCK = threading.Lock()
 ANALYSIS_STITCHING_DEFAULTS: Dict[str, float] = {
-    "overlap_ratio": 0.525,
+    "overlap_ratio": 0.522,
     "seam_blend_ratio": 0.065,
     "left_crop_y_ratio": 0.01,
     "right_crop_y_ratio": 0.07,
@@ -3122,8 +3122,8 @@ ANALYSIS_HTML = r"""
           <div>
             <label>Overlap</label>
             <div class="range-value">
-              <input id="stitchOverlap" type="range" min="0.22" max="0.68" step="0.005" value="0.44"/>
-              <input id="stitchOverlapNumber" class="mini" type="number" min="0.22" max="0.68" step="0.005" value="0.44"/>
+              <input id="stitchOverlap" type="range" min="0.22" max="0.68" step="0.001" value="0.44"/>
+              <input id="stitchOverlapNumber" class="mini" type="number" min="0.22" max="0.68" step="0.001" value="0.44"/>
             </div>
           </div>
           <div>
@@ -3202,7 +3202,7 @@ ANALYSIS_HTML = r"""
     let maxAnalysisMinutes = 0;
     const STITCH_STORAGE_KEY = "ballscope-analysis-stitching-v2";
 	    const STITCH_DEFAULTS = {
-	      overlap_ratio: 0.525,
+	      overlap_ratio: 0.522,
 	      seam_blend_ratio: 0.065,
 	      left_crop_y_ratio: 0.01,
 	      right_crop_y_ratio: 0.07,
@@ -3230,7 +3230,7 @@ ANALYSIS_HTML = r"""
     const clamp = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
     const formatSeconds = (value) => `${Math.max(0, Number(value || 0)).toFixed(1)}s`;
 	    const stitchControlMap = [
-	      ["stitchOverlap", "stitchOverlapNumber", "overlap_ratio", 0.525],
+	      ["stitchOverlap", "stitchOverlapNumber", "overlap_ratio", 0.522],
 	      ["stitchBlend", "stitchBlendNumber", "seam_blend_ratio", 0.065],
 	      ["stitchLeftCrop", "stitchLeftCropNumber", "left_crop_y_ratio", 0.01],
 	      ["stitchRightCrop", "stitchRightCropNumber", "right_crop_y_ratio", 0.07],
