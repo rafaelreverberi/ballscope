@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse, Response
 
 from ballscope.config import (
@@ -217,6 +217,38 @@ def _analysis_stitching_config_from_query(raw: Optional[str]) -> Dict[str, float
     if not isinstance(parsed, dict):
         parsed = {}
     return _analysis_stitching_config_from_values(parsed)
+
+
+def _analysis_ignore_zones_from_query(raw: Optional[str]) -> List[Dict[str, Any]]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    zones = parsed.get("zones") if isinstance(parsed, dict) else parsed
+    if not isinstance(zones, list):
+        return []
+    clean: List[Dict[str, Any]] = []
+    for zone in zones[:24]:
+        if not isinstance(zone, dict):
+            continue
+        points = zone.get("points")
+        if not isinstance(points, list) or len(points) < 3:
+            continue
+        clean_points = []
+        for point in points[:160]:
+            if not isinstance(point, dict):
+                continue
+            try:
+                x = max(0.0, min(1.0, float(point.get("x", 0.0))))
+                y = max(0.0, min(1.0, float(point.get("y", 0.0))))
+            except Exception:
+                continue
+            clean_points.append({"x": x, "y": y})
+        if len(clean_points) >= 3:
+            clean.append({"points": clean_points})
+    return clean
 
 
 def _analysis_master_canvas_config(session: Dict[str, Any]) -> MasterCanvasConfig:
@@ -1044,6 +1076,7 @@ def _analysis_process_video(session_id: str, video_path: str):
     device_pref = str(session.get("device", "auto"))
     device_use = _analysis_resolve_device(device_pref)
     crop = session.get("crop") or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+    ignore_zones = list(session.get("ignore_zones") or [])
     source_entries = list(session.get("sources") or [])
     analysis_minutes = max(0.0, float(session.get("analysis_minutes", 0.0) or 0.0))
     analysis_start_min = max(0.0, float(session.get("analysis_start_min", 0.0) or 0.0))
@@ -1226,6 +1259,7 @@ def _analysis_process_video(session_id: str, video_path: str):
         ANALYSIS_SESSIONS[session_id]["render_mode"] = "master-canvas" if dual_master_mode else "single-stream"
         ANALYSIS_SESSIONS[session_id]["fusion_mode"] = "per-camera-master-fusion"
         ANALYSIS_SESSIONS[session_id]["stitching"] = _analysis_stitching_config_from_values(session.get("stitching"))
+        ANALYSIS_SESSIONS[session_id]["ignore_zone_count"] = len(ignore_zones)
 
     proc_times = deque(maxlen=50)
     frame_idx = 0
@@ -1252,6 +1286,7 @@ def _analysis_process_video(session_id: str, video_path: str):
             target_output_size=None,
             master_canvas_config=master_canvas_cfg,
             target_fps=src_fps,
+            ignore_zones=ignore_zones,
         )
     )
 
@@ -2793,6 +2828,7 @@ ANALYSIS_HTML = r"""
     .inline-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
     .inline-actions button { width:auto; margin-top:0; }
     .stitch-summary { margin-top:10px; color:var(--muted); font-size:12px; font-family:"JetBrains Mono", monospace; }
+    .deadpoint-summary { margin-top:10px; color:var(--muted); font-size:12px; font-family:"JetBrains Mono", monospace; }
     .modal-backdrop {
       position: fixed;
       inset: 0;
@@ -2818,6 +2854,10 @@ ANALYSIS_HTML = r"""
         var(--panel);
       box-shadow: inset 0 1px 0 rgba(255,255,255,.06), var(--shadow);
     }
+    .modal-card.deadpoint-card {
+      width: min(1680px, calc(100vw - 20px));
+      max-height: calc(100vh - 20px);
+    }
     .modal-head {
       display:flex;
       justify-content:space-between;
@@ -2835,6 +2875,9 @@ ANALYSIS_HTML = r"""
       grid-template-columns: minmax(0, 1.5fr) minmax(300px, .9fr);
       gap: 14px;
     }
+    .modal-grid.deadpoint-grid {
+      grid-template-columns: minmax(0, 1fr) 300px;
+    }
     .modal-stage {
       border-radius:16px;
       overflow:hidden;
@@ -2851,6 +2894,36 @@ ANALYSIS_HTML = r"""
       width:100%;
       height:100%;
       display:block;
+    }
+    .draw-stage {
+      position: relative;
+      cursor: crosshair;
+      touch-action: none;
+    }
+    .deadpoint-stage {
+      height: min(74vh, 920px);
+      aspect-ratio: auto;
+    }
+    .draw-toolbar {
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      align-items:center;
+      margin-top:10px;
+    }
+    .draw-toolbar button {
+      width:auto;
+      margin-top:0;
+    }
+    .zoom-control {
+      display:flex;
+      align-items:center;
+      gap:8px;
+      min-width: min(100%, 360px);
+    }
+    .zoom-control input[type="range"] {
+      width: 180px;
+      padding: 0;
     }
     .preview-grid {
       display:grid;
@@ -3024,8 +3097,11 @@ ANALYSIS_HTML = r"""
         <div class="inline-actions">
           <button id="stitchSetupBtn" class="secondary" type="button">Set Up Stitching</button>
           <button id="stitchResetBtn" class="secondary" type="button">Reset Stitching</button>
+          <button id="deadpointSetupBtn" class="secondary" type="button">Setup Deadpoints</button>
+          <button id="deadpointResetBtn" class="secondary" type="button">Reset Deadpoints</button>
         </div>
         <div class="stitch-summary" id="stitchSummary">Using default session stitching values.</div>
+        <div class="deadpoint-summary" id="deadpointSummary">No AI ignore zones saved for this browser session.</div>
         <label>Analysis Window (minutes)</label>
         <div class="row">
           <div>
@@ -3073,6 +3149,7 @@ ANALYSIS_HTML = r"""
           <div class="chip" id="stConf">conf:0</div>
           <div class="chip" id="stSeen">last seen:-</div>
           <div class="chip" id="stSync">sync:-</div>
+          <div class="chip" id="stDeadpoints">deadpoints:0</div>
         </div>
         <div style="margin-top:12px;">
           <a id="resultLink" class="result-link" href="#">Download Result MP4</a>
@@ -3173,6 +3250,53 @@ ANALYSIS_HTML = r"""
       </div>
     </div>
   </div>
+  <div id="deadpointModal" class="modal-backdrop" aria-hidden="true">
+    <div class="modal-card deadpoint-card">
+      <div class="modal-head">
+        <div>
+          <h3 style="margin:0;">Setup Deadpoints</h3>
+          <p>Draw fixed image areas where AI detections should be ignored. Saved zones apply to the full master image before broadcast zoom.</p>
+        </div>
+        <button id="deadpointCloseBtn" class="secondary" type="button">Close</button>
+      </div>
+      <div class="modal-grid deadpoint-grid">
+        <div>
+          <div class="modal-stage draw-stage deadpoint-stage">
+            <canvas id="deadpointCanvas" width="1920" height="1080"></canvas>
+          </div>
+          <div class="draw-toolbar">
+            <button id="deadpointUndoPointBtn" class="secondary" type="button">Undo Point</button>
+            <button id="deadpointFinishBtn" class="secondary" type="button">Finish Zone</button>
+            <button id="deadpointUndoZoneBtn" class="secondary" type="button">Undo Zone</button>
+            <button id="deadpointClearBtn" class="secondary" type="button">Clear</button>
+            <div class="zoom-control">
+              <button id="deadpointZoomOutBtn" class="secondary" type="button">Zoom -</button>
+              <input id="deadpointZoomRange" type="range" min="1" max="16" step="0.25" value="1"/>
+              <button id="deadpointZoomInBtn" class="secondary" type="button">Zoom +</button>
+              <button id="deadpointZoomResetBtn" class="secondary" type="button">Reset View</button>
+            </div>
+          </div>
+          <div class="status" id="deadpointStatus">Choose both left and right videos, then draw around static false-positive areas.</div>
+        </div>
+        <div class="control-grid">
+          <div class="preview-card">
+            <h4>Drawing</h4>
+            <div class="preview-copy">Click or drag points around a fixed false-positive area. Finish Zone closes the polygon. Zones are saved normalized to the full stitched image, so the later camera zoom can move freely.</div>
+          </div>
+          <div class="preview-card">
+            <h4>Active Zones</h4>
+            <div class="preview-copy" id="deadpointList">No zones saved.</div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <div class="status" id="deadpointSaveStatus">Deadpoints stay active for the current browser session.</div>
+        <div class="inline-actions">
+          <button id="deadpointSaveBtn" type="button">Save Deadpoints</button>
+        </div>
+      </div>
+    </div>
+  </div>
   <script>
     (() => {
       const KEY = "ballscope-theme";
@@ -3201,6 +3325,7 @@ ANALYSIS_HTML = r"""
     let modelMetaByPath = {};
     let maxAnalysisMinutes = 0;
     const STITCH_STORAGE_KEY = "ballscope-analysis-stitching-v2";
+    const DEADPOINT_STORAGE_KEY = "ballscope-analysis-deadpoints-v1";
 	    const STITCH_DEFAULTS = {
 	      overlap_ratio: 0.522,
 	      seam_blend_ratio: 0.065,
@@ -3217,6 +3342,8 @@ ANALYSIS_HTML = r"""
     const stitchCtxClean = stitchCanvasClean.getContext("2d");
     const stitchCtxGuide = stitchCanvasGuide.getContext("2d");
     const stitchCtxZoom = stitchCanvasZoom.getContext("2d");
+    const deadpointCanvas = $("deadpointCanvas");
+    const deadpointCtx = deadpointCanvas.getContext("2d");
     let stitchPlaybackTimer = null;
     let stitchPreviewSessionId = null;
     let stitchPreviewDuration = 0;
@@ -3226,6 +3353,11 @@ ANALYSIS_HTML = r"""
     let stitchRenderInFlight = false;
     let stitchQueuedRender = null;
     let stitchSecondaryTimer = null;
+    let deadpointZones = [];
+    let deadpointDraft = [];
+    let deadpointImage = null;
+    let deadpointImageMeta = null;
+    let deadpointView = { zoom: 1, panX: 0.5, panY: 0.5 };
 
     const clamp = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
     const formatSeconds = (value) => `${Math.max(0, Number(value || 0)).toFixed(1)}s`;
@@ -3420,6 +3552,180 @@ ANALYSIS_HTML = r"""
       img.src = imageUrl;
     });
 
+    const getSavedDeadpoints = () => {
+      try {
+        const raw = sessionStorage.getItem(DEADPOINT_STORAGE_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        const zones = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.zones) ? parsed.zones : []);
+        return zones
+          .map((zone) => ({
+            points: Array.isArray(zone?.points)
+              ? zone.points
+                  .map((p) => ({ x: clamp(Number(p?.x ?? 0), 0, 1), y: clamp(Number(p?.y ?? 0), 0, 1) }))
+                  .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
+              : [],
+          }))
+          .filter((zone) => zone.points.length >= 3);
+      } catch (e) {
+        return [];
+      }
+    };
+
+    const updateDeadpointSummary = () => {
+      const savedCount = getSavedDeadpoints().length;
+      const activeCount = deadpointZones.length;
+      $("deadpointSummary").textContent = savedCount
+        ? `${savedCount} AI ignore zone${savedCount === 1 ? "" : "s"} saved for this browser session.`
+        : "No AI ignore zones saved for this browser session.";
+      $("deadpointList").textContent = activeCount
+        ? `${activeCount} closed zone${activeCount === 1 ? "" : "s"} ready. Current draft points: ${deadpointDraft.length}.`
+        : `No closed zones. Current draft points: ${deadpointDraft.length}.`;
+    };
+
+    const clampDeadpointView = () => {
+      deadpointView.zoom = clamp(Number(deadpointView.zoom || 1), 1, 16);
+      if (!deadpointImageMeta) {
+        deadpointView.panX = 0.5;
+        deadpointView.panY = 0.5;
+        return;
+      }
+      const drawW = deadpointImageMeta.baseW * deadpointView.zoom;
+      const drawH = deadpointImageMeta.baseH * deadpointView.zoom;
+      if (drawW <= deadpointCanvas.width) deadpointView.panX = 0.5;
+      else {
+        const marginX = deadpointCanvas.width / (2 * drawW);
+        deadpointView.panX = clamp(deadpointView.panX, marginX, 1 - marginX);
+      }
+      if (drawH <= deadpointCanvas.height) deadpointView.panY = 0.5;
+      else {
+        const marginY = deadpointCanvas.height / (2 * drawH);
+        deadpointView.panY = clamp(deadpointView.panY, marginY, 1 - marginY);
+      }
+    };
+
+    const deadpointImageRect = () => {
+      if (!deadpointImageMeta) return { x: 0, y: 0, w: deadpointCanvas.width, h: deadpointCanvas.height };
+      clampDeadpointView();
+      const drawW = deadpointImageMeta.baseW * deadpointView.zoom;
+      const drawH = deadpointImageMeta.baseH * deadpointView.zoom;
+      return {
+        x: Math.round(deadpointCanvas.width / 2 - deadpointView.panX * drawW),
+        y: Math.round(deadpointCanvas.height / 2 - deadpointView.panY * drawH),
+        w: drawW,
+        h: drawH,
+      };
+    };
+
+    const setDeadpointZoom = (zoom, anchor = null) => {
+      if (anchor && deadpointImageMeta) {
+        const before = deadpointImageRect();
+        const nx = clamp((anchor.x - before.x) / before.w, 0, 1);
+        const ny = clamp((anchor.y - before.y) / before.h, 0, 1);
+        deadpointView.zoom = clamp(Number(zoom || 1), 1, 16);
+        const afterW = deadpointImageMeta.baseW * deadpointView.zoom;
+        const afterH = deadpointImageMeta.baseH * deadpointView.zoom;
+        deadpointView.panX = (deadpointCanvas.width / 2 - anchor.x + nx * afterW) / afterW;
+        deadpointView.panY = (deadpointCanvas.height / 2 - anchor.y + ny * afterH) / afterH;
+      } else {
+        deadpointView.zoom = clamp(Number(zoom || 1), 1, 16);
+      }
+      clampDeadpointView();
+      $("deadpointZoomRange").value = String(deadpointView.zoom);
+      drawDeadpoints();
+    };
+
+    const drawDeadpoints = () => {
+      deadpointCtx.clearRect(0, 0, deadpointCanvas.width, deadpointCanvas.height);
+      deadpointCtx.fillStyle = "rgba(8, 12, 18, 1)";
+      deadpointCtx.fillRect(0, 0, deadpointCanvas.width, deadpointCanvas.height);
+      const rect = deadpointImageRect();
+      if (deadpointImage) {
+        deadpointCtx.drawImage(deadpointImage, rect.x, rect.y, rect.w, rect.h);
+      } else {
+        deadpointCtx.fillStyle = "rgba(255,255,255,0.72)";
+        deadpointCtx.font = "24px Rubik";
+        deadpointCtx.textAlign = "center";
+        deadpointCtx.fillText("Deadpoint setup waits for both videos.", deadpointCanvas.width / 2, deadpointCanvas.height / 2);
+      }
+      const drawZone = (points, closed) => {
+        if (!points.length) return;
+        deadpointCtx.beginPath();
+        points.forEach((p, index) => {
+          const x = rect.x + p.x * rect.w;
+          const y = rect.y + p.y * rect.h;
+          if (index === 0) deadpointCtx.moveTo(x, y);
+          else deadpointCtx.lineTo(x, y);
+        });
+        if (closed) deadpointCtx.closePath();
+        if (closed) {
+          deadpointCtx.fillStyle = "rgba(255, 75, 75, 0.22)";
+          deadpointCtx.fill();
+        }
+        deadpointCtx.strokeStyle = closed ? "rgba(255, 120, 120, 0.95)" : "rgba(103, 214, 255, 0.95)";
+        deadpointCtx.lineWidth = 3;
+        deadpointCtx.stroke();
+        deadpointCtx.fillStyle = "rgba(255,255,255,0.92)";
+        for (const p of points) {
+          deadpointCtx.beginPath();
+          deadpointCtx.arc(rect.x + p.x * rect.w, rect.y + p.y * rect.h, 4, 0, Math.PI * 2);
+          deadpointCtx.fill();
+        }
+      };
+      for (const zone of deadpointZones) drawZone(zone.points || [], true);
+      drawZone(deadpointDraft, false);
+    };
+
+    const canvasPointerToDeadpoint = (ev) => {
+      const bounds = deadpointCanvas.getBoundingClientRect();
+      const rect = deadpointImageRect();
+      const sx = deadpointCanvas.width / Math.max(1, bounds.width);
+      const sy = deadpointCanvas.height / Math.max(1, bounds.height);
+      const x = (ev.clientX - bounds.left) * sx;
+      const y = (ev.clientY - bounds.top) * sy;
+      if (x < rect.x || x > rect.x + rect.w || y < rect.y || y > rect.y + rect.h) return null;
+      return { x: clamp((x - rect.x) / rect.w, 0, 1), y: clamp((y - rect.y) / rect.h, 0, 1) };
+    };
+
+    const loadDeadpointFrame = async () => {
+      if (!(await ensureStitchPreviewSession())) {
+        deadpointImage = null;
+        deadpointImageMeta = null;
+        drawDeadpoints();
+        $("deadpointStatus").textContent = "Choose both left and right videos first.";
+        return false;
+      }
+      try {
+        const blob = await fetchStitchPreviewFrame("full", stitchCurrentTime || 0, getSavedStitching());
+        const imageUrl = URL.createObjectURL(blob);
+        const img = new Image();
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = reject;
+          img.src = imageUrl;
+        });
+        const scale = Math.min(deadpointCanvas.width / img.width, deadpointCanvas.height / img.height);
+        const drawW = Math.max(1, Math.round(img.width * scale));
+        const drawH = Math.max(1, Math.round(img.height * scale));
+        deadpointImage = img;
+        deadpointImageMeta = {
+          baseW: drawW,
+          baseH: drawH,
+        };
+        deadpointView = { zoom: Number($("deadpointZoomRange").value || 1), panX: 0.5, panY: 0.5 };
+        clampDeadpointView();
+        URL.revokeObjectURL(imageUrl);
+        drawDeadpoints();
+        $("deadpointStatus").textContent = "Draw around fixed false-positive areas. Use Preview Zoom or mouse wheel for detail work.";
+        return true;
+      } catch (e) {
+        deadpointImage = null;
+        deadpointImageMeta = null;
+        drawDeadpoints();
+        $("deadpointStatus").textContent = "Deadpoint preview could not load this frame.";
+        return false;
+      }
+    };
+
 	    const fetchStitchPreviewFrame = async (view, timeSec, cfg) => {
       if (!stitchPreviewSessionId) {
         throw new Error("missing preview session");
@@ -3540,6 +3846,32 @@ ANALYSIS_HTML = r"""
       pauseStitchPlayback();
       $("stitchModal").classList.remove("open");
       $("stitchModal").setAttribute("aria-hidden", "true");
+    };
+
+    const openDeadpointModal = async () => {
+      pauseStitchPlayback();
+      deadpointZones = getSavedDeadpoints();
+      deadpointDraft = [];
+      updateDeadpointSummary();
+      $("deadpointModal").classList.add("open");
+      $("deadpointModal").setAttribute("aria-hidden", "false");
+      await loadDeadpointFrame();
+    };
+
+    const closeDeadpointModal = () => {
+      $("deadpointModal").classList.remove("open");
+      $("deadpointModal").setAttribute("aria-hidden", "true");
+    };
+
+    const saveDeadpointsForSession = () => {
+      if (deadpointDraft.length >= 3) {
+        deadpointZones.push({ points: deadpointDraft.slice() });
+        deadpointDraft = [];
+      }
+      sessionStorage.setItem(DEADPOINT_STORAGE_KEY, JSON.stringify(deadpointZones));
+      updateDeadpointSummary();
+      drawDeadpoints();
+      $("deadpointSaveStatus").textContent = `${deadpointZones.length} deadpoint zone${deadpointZones.length === 1 ? "" : "s"} saved for this browser session.`;
     };
 
     const setAnalysisMinutesLimits = (minutes) => {
@@ -3727,6 +4059,7 @@ ANALYSIS_HTML = r"""
         $("stSync").textContent = syncMode === "auto"
           ? `${syncLabel} q:${syncScore.toFixed(2)}`
           : syncLabel;
+        $("stDeadpoints").textContent = `deadpoints:${j.ignore_zone_count || 0}`;
         if (j.running) {
           const tuneTxt = `imgsz:${j.imgsz || "-"}, detectEvery:${j.detect_every || "-"}`;
           $("line").textContent = `Analysis running ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 1} stream(s), ${j.device_used || "auto"}, ${syncLabel}, ${tuneTxt})`;
@@ -3767,6 +4100,7 @@ ANALYSIS_HTML = r"""
       const form = new FormData();
       if (leftFile) form.append("left_video", leftFile);
       if (rightFile) form.append("right_video", rightFile);
+      form.append("ignore_zones", JSON.stringify({ zones: getSavedDeadpoints() }));
       $("line").textContent = `Uploading ... (0 / ${Math.max(1, Math.round(totalBytes / (1024 * 1024)))} MB)`;
       try {
         const j = await new Promise((resolve, reject) => {
@@ -3830,6 +4164,70 @@ ANALYSIS_HTML = r"""
     $("stitchModal").addEventListener("click", (ev) => {
       if (ev.target === $("stitchModal")) closeStitchModal();
     });
+    $("deadpointSetupBtn").addEventListener("click", openDeadpointModal);
+    $("deadpointCloseBtn").addEventListener("click", closeDeadpointModal);
+    $("deadpointModal").addEventListener("click", (ev) => {
+      if (ev.target === $("deadpointModal")) closeDeadpointModal();
+    });
+    $("deadpointResetBtn").addEventListener("click", () => {
+      sessionStorage.removeItem(DEADPOINT_STORAGE_KEY);
+      deadpointZones = [];
+      deadpointDraft = [];
+      updateDeadpointSummary();
+      drawDeadpoints();
+    });
+    deadpointCanvas.addEventListener("pointerdown", (ev) => {
+      const point = canvasPointerToDeadpoint(ev);
+      if (!point) return;
+      deadpointDraft.push(point);
+      updateDeadpointSummary();
+      drawDeadpoints();
+    });
+    deadpointCanvas.addEventListener("wheel", (ev) => {
+      ev.preventDefault();
+      const bounds = deadpointCanvas.getBoundingClientRect();
+      const anchor = {
+        x: (ev.clientX - bounds.left) * (deadpointCanvas.width / Math.max(1, bounds.width)),
+        y: (ev.clientY - bounds.top) * (deadpointCanvas.height / Math.max(1, bounds.height)),
+      };
+      const factor = ev.deltaY < 0 ? 1.35 : 1 / 1.35;
+      setDeadpointZoom(deadpointView.zoom * factor, anchor);
+    }, { passive: false });
+    $("deadpointZoomOutBtn").addEventListener("click", () => setDeadpointZoom(deadpointView.zoom / 1.5));
+    $("deadpointZoomInBtn").addEventListener("click", () => setDeadpointZoom(deadpointView.zoom * 1.5));
+    $("deadpointZoomResetBtn").addEventListener("click", () => {
+      deadpointView = { zoom: 1, panX: 0.5, panY: 0.5 };
+      setDeadpointZoom(1);
+    });
+    $("deadpointZoomRange").addEventListener("input", (ev) => setDeadpointZoom(Number(ev.target.value || 1)));
+    $("deadpointUndoPointBtn").addEventListener("click", () => {
+      deadpointDraft.pop();
+      updateDeadpointSummary();
+      drawDeadpoints();
+    });
+    $("deadpointFinishBtn").addEventListener("click", () => {
+      if (deadpointDraft.length >= 3) {
+        deadpointZones.push({ points: deadpointDraft.slice() });
+        deadpointDraft = [];
+        $("deadpointStatus").textContent = "Zone closed. Save Deadpoints to use it in the next analysis.";
+      } else {
+        $("deadpointStatus").textContent = "Add at least three points before finishing a zone.";
+      }
+      updateDeadpointSummary();
+      drawDeadpoints();
+    });
+    $("deadpointUndoZoneBtn").addEventListener("click", () => {
+      deadpointZones.pop();
+      updateDeadpointSummary();
+      drawDeadpoints();
+    });
+    $("deadpointClearBtn").addEventListener("click", () => {
+      deadpointZones = [];
+      deadpointDraft = [];
+      updateDeadpointSummary();
+      drawDeadpoints();
+    });
+    $("deadpointSaveBtn").addEventListener("click", saveDeadpointsForSession);
     $("stitchResetBtn").addEventListener("click", () => {
       sessionStorage.removeItem(STITCH_STORAGE_KEY);
       updateStitchSummary();
@@ -3880,6 +4278,8 @@ ANALYSIS_HTML = r"""
     setAnalysisMinutesLimits(0);
     setStitchControls(getSavedStitching());
     updateStitchSummary();
+    updateDeadpointSummary();
+    drawDeadpoints();
     loadModels();
     loadDevices();
   </script>
@@ -5943,6 +6343,7 @@ async def analysis_upload(
     analysis_end_min: float = 0.0,
     analysis_minutes: float = 0.0,
     stitching_config: Optional[str] = None,
+    ignore_zones: Optional[str] = Form(default=None),
     sync_offset_sec: float = 0.0,
 ):
     del speed_up
@@ -6009,6 +6410,7 @@ async def analysis_upload(
     if crop["y"] + crop["h"] > 1.0:
         crop["h"] = max(0.05, 1.0 - crop["y"])
     stitching = _analysis_stitching_config_from_query(stitching_config)
+    analysis_ignore_zones = _analysis_ignore_zones_from_query(ignore_zones)
 
     with ANALYSIS_LOCK:
         ANALYSIS_SESSIONS[session_id] = {
@@ -6027,6 +6429,7 @@ async def analysis_upload(
             "analysis_end_min": max(0.0, float(analysis_end_min)),
             "analysis_minutes": max(0.0, float(analysis_minutes)),
             "stitching": stitching,
+            "ignore_zones": analysis_ignore_zones,
             "sync_offset_sec": float(sync_offset_sec or 0.0),
             "sync_score": 0.0,
             "sync_mode": "manual" if abs(float(sync_offset_sec or 0.0)) >= 0.05 else "off",
@@ -6058,7 +6461,7 @@ async def analysis_upload(
     thread.start()
     print(
         f"[analysis] job started sid={session_id} model={model_path} class_id={class_id} "
-        f"device={device} zoom={zoom} sources={','.join(item['label'] for item in sources)}"
+        f"device={device} zoom={zoom} ignore_zones={len(analysis_ignore_zones)} sources={','.join(item['label'] for item in sources)}"
     )
     return {"ok": True, "session_id": session_id}
 
@@ -6183,6 +6586,7 @@ def analysis_status(session_id: str):
             "sync_score": sess.get("sync_score"),
             "sync_mode": sess.get("sync_mode"),
             "stream_start_offsets": sess.get("stream_start_offsets"),
+            "ignore_zone_count": sess.get("ignore_zone_count", 0),
             "render_mode": sess.get("render_mode"),
             "output_path": sess.get("output_path"),
             "output_url": f"/api/analysis/result/{session_id}" if sess.get("output_path") else None,

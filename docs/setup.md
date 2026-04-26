@@ -79,6 +79,7 @@ Open `Analysis` from the home screen for offline post-processing.
 Notes:
 - The page accepts separate `Left Camera` and `Right Camera` video uploads.
 - The `Set Up Stitching` button opens a local stitched preview for the selected uploads so overlap, blend width, and left/right crop alignment can be adjusted before analysis starts.
+- The `Setup Deadpoints` button opens a drawing view for full-field AI ignore zones. Use it to mask fixed false positives before starting analysis.
 - Saved stitch values apply to the current browser session only; if you keep the defaults, the standard automatic BallScope stitch behavior is used unchanged.
 - Dual-source analysis advances each upload by playback time, not by matching decoded frame numbers, so variable-frame-rate left/right files do not drift apart during longer analysis runs.
 - If the clip starts are still offset on a specific pair, use the `Right Delay (sec)` control in the Stitching modal. Positive values mean the right upload should be read later than the left upload.
@@ -87,6 +88,7 @@ Notes:
 - Model selection is automatic by checkpoint type. BallScope distinguishes YOLO checkpoints from RF-DETR checkpoints and uses the matching backend.
 - `models/ballscope-ai.pt` is the default analysis model and is treated as RF-DETR.
 - Dual-camera analysis runs per-camera detection first, fuses ball hypotheses in master-canvas space, and renders the final output from the master canvas.
+- Offline camera movement starts on the first plausible ball instead of the center, moves through a slower lock/reacquire controller, and zooms in more when the detected ball is small.
 - Full-frame reacquire scans preserve original frame resolution; only ROI follow-up passes are allowed to use a reduced inference size.
 - The analysis preview shows fused state, field side, live zoom factor, and the master-canvas debug view.
 - Short ball losses are handled by bounded prediction plus phased virtual-camera widening, so the crop does not jump to center immediately.

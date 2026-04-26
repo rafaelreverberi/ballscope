@@ -156,6 +156,7 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 ## Analysis Workspace
 - The `Analysis` page accepts separate `Left Camera` and `Right Camera` uploads.
 - The `Set Up Stitching` action opens a stitched preview player for the selected left/right uploads so overlap, blend width, and vertical crop alignment can be tuned before starting analysis.
+- The `Setup Deadpoints` action lets you draw full-field AI ignore zones for static false positives. Saved zones are applied before the final broadcast crop/zoom, so they remain stable while the analysis camera moves.
 - The default stitch uses a wider feathered seam so players crossing the midfield overlap do not hit a hard 1-camera cut.
 - Saved stitching values stay active for the current browser session and are sent into the same dual-camera analysis pipeline on both Apple Silicon macOS and Jetson.
 - Dual-source analysis advances each upload by playback time, not by matching decoded frame numbers, so variable-frame-rate left/right files do not drift apart during longer analysis runs.
@@ -165,6 +166,7 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 - BallScope detects whether a model is a YOLO checkpoint or an RF-DETR checkpoint and uses the matching runtime automatically.
 - `models/ballscope-ai.pt` is detected as RF-DETR and is the default analysis model.
 - Dual-camera analysis is per-camera first: left/right detections stay separate, are fused in master-canvas space, and the final broadcast crop is rendered from the master canvas.
+- Offline camera movement starts directly on the first plausible ball, holds briefly on short losses, requires confirmation before large jumps, and adjusts zoom gradually from ball scale.
 - Full-frame global reacquire scans keep original frame resolution so small-ball detectability is not destroyed by downscaling.
 - Short ball losses are handled with bounded prediction and phased camera behavior (`TRACKED`, `HOLD_SHORT`, `LOST_SHORT`, `LOST_LONG`, `UNKNOWN`) so the view widens gradually instead of snapping away.
 

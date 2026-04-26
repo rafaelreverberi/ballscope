@@ -87,6 +87,7 @@ class CameraViewState:
     shot_target_center: Optional[tuple[float, float]] = None
     shot_target_zoom: float = 1.0
     last_shot_update_frame: int = 0
+    snapped_to_first_detection: bool = False
 
 
 @dataclass
@@ -106,6 +107,7 @@ class OfflineAnalysisEngineConfig:
     target_output_size: Optional[tuple[int, int]]
     master_canvas_config: MasterCanvasConfig = field(default_factory=MasterCanvasConfig)
     target_fps: float = 30.0
+    ignore_zones: Sequence[Dict[str, object]] = field(default_factory=tuple)
 
 
 @dataclass
@@ -198,8 +200,9 @@ class OfflineAnalysisEngine:
         self.max_ball_speed_px_per_sec = 0.42 * 1920.0
         self.large_jump_confirm_frames = max(2, int(round(config.target_fps * 0.18)))
         self.shot_hold_frames = max(24, int(round(config.target_fps * 2.2)))
-        self.shot_break_distance_px = 220.0
-        self.shot_break_distance_y_px = 140.0
+        self.shot_break_distance_px = 300.0
+        self.shot_break_distance_y_px = 190.0
+        self.initial_lock_min_confidence = max(0.16, min(0.72, config.conf * 1.15))
 
     def process_frame(
         self,
@@ -567,6 +570,7 @@ class OfflineAnalysisEngine:
         render_shape: tuple[int, int],
         master_layout: Optional[MasterCanvasLayout],
     ) -> Optional[StreamHypothesis]:
+        hypotheses = [item for item in hypotheses if not self._hypothesis_in_ignore_zone(item, render_shape)]
         if not hypotheses:
             self._advance_lost_state(frame_idx)
             return None
@@ -622,6 +626,8 @@ class OfflineAnalysisEngine:
         detections: Sequence[StreamHypothesis],
     ) -> bool:
         if self.fused.last_safe_center is None or self.fused.last_seen_frame is None:
+            if best.detection.confidence < self.initial_lock_min_confidence:
+                return False
             self.fused.pending_center = None
             self.fused.pending_box = None
             self.fused.pending_frames = 0
@@ -784,7 +790,16 @@ class OfflineAnalysisEngine:
         proposed_center = tactical_center
         proposed_zoom = 1.0
         if self.fused.phase == "TRACKED" and best is not None:
-            lead = 0.04
+            if not self.camera.snapped_to_first_detection:
+                self.camera.center = best.master_center
+                self.camera.velocity = (0.0, 0.0)
+                self.camera.shot_target_center = best.master_center
+                self.camera.shot_target_zoom = self._tracked_zoom(best, render_shape)
+                self.camera.zoom = self.camera.shot_target_zoom
+                self.camera.last_shot_update_frame = frame_idx
+                self.camera.snapped_to_first_detection = True
+                return
+            lead = 0.02
             proposed_center = self._comfortable_tracking_center(best, render_shape, lead)
             proposed_zoom = self._tracked_zoom(best, render_shape)
         elif self.fused.phase == "HOLD_SHORT":
@@ -806,17 +821,17 @@ class OfflineAnalysisEngine:
         target_zoom = self.camera.shot_target_zoom
 
         cx, cy = self.camera.center
-        deadzone = max(18.0, min(w, h) * 0.055)
+        deadzone = max(24.0, min(w, h) * 0.075)
         dx = target_center[0] - cx
         dy = target_center[1] - cy
         if abs(dx) < deadzone:
             dx = 0.0
         if abs(dy) < deadzone:
             dy = 0.0
-        accel = max(2.5, min(w, h) * 0.005)
+        accel = max(1.7, min(w, h) * 0.0034)
         self.camera.velocity = (
-            max(-accel, min(accel, self.camera.velocity[0] * 0.94 + dx * 0.028)),
-            max(-accel, min(accel, self.camera.velocity[1] * 0.94 + dy * 0.028)),
+            max(-accel, min(accel, self.camera.velocity[0] * 0.965 + dx * 0.016)),
+            max(-accel, min(accel, self.camera.velocity[1] * 0.965 + dy * 0.016)),
         )
         if self.fused.phase in {"LOST_LONG", "UNKNOWN"}:
             self.camera.velocity = (self.camera.velocity[0] * 0.84, self.camera.velocity[1] * 0.84)
@@ -824,7 +839,7 @@ class OfflineAnalysisEngine:
             float(cx + self.camera.velocity[0]),
             float(cy + self.camera.velocity[1]),
         )
-        zoom_alpha = 0.008 if self.fused.phase == "TRACKED" else 0.012
+        zoom_alpha = 0.006 if self.fused.phase == "TRACKED" else 0.010
         self.camera.zoom = float(max(1.0, min(4.0, self.camera.zoom * (1.0 - zoom_alpha) + target_zoom * zoom_alpha)))
         self.camera.center = (
             float(max(0.0, min(w, self.camera.center[0]))),
@@ -868,10 +883,10 @@ class OfflineAnalysisEngine:
             best.master_center[0] + self.fused.velocity[0] * lead,
             best.master_center[1] + self.fused.velocity[1] * lead,
         )
-        safe_half_w = view_w * 0.14
-        safe_half_h = view_h * 0.12
-        edge_half_w = view_w * 0.36
-        edge_half_h = view_h * 0.32
+        safe_half_w = view_w * 0.12
+        safe_half_h = view_h * 0.10
+        edge_half_w = view_w * 0.43
+        edge_half_h = view_h * 0.38
         dx = predicted_ball[0] - current_center[0]
         dy = predicted_ball[1] - current_center[1]
         target_x = current_center[0]
@@ -889,16 +904,51 @@ class OfflineAnalysisEngine:
     def _tracked_zoom(self, best: StreamHypothesis, render_shape: tuple[int, int]) -> float:
         box = best.master_box
         area_ratio = _area_ratio(box, render_shape)
-        zoom = 1.18
-        if area_ratio < 0.00014:
-            zoom += 0.35
+        zoom = 1.24
+        if area_ratio < 0.00010:
+            zoom += 0.58
+        elif area_ratio < 0.00018:
+            zoom += 0.44
         elif area_ratio < 0.00028:
-            zoom += 0.22
+            zoom += 0.30
         elif area_ratio < 0.00055:
-            zoom += 0.10
+            zoom += 0.16
         if best.detection.confidence < 0.55:
             zoom -= 0.18
-        return max(1.0, min(1.55, zoom))
+        return max(1.0, min(1.88, zoom))
+
+    def _hypothesis_in_ignore_zone(self, hypothesis: StreamHypothesis, render_shape: tuple[int, int]) -> bool:
+        h, w = render_shape
+        if h <= 0 or w <= 0:
+            return False
+        x = hypothesis.master_center[0] / float(w)
+        y = hypothesis.master_center[1] / float(h)
+        for zone in self.config.ignore_zones or ():
+            points = zone.get("points") if isinstance(zone, dict) else None
+            if not isinstance(points, list) or len(points) < 3:
+                continue
+            polygon: List[tuple[float, float]] = []
+            for point in points:
+                if not isinstance(point, dict):
+                    continue
+                px = max(0.0, min(1.0, float(point.get("x", 0.0))))
+                py = max(0.0, min(1.0, float(point.get("y", 0.0))))
+                polygon.append((px, py))
+            if len(polygon) >= 3 and self._point_in_polygon(x, y, polygon):
+                return True
+        return False
+
+    @staticmethod
+    def _point_in_polygon(x: float, y: float, polygon: Sequence[tuple[float, float]]) -> bool:
+        inside = False
+        j = len(polygon) - 1
+        for i, (xi, yi) in enumerate(polygon):
+            xj, yj = polygon[j]
+            intersects = ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / max(1e-9, yj - yi) + xi)
+            if intersects:
+                inside = not inside
+            j = i
+        return inside
 
     def _render_virtual_camera(self, render_base: np.ndarray) -> np.ndarray:
         h, w = render_base.shape[:2]
@@ -950,6 +1000,7 @@ class OfflineAnalysisEngine:
             cv2.circle(vis, (sx, sy), 10, (255, 220, 60), 2)
         if master_layout is not None:
             cv2.line(vis, (master_layout.seam_x, 0), (master_layout.seam_x, vis.shape[0]), (220, 200, 60), 1)
+        self._draw_ignore_zones(vis)
         cx, cy = self.camera.center or (vis.shape[1] / 2.0, vis.shape[0] / 2.0)
         win_w = max(1, int(round(self.output_size[0] / max(1.0, self.camera.zoom)))) if self.output_size else vis.shape[1]
         win_h = max(1, int(round(self.output_size[1] / max(1.0, self.camera.zoom)))) if self.output_size else vis.shape[0]
@@ -966,6 +1017,27 @@ class OfflineAnalysisEngine:
             2,
         )
         return vis
+
+    def _draw_ignore_zones(self, vis: np.ndarray) -> None:
+        h, w = vis.shape[:2]
+        for zone in self.config.ignore_zones or ():
+            points = zone.get("points") if isinstance(zone, dict) else None
+            if not isinstance(points, list) or len(points) < 3:
+                continue
+            pts = []
+            for point in points:
+                if not isinstance(point, dict):
+                    continue
+                pts.append([
+                    _clamp_int(int(round(float(point.get("x", 0.0)) * w)), 0, max(0, w - 1)),
+                    _clamp_int(int(round(float(point.get("y", 0.0)) * h)), 0, max(0, h - 1)),
+                ])
+            if len(pts) >= 3:
+                arr = np.array(pts, dtype=np.int32)
+                overlay = vis.copy()
+                cv2.fillPoly(overlay, [arr], (35, 35, 180))
+                cv2.addWeighted(overlay, 0.18, vis, 0.82, 0, dst=vis)
+                cv2.polylines(vis, [arr], True, (70, 110, 255), 2)
 
 
 def calibrate_master_layout(
