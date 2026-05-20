@@ -1052,6 +1052,307 @@ def _analysis_read_frame_at_time(runtime: Dict[str, Any], target_sec: float) -> 
     return runtime.get("last_frame")
 
 
+def _analysis_preview_downscale(frame: np.ndarray, max_w: int = 1280) -> np.ndarray:
+    if frame is None or frame.size == 0:
+        return frame
+    h, w = frame.shape[:2]
+    if w <= max_w:
+        return frame
+    scale = max_w / float(max(1, w))
+    target_h = max(1, int(round(h * scale)))
+    return cv2.resize(frame, (max_w, target_h), interpolation=cv2.INTER_AREA)
+
+
+def _analysis_even_frame(frame: np.ndarray) -> np.ndarray:
+    h, w = frame.shape[:2]
+    even_h = h - (h % 2)
+    even_w = w - (w % 2)
+    if even_h <= 0 or even_w <= 0:
+        return frame
+    if even_h == h and even_w == w:
+        return frame
+    return frame[:even_h, :even_w]
+
+
+def _analysis_process_stitch_only(session_id: str, video_path: str):
+    with ANALYSIS_LOCK:
+        session = ANALYSIS_SESSIONS.get(session_id)
+    if not session:
+        return
+
+    source_entries = list(session.get("sources") or [])
+    analysis_minutes = max(0.0, float(session.get("analysis_minutes", 0.0) or 0.0))
+    analysis_start_min = max(0.0, float(session.get("analysis_start_min", 0.0) or 0.0))
+    analysis_end_min = max(0.0, float(session.get("analysis_end_min", 0.0) or 0.0))
+    preview_stride = max(1, int(session.get("preview_stride", 1)))
+
+    with ANALYSIS_LOCK:
+        ANALYSIS_SESSIONS[session_id]["running"] = True
+        ANALYSIS_SESSIONS[session_id]["state"] = "preparing-stitch"
+        ANALYSIS_SESSIONS[session_id]["model_backend"] = "none"
+        ANALYSIS_SESSIONS[session_id]["device_used"] = "none"
+
+    os.makedirs(ANALYSIS_RESULT_DIR, exist_ok=True)
+    source_paths: List[str] = [str(entry.get("path")) for entry in source_entries if entry.get("path")]
+    source_labels: List[str] = [str(entry.get("label") or f"stream-{idx + 1}") for idx, entry in enumerate(source_entries) if entry.get("path")]
+
+    caps: List[cv2.VideoCapture] = []
+    open_labels: List[str] = []
+    for idx, path in enumerate(source_paths):
+        cap = cv2.VideoCapture(path)
+        if cap.isOpened():
+            caps.append(cap)
+            open_labels.append(str(source_labels[idx] if idx < len(source_labels) else f"stream-{idx + 1}").strip().lower())
+        else:
+            cap.release()
+    source_labels = open_labels
+
+    if len(caps) < 2 or not {"left", "right"}.issubset(set(source_labels)):
+        for cap in caps:
+            cap.release()
+        with ANALYSIS_LOCK:
+            ANALYSIS_SESSIONS[session_id]["running"] = False
+            ANALYSIS_SESSIONS[session_id]["state"] = "error"
+            ANALYSIS_SESSIONS[session_id]["last_error"] = "Stitch only requires both left and right camera videos."
+        return
+
+    fps_list = [(cap.get(cv2.CAP_PROP_FPS) or ANALYSIS_TARGET_FPS) for cap in caps]
+    frame_count_list = [int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) for cap in caps]
+    master_canvas_cfg = _analysis_master_canvas_config(session)
+    src_fps = max([f for f in fps_list if f > 0] or [ANALYSIS_TARGET_FPS])
+    duration_list = [n / f for n, f in zip(frame_count_list, fps_list) if n > 0 and f > 0]
+    media_duration_sec = min(duration_list or [0.0])
+    start_sec = max(0.0, analysis_start_min * 60.0)
+    if media_duration_sec > 0:
+        start_sec = min(start_sec, max(0.0, media_duration_sec - 0.25))
+    end_sec = analysis_end_min * 60.0 if analysis_end_min > 0 else 0.0
+    if end_sec <= 0.0 and analysis_minutes > 0:
+        end_sec = start_sec + (analysis_minutes * 60.0)
+    if media_duration_sec > 0 and end_sec > 0.0:
+        end_sec = min(end_sec, media_duration_sec)
+    if end_sec > 0.0 and end_sec <= start_sec:
+        end_sec = min(media_duration_sec, start_sec + 60.0) if media_duration_sec > 0 else (start_sec + 60.0)
+    requested_limit_sec = max(0.0, end_sec - start_sec) if end_sec > 0.0 else max(0.0, media_duration_sec - start_sec if media_duration_sec > 0 else 0.0)
+
+    sync_offset_sec = float(session.get("sync_offset_sec", 0.0) or 0.0)
+    stream_start_offsets = [0.0 for _ in caps]
+    left_idx = source_labels.index("left")
+    right_idx = source_labels.index("right")
+    if sync_offset_sec >= 0.0:
+        stream_start_offsets[right_idx] = sync_offset_sec
+    else:
+        stream_start_offsets[left_idx] = -sync_offset_sec
+
+    aligned_duration_candidates = []
+    for idx, dur in enumerate(duration_list):
+        trim = float(stream_start_offsets[idx]) if idx < len(stream_start_offsets) else 0.0
+        aligned_duration_candidates.append(max(0.0, dur - start_sec - trim))
+    aligned_duration_sec = min(aligned_duration_candidates or [0.0])
+    stitch_limit_sec = requested_limit_sec if requested_limit_sec > 0.0 else aligned_duration_sec
+    if aligned_duration_sec > 0.0 and stitch_limit_sec > 0.0:
+        stitch_limit_sec = min(stitch_limit_sec, aligned_duration_sec)
+    total_frames = int(round(stitch_limit_sec * src_fps)) if stitch_limit_sec > 0 and src_fps > 0 else 0
+
+    stream_runtimes = [
+        {
+            "cap": cap,
+            "fps": float(fps_list[idx] if idx < len(fps_list) and fps_list[idx] > 0 else ANALYSIS_TARGET_FPS),
+            "start_offset_sec": float(stream_start_offsets[idx]) if idx < len(stream_start_offsets) else 0.0,
+            "abs_idx": -1,
+            "last_ts_sec": None,
+            "last_frame": None,
+            "ended": False,
+            "use_timestamps": True,
+        }
+        for idx, cap in enumerate(caps)
+    ]
+
+    master_layout_fixed = calibrate_master_layout(
+        left_path=source_paths[left_idx],
+        right_path=source_paths[right_idx],
+        left_start_sec=start_sec + float(stream_start_offsets[left_idx]),
+        right_start_sec=start_sec + float(stream_start_offsets[right_idx]),
+        media_duration_sec=min(
+            (duration_list[left_idx] if left_idx < len(duration_list) else media_duration_sec),
+            (duration_list[right_idx] if right_idx < len(duration_list) else media_duration_sec),
+        ),
+        config=master_canvas_cfg,
+    )
+
+    segment_dir = os.path.join(ANALYSIS_RESULT_DIR, f"stitch_{session_id}_parts")
+    os.makedirs(segment_dir, exist_ok=True)
+    stitched_avi = os.path.join(segment_dir, f"{session_id}_stitched.avi")
+    stem = Path(source_paths[left_idx] if source_paths else video_path).stem
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    final_mp4 = os.path.join(ANALYSIS_RESULT_DIR, f"{stem}_stitch_only_{ts}_{session_id}.mp4")
+
+    with ANALYSIS_LOCK:
+        sess = ANALYSIS_SESSIONS[session_id]
+        sess["state"] = "stitching"
+        sess["input_fps"] = float(src_fps)
+        sess["total_frames"] = float(total_frames)
+        sess["analysis_limit_sec"] = stitch_limit_sec if stitch_limit_sec > 0 else None
+        sess["sync_offset_sec"] = sync_offset_sec
+        sess["sync_score"] = 1.0 if abs(sync_offset_sec) >= 0.05 else 0.0
+        sess["sync_mode"] = "manual" if abs(sync_offset_sec) >= 0.05 else "off"
+        sess["stream_start_offsets"] = [float(v) for v in stream_start_offsets]
+        sess["progress_pct"] = 0.0
+        sess["eta_sec"] = None
+        sess["stream_count"] = len(caps)
+        sess["detect_every"] = None
+        sess["imgsz"] = None
+        sess["output_path"] = None
+        sess["recovery_dir"] = segment_dir
+        sess["focus_stream_label"] = "stitched"
+        sess["render_mode"] = "stitch-only-master-canvas"
+        sess["fusion_mode"] = "none"
+        sess["stitching"] = _analysis_stitching_config_from_values(session.get("stitching"))
+        sess["ignore_zone_count"] = 0
+
+    proc_times = deque(maxlen=50)
+    frame_idx = 0
+    writer = None
+    output_size = None
+    segment_paths: List[str] = []
+    segment_frames = max(120, int(src_fps * 8))
+    segment_frame_count = 0
+    segment_index = 0
+
+    try:
+        if start_sec > 0 or any(abs(float(v)) > 0.001 for v in stream_start_offsets):
+            for idx, cap in enumerate(caps):
+                try:
+                    seek_sec = start_sec + float(stream_start_offsets[idx] if idx < len(stream_start_offsets) else 0.0)
+                    cap.set(cv2.CAP_PROP_POS_MSEC, seek_sec * 1000.0)
+                    if idx < len(stream_runtimes):
+                        stream_runtimes[idx]["abs_idx"] = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0) - 1
+                        stream_runtimes[idx]["last_ts_sec"] = None
+                        stream_runtimes[idx]["last_frame"] = None
+                except Exception:
+                    pass
+        while True:
+            t0 = time.time()
+            if total_frames > 0 and frame_idx >= total_frames:
+                break
+            frame_idx += 1
+            frames: List[Optional[np.ndarray]] = []
+            any_open = False
+            timeline_sec = (frame_idx - 1) / max(1.0, src_fps)
+            for runtime in stream_runtimes:
+                target_sec = start_sec + timeline_sec + float(runtime["start_offset_sec"])
+                frame = _analysis_read_frame_at_time(runtime, target_sec)
+                frames.append(frame)
+                if frame is not None:
+                    any_open = True
+            if not any_open:
+                break
+
+            master_frame, master_layout = build_master_frame(
+                frames=frames,
+                source_labels=source_labels,
+                layout=master_layout_fixed,
+                config=master_canvas_cfg,
+            )
+            if master_layout_fixed is None and master_layout is not None:
+                master_layout_fixed = master_layout
+            if master_frame is None:
+                continue
+
+            render_frame = _analysis_even_frame(master_frame)
+            if output_size is None:
+                output_size = (render_frame.shape[1], render_frame.shape[0])
+            if writer is None and output_size is not None:
+                segment_path = os.path.join(segment_dir, f"part_{segment_index:04d}.avi")
+                writer = cv2.VideoWriter(
+                    segment_path,
+                    cv2.VideoWriter_fourcc(*"MJPG"),
+                    float(src_fps),
+                    output_size,
+                )
+                if writer is not None:
+                    segment_paths.append(segment_path)
+                    segment_frame_count = 0
+                    segment_index += 1
+            if writer is not None:
+                writer.write(render_frame)
+                segment_frame_count += 1
+                if segment_frame_count >= segment_frames:
+                    writer.release()
+                    writer = None
+
+            proc_times.append(time.time() - t0)
+            fps_proc = 1.0 / max(1e-6, (sum(proc_times) / len(proc_times))) if proc_times else 0.0
+            with ANALYSIS_LOCK:
+                sess = ANALYSIS_SESSIONS.get(session_id)
+                if not sess:
+                    break
+                publish_preview = (frame_idx % preview_stride) == 0 or sess.get("frame") is None or sess.get("frame_master") is None
+                sess["frames"] = float(sess.get("frames", 0.0) + 1.0)
+                sess["detections"] = 0.0
+                sess["fps"] = fps_proc
+                sess["last_conf"] = 0.0
+                sess["state"] = "stitching"
+                sess["last_seen_sec"] = None
+                sess["focus_stream_label"] = "stitched"
+                sess["view_half"] = "full"
+                sess["field_side"] = "full"
+                sess["zoom_live"] = 1.0
+                sess["fusion_sources"] = []
+                if total_frames > 0:
+                    done = float(sess["frames"])
+                    sess["progress_pct"] = min(100.0, (done / float(total_frames)) * 100.0)
+                    sess["eta_sec"] = ((float(total_frames) - done) / fps_proc) if fps_proc > 0 and done < total_frames else 0.0
+                if publish_preview:
+                    preview = _analysis_preview_downscale(render_frame, max_w=1280)
+                    sess["frame"] = preview
+                    sess["frame_master"] = preview
+    except Exception as exc:
+        with ANALYSIS_LOCK:
+            sess = ANALYSIS_SESSIONS.get(session_id)
+            if sess is not None:
+                sess["state"] = "error"
+                sess["last_error"] = str(exc)
+    finally:
+        for cap in caps:
+            cap.release()
+        if writer is not None:
+            writer.release()
+        stitched_ok = _analysis_concat_segments(segment_paths, stitched_avi)
+        audio_source_path = None
+        audio_trim_sec = start_sec
+        for idx, path in enumerate(source_paths):
+            if _analysis_has_audio_stream(path):
+                audio_source_path = path
+                audio_trim_sec = start_sec + float(stream_start_offsets[idx] if idx < len(stream_start_offsets) else 0.0)
+                break
+        if audio_source_path is None and _analysis_has_audio_stream(video_path):
+            audio_source_path = video_path
+            audio_trim_sec = start_sec
+        if stitched_ok:
+            _analysis_mux_video_with_audio(
+                video_path=stitched_avi,
+                output_path=final_mp4,
+                audio_source_path=audio_source_path,
+                audio_trim_sec=audio_trim_sec,
+            )
+        if not os.path.exists(final_mp4) and stitched_ok:
+            try:
+                shutil.copyfile(stitched_avi, final_mp4)
+            except Exception:
+                pass
+        with ANALYSIS_LOCK:
+            sess = ANALYSIS_SESSIONS.get(session_id)
+            if sess is not None:
+                sess["running"] = False
+                if sess.get("state") != "error":
+                    sess["state"] = "done"
+                sess["progress_pct"] = 100.0 if os.path.exists(final_mp4) else sess.get("progress_pct", 0.0)
+                sess["eta_sec"] = 0.0 if os.path.exists(final_mp4) else sess.get("eta_sec")
+                sess["output_path"] = final_mp4 if os.path.exists(final_mp4) else None
+                sess["segments_saved"] = len(segment_paths)
+        print(f"[analysis] stitch-only job finished sid={session_id} output={final_mp4 if os.path.exists(final_mp4) else 'none'}")
+
+
 def _analysis_process_video(session_id: str, video_path: str):
     with ANALYSIS_LOCK:
         session = ANALYSIS_SESSIONS.get(session_id)
@@ -2827,6 +3128,24 @@ ANALYSIS_HTML = r"""
     .result-link:hover { border-color: var(--stroke-strong); background: color-mix(in srgb, var(--panel-2) 84%, var(--accent-2) 16%); }
     .inline-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
     .inline-actions button { width:auto; margin-top:0; }
+    .mode-toggle {
+      display:grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap:8px;
+      margin: 8px 0 12px;
+    }
+    .mode-toggle button {
+      margin-top:0;
+      border-color: var(--stroke);
+      background: color-mix(in srgb, var(--panel-2) 92%, transparent);
+      color: var(--text);
+    }
+    .mode-toggle button.active {
+      border-color: color-mix(in srgb, var(--accent-2) 58%, var(--stroke) 42%);
+      background: color-mix(in srgb, var(--accent-2) 72%, #2a63d7 28%);
+      color: var(--btn-text);
+    }
+    .hidden { display:none !important; }
     .stitch-summary { margin-top:10px; color:var(--muted); font-size:12px; font-family:"JetBrains Mono", monospace; }
     .deadpoint-summary { margin-top:10px; color:var(--muted); font-size:12px; font-family:"JetBrains Mono", monospace; }
     .modal-backdrop {
@@ -3016,6 +3335,7 @@ ANALYSIS_HTML = r"""
     @media (max-width: 680px) {
       .row { grid-template-columns: 1fr; }
       .stats { grid-template-columns: 1fr; }
+      .mode-toggle { grid-template-columns: 1fr; }
       .card { padding: 12px; }
     }
   </style>
@@ -3034,6 +3354,12 @@ ANALYSIS_HTML = r"""
     <section class="grid">
       <div class="card">
         <h3>Inputs + Crop</h3>
+        <label>Mode</label>
+        <div class="mode-toggle" role="group" aria-label="Analysis mode">
+          <button id="modeAnalysisBtn" type="button" class="active">AI Analysis</button>
+          <button id="modeStitchOnlyBtn" type="button">Stitch Only</button>
+        </div>
+        <div class="status" id="modeHint">Runs ball detection, smart crop, and broadcast zoom.</div>
         <div class="row">
           <div>
             <label>Left Camera</label>
@@ -3044,7 +3370,7 @@ ANALYSIS_HTML = r"""
             <input id="videoFileRight" type="file" accept="video/*"/>
           </div>
         </div>
-        <div class="row">
+        <div class="row ai-only">
           <div>
             <label>Class</label>
             <select id="classId">
@@ -3056,7 +3382,7 @@ ANALYSIS_HTML = r"""
             <input id="conf" type="number" value="0.18" step="0.01" min="0" max="1"/>
           </div>
         </div>
-        <div class="row">
+        <div class="row ai-only">
           <div>
             <label>IOU</label>
             <input id="iou" type="number" value="0.35" step="0.01" min="0" max="1"/>
@@ -3066,7 +3392,7 @@ ANALYSIS_HTML = r"""
             <select id="modelPath"></select>
           </div>
         </div>
-        <div class="row">
+        <div class="row ai-only">
           <div>
             <label>Device</label>
             <select id="deviceSel">
@@ -3075,7 +3401,7 @@ ANALYSIS_HTML = r"""
           </div>
           <div></div>
         </div>
-        <div class="row">
+        <div class="row ai-only">
           <div>
             <label>Zoom Output</label>
             <div class="status" style="margin-top:8px;">Automatic broadcast zoom is always on.</div>
@@ -3097,11 +3423,11 @@ ANALYSIS_HTML = r"""
         <div class="inline-actions">
           <button id="stitchSetupBtn" class="secondary" type="button">Set Up Stitching</button>
           <button id="stitchResetBtn" class="secondary" type="button">Reset Stitching</button>
-          <button id="deadpointSetupBtn" class="secondary" type="button">Setup Deadpoints</button>
-          <button id="deadpointResetBtn" class="secondary" type="button">Reset Deadpoints</button>
+          <button id="deadpointSetupBtn" class="secondary ai-only" type="button">Setup Deadpoints</button>
+          <button id="deadpointResetBtn" class="secondary ai-only" type="button">Reset Deadpoints</button>
         </div>
         <div class="stitch-summary" id="stitchSummary">Using default session stitching values.</div>
-        <div class="deadpoint-summary" id="deadpointSummary">No AI ignore zones saved for this browser session.</div>
+        <div class="deadpoint-summary ai-only" id="deadpointSummary">No AI ignore zones saved for this browser session.</div>
         <label>Analysis Window (minutes)</label>
         <div class="row">
           <div>
@@ -3129,7 +3455,7 @@ ANALYSIS_HTML = r"""
         <div class="status" id="line">idle</div>
       </div>
       <div class="card">
-        <h3>Tracking Preview</h3>
+        <h3 id="previewTitle">Tracking Preview</h3>
         <div class="preview"><img id="stream" alt="analysis stream"/><span id="streamHint">No session started yet</span></div>
         <h3 style="margin-top:14px;">Master Canvas Debug</h3>
         <div class="preview"><img id="streamMaster" alt="analysis master canvas stream"/><span id="streamMasterHint">Combined full-field canvas will appear here</span></div>
@@ -3324,6 +3650,7 @@ ANALYSIS_HTML = r"""
     let timer = null;
     let modelMetaByPath = {};
     let maxAnalysisMinutes = 0;
+    let analysisMode = "analysis";
     const STITCH_STORAGE_KEY = "ballscope-analysis-stitching-v2";
     const DEADPOINT_STORAGE_KEY = "ballscope-analysis-deadpoints-v1";
 	    const STITCH_DEFAULTS = {
@@ -3361,6 +3688,25 @@ ANALYSIS_HTML = r"""
 
     const clamp = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
     const formatSeconds = (value) => `${Math.max(0, Number(value || 0)).toFixed(1)}s`;
+    const setAnalysisMode = (mode) => {
+      analysisMode = mode === "stitch_only" ? "stitch_only" : "analysis";
+      const stitchOnly = analysisMode === "stitch_only";
+      $("modeAnalysisBtn").classList.toggle("active", !stitchOnly);
+      $("modeStitchOnlyBtn").classList.toggle("active", stitchOnly);
+      for (const el of document.querySelectorAll(".ai-only")) {
+        el.classList.toggle("hidden", stitchOnly);
+        for (const field of el.querySelectorAll("input, select, button")) {
+          field.disabled = stitchOnly;
+        }
+      }
+      $("modeHint").textContent = stitchOnly
+        ? "Only renders the saved full-field stitch. AI model, detections, deadpoints, smart crop, and zoom are skipped."
+        : "Runs ball detection, smart crop, and broadcast zoom.";
+      $("startBtn").textContent = stitchOnly ? "Start Stitch Only" : "Start Analysis";
+      $("previewTitle").textContent = stitchOnly ? "Stitch Preview" : "Tracking Preview";
+      $("streamHint").textContent = stitchOnly ? "No stitch session started yet" : "No session started yet";
+      $("streamMasterHint").textContent = stitchOnly ? "Full-resolution stitched canvas preview will appear here" : "Combined full-field canvas will appear here";
+    };
 	    const stitchControlMap = [
 	      ["stitchOverlap", "stitchOverlapNumber", "overlap_ratio", 0.522],
 	      ["stitchBlend", "stitchBlendNumber", "seam_blend_ratio", 0.065],
@@ -4046,28 +4392,30 @@ ANALYSIS_HTML = r"""
         $("stProg").textContent = `progress:${(j.progress_pct || 0).toFixed(1)}%`;
         $("stFps").textContent = `fps:${(j.fps || 0).toFixed(1)}`;
         $("stEta").textContent = `eta:${j.eta_sec == null ? "-" : Math.max(0, j.eta_sec).toFixed(1) + "s"}`;
-        $("stBackend").textContent = `backend:${j.model_backend || "-"}`;
+        $("stBackend").textContent = j.analysis_mode === "stitch_only" ? "backend:none" : `backend:${j.model_backend || "-"}`;
         $("stSource").textContent = `source:${j.focus_stream_label || "-"}`;
         $("stField").textContent = `field:${j.field_side || j.view_half || "-"}`;
-        $("stZoom").textContent = `zoom:${(j.zoom_live || 1).toFixed(2)}`;
+        $("stZoom").textContent = j.analysis_mode === "stitch_only" ? "zoom:off" : `zoom:${(j.zoom_live || 1).toFixed(2)}`;
         $("stFrames").textContent = `frames:${(j.frames || 0).toFixed(0)}`;
         $("stTotal").textContent = `total:${(j.total_frames || 0).toFixed(0)}`;
         $("stDet").textContent = `detections:${(j.detections || 0).toFixed(0)}`;
         $("stSeg").textContent = `segments:${(j.segments_saved || 0).toFixed(0)}`;
-        $("stConf").textContent = `conf:${(j.last_conf || 0).toFixed(2)}`;
-        $("stSeen").textContent = `last seen:${j.last_seen_sec == null ? "-" : j.last_seen_sec.toFixed(2) + "s"}`;
+        $("stConf").textContent = j.analysis_mode === "stitch_only" ? "conf:n/a" : `conf:${(j.last_conf || 0).toFixed(2)}`;
+        $("stSeen").textContent = j.analysis_mode === "stitch_only" ? "last seen:n/a" : `last seen:${j.last_seen_sec == null ? "-" : j.last_seen_sec.toFixed(2) + "s"}`;
         $("stSync").textContent = syncMode === "auto"
           ? `${syncLabel} q:${syncScore.toFixed(2)}`
           : syncLabel;
-        $("stDeadpoints").textContent = `deadpoints:${j.ignore_zone_count || 0}`;
+        $("stDeadpoints").textContent = j.analysis_mode === "stitch_only" ? "deadpoints:off" : `deadpoints:${j.ignore_zone_count || 0}`;
         if (j.running) {
           const tuneTxt = `imgsz:${j.imgsz || "-"}, detectEvery:${j.detect_every || "-"}`;
-          $("line").textContent = `Analysis running ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 1} stream(s), ${j.device_used || "auto"}, ${syncLabel}, ${tuneTxt})`;
+          $("line").textContent = j.analysis_mode === "stitch_only"
+            ? `Stitch only running ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 2} streams, ${syncLabel})`
+            : `Analysis running ${((j.progress_pct || 0)).toFixed(1)}% (${j.stream_count || 1} stream(s), ${j.device_used || "auto"}, ${syncLabel}, ${tuneTxt})`;
         }
         if (j.output_url && j.state === "done") {
           $("resultLink").href = j.output_url;
           $("resultLink").style.display = "inline-block";
-          $("line").textContent = "Analysis finished - MP4 ready";
+          $("line").textContent = j.analysis_mode === "stitch_only" ? "Stitch only finished - MP4 ready" : "Analysis finished - MP4 ready";
         }
         if (j.last_error) $("line").textContent = `error: ${j.last_error}`;
       } catch (e) {}
@@ -4080,7 +4428,12 @@ ANALYSIS_HTML = r"""
         $("line").textContent = "Please select at least one camera video.";
         return;
       }
+      if (analysisMode === "stitch_only" && (!leftFile || !rightFile)) {
+        $("line").textContent = "Stitch only needs both left and right videos.";
+        return;
+      }
 	      const params = new URLSearchParams({
+            analysis_mode: analysisMode,
 	        conf: $("conf").value,
 	        iou: $("iou").value,
         model_path: $("modelPath").value,
@@ -4100,7 +4453,7 @@ ANALYSIS_HTML = r"""
       const form = new FormData();
       if (leftFile) form.append("left_video", leftFile);
       if (rightFile) form.append("right_video", rightFile);
-      form.append("ignore_zones", JSON.stringify({ zones: getSavedDeadpoints() }));
+      form.append("ignore_zones", JSON.stringify({ zones: analysisMode === "stitch_only" ? [] : getSavedDeadpoints() }));
       $("line").textContent = `Uploading ... (0 / ${Math.max(1, Math.round(totalBytes / (1024 * 1024)))} MB)`;
       try {
         const j = await new Promise((resolve, reject) => {
@@ -4131,7 +4484,7 @@ ANALYSIS_HTML = r"""
         $("streamMaster").src = `/video/analysis/${sid}/master.mjpg`;
         $("streamMaster").style.display = "block";
         $("streamMasterHint").style.display = "none";
-        $("line").textContent = `Analysis started (${sid})`;
+        $("line").textContent = analysisMode === "stitch_only" ? `Stitch only started (${sid})` : `Analysis started (${sid})`;
         if (timer) clearInterval(timer);
         timer = setInterval(poll, 350);
       } catch (e) {
@@ -4139,6 +4492,8 @@ ANALYSIS_HTML = r"""
       }
     };
 
+    $("modeAnalysisBtn").addEventListener("click", () => setAnalysisMode("analysis"));
+    $("modeStitchOnlyBtn").addEventListener("click", () => setAnalysisMode("stitch_only"));
     $("modelPath").onchange = loadClasses;
     $("analysisMinutesRange").oninput = (ev) => syncAnalysisMinutes(ev.target);
     $("analysisMinutes").oninput = (ev) => syncAnalysisMinutes(ev.target);
@@ -4276,6 +4631,7 @@ ANALYSIS_HTML = r"""
       queueLiveStitchPreview();
     });
     setAnalysisMinutesLimits(0);
+    setAnalysisMode("analysis");
     setStitchControls(getSavedStitching());
     updateStitchSummary();
     updateDeadpointSummary();
@@ -6345,9 +6701,13 @@ async def analysis_upload(
     stitching_config: Optional[str] = None,
     ignore_zones: Optional[str] = Form(default=None),
     sync_offset_sec: float = 0.0,
+    analysis_mode: str = "analysis",
 ):
     del speed_up
     os.makedirs(ANALYSIS_UPLOAD_DIR, exist_ok=True)
+    analysis_mode = str(analysis_mode or "analysis").strip().lower()
+    if analysis_mode not in {"analysis", "stitch_only"}:
+        analysis_mode = "analysis"
     available_models = set(_analysis_list_model_files())
     if model_path not in available_models:
         model_path = ANALYSIS_DEFAULT_MODEL
@@ -6357,7 +6717,7 @@ async def analysis_upload(
     sources: List[Dict[str, Any]] = []
     total_written = 0
 
-    if class_id is None:
+    if class_id is None and analysis_mode != "stitch_only":
         try:
             class_id = _analysis_model_meta(model_path).default_class_id
         except Exception:
@@ -6372,6 +6732,8 @@ async def analysis_upload(
         uploads.append(("main", video))
     if not uploads:
         raise HTTPException(status_code=400, detail="Please upload at least one video.")
+    if analysis_mode == "stitch_only" and {label for label, _upload in uploads} != {"left", "right"}:
+        raise HTTPException(status_code=400, detail="Stitch only requires both left and right camera videos.")
 
     try:
         for label, upload in uploads:
@@ -6415,6 +6777,7 @@ async def analysis_upload(
     with ANALYSIS_LOCK:
         ANALYSIS_SESSIONS[session_id] = {
             "session_id": session_id,
+            "analysis_mode": analysis_mode,
             "video_path": target_path,
             "sources": sources,
             "model_path": model_path,
@@ -6457,10 +6820,11 @@ async def analysis_upload(
             "frame_master": None,
         }
 
-    thread = threading.Thread(target=_analysis_process_video, args=(session_id, target_path), daemon=True)
+    processor = _analysis_process_stitch_only if analysis_mode == "stitch_only" else _analysis_process_video
+    thread = threading.Thread(target=processor, args=(session_id, target_path), daemon=True)
     thread.start()
     print(
-        f"[analysis] job started sid={session_id} model={model_path} class_id={class_id} "
+        f"[analysis] job started sid={session_id} mode={analysis_mode} model={model_path} class_id={class_id} "
         f"device={device} zoom={zoom} ignore_zones={len(analysis_ignore_zones)} sources={','.join(item['label'] for item in sources)}"
     )
     return {"ok": True, "session_id": session_id}
@@ -6557,6 +6921,7 @@ def analysis_status(session_id: str):
             raise HTTPException(status_code=404, detail="Unknown session_id")
         return {
             "session_id": session_id,
+            "analysis_mode": sess.get("analysis_mode", "analysis"),
             "state": sess.get("state"),
             "running": sess.get("running"),
             "frames": sess.get("frames", 0.0),
@@ -6588,6 +6953,7 @@ def analysis_status(session_id: str):
             "stream_start_offsets": sess.get("stream_start_offsets"),
             "ignore_zone_count": sess.get("ignore_zone_count", 0),
             "render_mode": sess.get("render_mode"),
+            "fusion_mode": sess.get("fusion_mode"),
             "output_path": sess.get("output_path"),
             "output_url": f"/api/analysis/result/{session_id}" if sess.get("output_path") else None,
             "last_error": sess.get("last_error"),

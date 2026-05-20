@@ -33,6 +33,7 @@ BallScope is designed to run the same application logic on:
 
 ## Analysis Flow
 - The `Analysis` workspace can ingest either one video file or separate left/right camera files.
+- Stitch-only analysis mode requires separate left/right uploads, uses the same master-canvas stitching settings, skips model loading and detection, and exports the full stitched master canvas for editing.
 - Offline analysis uses the same shared runtime-device resolution strategy (`auto` -> Jetson CUDA, Apple Silicon MPS, fallback CPU).
 - Model loading is backend-aware: YOLO checkpoints use `ultralytics`, RF-DETR checkpoints use `rfdetr`.
 - Dual-camera post-analysis now uses a per-camera-first pipeline:

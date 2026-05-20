@@ -16,6 +16,7 @@ BallScope is an AI-assisted multi-camera football tracking project. It captures 
 - Record processed output and raw camera streams.
 - Analyze uploaded videos in the web UI.
 - Run post-analysis on separate left/right camera videos in the web UI.
+- Render a stitch-only full-field MP4 from separate left/right uploads for editing workflows.
 - Preview and tune dual-camera stitching in the Analysis workspace, then save the stitch values for the current browser session.
 - Tune both cameras in a dedicated Camera Settings workspace, keep those settings for the current session, and save named camera presets for later reuse.
 
@@ -155,6 +156,7 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 
 ## Analysis Workspace
 - The `Analysis` page accepts separate `Left Camera` and `Right Camera` uploads.
+- The `Stitch Only` mode skips AI detection entirely and exports the full stitched master field as an MP4 using the current stitching and right-delay settings.
 - The `Set Up Stitching` action opens a stitched preview player for the selected left/right uploads so overlap, blend width, and vertical crop alignment can be tuned before starting analysis.
 - The `Setup Deadpoints` action lets you draw full-field AI ignore zones for static false positives. Saved zones are applied before the final broadcast crop/zoom, so they remain stable while the analysis camera moves.
 - The default stitch uses a wider feathered seam so players crossing the midfield overlap do not hit a hard 1-camera cut.
