@@ -164,7 +164,7 @@ In the `Camera Settings` workspace, you can change source values and save BRIO c
 - Dual-source analysis advances each upload by playback time, not by matching decoded frame numbers, so variable-frame-rate left/right files do not drift apart during longer analysis runs.
 - The Stitching modal also exposes a manual `Right Delay (sec)` control. Positive values mean the right clip starts later and should be shifted forward to match the left clip.
 - Final analysis export trims the chosen audio source to the same effective start as the rendered video instead of remuxing unaligned audio from the raw upload.
-- Analysis can optionally be limited to the first N minutes of the uploaded files for fast debugging on long recordings.
+- Analysis can optionally be limited by time or by analysis timeline frame range for fast debugging on long recordings. Time mode remains the default; frame mode still advances both uploads on the shared parallel timeline.
 - BallScope detects whether a model is a YOLO checkpoint or an RF-DETR checkpoint and uses the matching runtime automatically.
 - `models/ballscope-ai.pt` is detected as RF-DETR and is the default analysis model.
 - Dual-camera analysis is per-camera first: left/right detections stay separate, are fused in master-canvas space, and the final broadcast crop is rendered from the master canvas.

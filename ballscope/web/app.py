@@ -7,6 +7,7 @@ import platform
 import subprocess
 import threading
 import uuid
+import math
 from collections import deque
 from pathlib import Path
 from dataclasses import asdict
@@ -1074,6 +1075,83 @@ def _analysis_even_frame(frame: np.ndarray) -> np.ndarray:
     return frame[:even_h, :even_w]
 
 
+def _analysis_window_config(
+    session: Dict[str, Any],
+    media_duration_sec: float,
+    src_fps: float,
+) -> Dict[str, Any]:
+    fps = max(1.0, float(src_fps or ANALYSIS_TARGET_FPS))
+    media_duration = max(0.0, float(media_duration_sec or 0.0))
+    mode = str(session.get("analysis_window_mode") or "time").strip().lower()
+    if mode not in {"time", "frames"}:
+        mode = "time"
+
+    if mode == "frames":
+        try:
+            raw_start_frame = int(round(float(session.get("analysis_start_frame", 1) or 1)))
+        except (TypeError, ValueError):
+            raw_start_frame = 1
+        try:
+            raw_end_frame = int(round(float(session.get("analysis_end_frame", 0) or 0)))
+        except (TypeError, ValueError):
+            raw_end_frame = 0
+        max_timeline_frame = int(math.floor(media_duration * fps)) if media_duration > 0 else 0
+        start_frame = max(1, raw_start_frame)
+        if max_timeline_frame > 0:
+            start_frame = min(start_frame, max(1, max_timeline_frame))
+        end_frame = max(0, raw_end_frame)
+        if end_frame > 0:
+            if max_timeline_frame > 0:
+                end_frame = min(end_frame, max_timeline_frame)
+            end_frame = max(start_frame, end_frame)
+        start_sec = float(start_frame - 1) / fps
+        if media_duration > 0:
+            start_sec = min(start_sec, max(0.0, media_duration - (1.0 / fps)))
+        requested_limit_frames = max(0, (end_frame - start_frame + 1)) if end_frame > 0 else 0
+        requested_limit_sec = (
+            float(requested_limit_frames) / fps
+            if requested_limit_frames > 0
+            else max(0.0, media_duration - start_sec if media_duration > 0 else 0.0)
+        )
+        return {
+            "mode": mode,
+            "start_sec": start_sec,
+            "end_sec": start_sec + requested_limit_sec if requested_limit_sec > 0 else 0.0,
+            "requested_limit_sec": requested_limit_sec,
+            "start_frame": start_frame,
+            "end_frame": end_frame if end_frame > 0 else None,
+            "requested_limit_frames": requested_limit_frames or None,
+        }
+
+    analysis_minutes = max(0.0, float(session.get("analysis_minutes", 0.0) or 0.0))
+    analysis_start_min = max(0.0, float(session.get("analysis_start_min", 0.0) or 0.0))
+    analysis_end_min = max(0.0, float(session.get("analysis_end_min", 0.0) or 0.0))
+    start_sec = max(0.0, analysis_start_min * 60.0)
+    if media_duration > 0:
+        start_sec = min(start_sec, max(0.0, media_duration - 0.25))
+    end_sec = analysis_end_min * 60.0 if analysis_end_min > 0 else 0.0
+    if end_sec <= 0.0 and analysis_minutes > 0:
+        end_sec = start_sec + (analysis_minutes * 60.0)
+    if media_duration > 0 and end_sec > 0.0:
+        end_sec = min(end_sec, media_duration)
+    if end_sec > 0.0 and end_sec <= start_sec:
+        end_sec = min(media_duration, start_sec + 60.0) if media_duration > 0 else (start_sec + 60.0)
+    requested_limit_sec = (
+        max(0.0, end_sec - start_sec)
+        if end_sec > 0.0
+        else max(0.0, media_duration - start_sec if media_duration > 0 else 0.0)
+    )
+    return {
+        "mode": mode,
+        "start_sec": start_sec,
+        "end_sec": end_sec,
+        "requested_limit_sec": requested_limit_sec,
+        "start_frame": None,
+        "end_frame": None,
+        "requested_limit_frames": None,
+    }
+
+
 def _analysis_process_stitch_only(session_id: str, video_path: str):
     with ANALYSIS_LOCK:
         session = ANALYSIS_SESSIONS.get(session_id)
@@ -1081,9 +1159,6 @@ def _analysis_process_stitch_only(session_id: str, video_path: str):
         return
 
     source_entries = list(session.get("sources") or [])
-    analysis_minutes = max(0.0, float(session.get("analysis_minutes", 0.0) or 0.0))
-    analysis_start_min = max(0.0, float(session.get("analysis_start_min", 0.0) or 0.0))
-    analysis_end_min = max(0.0, float(session.get("analysis_end_min", 0.0) or 0.0))
     preview_stride = max(1, int(session.get("preview_stride", 1)))
 
     with ANALYSIS_LOCK:
@@ -1122,17 +1197,9 @@ def _analysis_process_stitch_only(session_id: str, video_path: str):
     src_fps = max([f for f in fps_list if f > 0] or [ANALYSIS_TARGET_FPS])
     duration_list = [n / f for n, f in zip(frame_count_list, fps_list) if n > 0 and f > 0]
     media_duration_sec = min(duration_list or [0.0])
-    start_sec = max(0.0, analysis_start_min * 60.0)
-    if media_duration_sec > 0:
-        start_sec = min(start_sec, max(0.0, media_duration_sec - 0.25))
-    end_sec = analysis_end_min * 60.0 if analysis_end_min > 0 else 0.0
-    if end_sec <= 0.0 and analysis_minutes > 0:
-        end_sec = start_sec + (analysis_minutes * 60.0)
-    if media_duration_sec > 0 and end_sec > 0.0:
-        end_sec = min(end_sec, media_duration_sec)
-    if end_sec > 0.0 and end_sec <= start_sec:
-        end_sec = min(media_duration_sec, start_sec + 60.0) if media_duration_sec > 0 else (start_sec + 60.0)
-    requested_limit_sec = max(0.0, end_sec - start_sec) if end_sec > 0.0 else max(0.0, media_duration_sec - start_sec if media_duration_sec > 0 else 0.0)
+    window_cfg = _analysis_window_config(session, media_duration_sec, src_fps)
+    start_sec = float(window_cfg["start_sec"])
+    requested_limit_sec = float(window_cfg["requested_limit_sec"])
 
     sync_offset_sec = float(session.get("sync_offset_sec", 0.0) or 0.0)
     stream_start_offsets = [0.0 for _ in caps]
@@ -1191,6 +1258,9 @@ def _analysis_process_stitch_only(session_id: str, video_path: str):
         sess["state"] = "stitching"
         sess["input_fps"] = float(src_fps)
         sess["total_frames"] = float(total_frames)
+        sess["analysis_window_mode"] = window_cfg["mode"]
+        sess["analysis_start_frame"] = window_cfg["start_frame"]
+        sess["analysis_end_frame"] = window_cfg["end_frame"]
         sess["analysis_limit_sec"] = stitch_limit_sec if stitch_limit_sec > 0 else None
         sess["sync_offset_sec"] = sync_offset_sec
         sess["sync_score"] = 1.0 if abs(sync_offset_sec) >= 0.05 else 0.0
@@ -1444,17 +1514,9 @@ def _analysis_process_video(session_id: str, video_path: str):
     src_fps = max([f for f in fps_list if f > 0] or [ANALYSIS_TARGET_FPS])
     duration_list = [n / f for n, f in zip(frame_count_list, fps_list) if n > 0 and f > 0]
     media_duration_sec = min(duration_list or [0.0])
-    start_sec = max(0.0, analysis_start_min * 60.0)
-    if media_duration_sec > 0:
-        start_sec = min(start_sec, max(0.0, media_duration_sec - 0.25))
-    end_sec = analysis_end_min * 60.0 if analysis_end_min > 0 else 0.0
-    if end_sec <= 0.0 and analysis_minutes > 0:
-        end_sec = start_sec + (analysis_minutes * 60.0)
-    if media_duration_sec > 0 and end_sec > 0.0:
-        end_sec = min(end_sec, media_duration_sec)
-    if end_sec > 0.0 and end_sec <= start_sec:
-        end_sec = min(media_duration_sec, start_sec + 60.0) if media_duration_sec > 0 else (start_sec + 60.0)
-    requested_limit_sec = max(0.0, end_sec - start_sec) if end_sec > 0.0 else max(0.0, media_duration_sec - start_sec if media_duration_sec > 0 else 0.0)
+    window_cfg = _analysis_window_config(session, media_duration_sec, src_fps)
+    start_sec = float(window_cfg["start_sec"])
+    requested_limit_sec = float(window_cfg["requested_limit_sec"])
     sync_offset_sec = 0.0
     sync_score = 0.0
     sync_mode = "off"
@@ -1543,6 +1605,9 @@ def _analysis_process_video(session_id: str, video_path: str):
         ANALYSIS_SESSIONS[session_id]["analysis_minutes"] = analysis_minutes
         ANALYSIS_SESSIONS[session_id]["analysis_start_min"] = analysis_start_min
         ANALYSIS_SESSIONS[session_id]["analysis_end_min"] = analysis_end_min if analysis_end_min > 0 else None
+        ANALYSIS_SESSIONS[session_id]["analysis_window_mode"] = window_cfg["mode"]
+        ANALYSIS_SESSIONS[session_id]["analysis_start_frame"] = window_cfg["start_frame"]
+        ANALYSIS_SESSIONS[session_id]["analysis_end_frame"] = window_cfg["end_frame"]
         ANALYSIS_SESSIONS[session_id]["analysis_limit_sec"] = analysis_limit_sec if analysis_limit_sec > 0 else None
         ANALYSIS_SESSIONS[session_id]["sync_offset_sec"] = sync_offset_sec
         ANALYSIS_SESSIONS[session_id]["sync_score"] = sync_score
@@ -3428,8 +3493,12 @@ ANALYSIS_HTML = r"""
         </div>
         <div class="stitch-summary" id="stitchSummary">Using default session stitching values.</div>
         <div class="deadpoint-summary ai-only" id="deadpointSummary">No AI ignore zones saved for this browser session.</div>
-        <label>Analysis Window (minutes)</label>
-        <div class="row">
+        <label>Analysis Window</label>
+        <div class="mode-toggle" role="group" aria-label="Analysis window mode">
+          <button id="windowTimeBtn" type="button" class="active">Time</button>
+          <button id="windowFrameBtn" type="button">Frames</button>
+        </div>
+        <div id="timeWindowFields" class="row">
           <div>
             <label style="margin-top:0;">Start Minute</label>
             <div class="row" style="align-items:center;">
@@ -3445,12 +3514,28 @@ ANALYSIS_HTML = r"""
             </div>
           </div>
         </div>
+        <div id="frameWindowFields" class="row hidden">
+          <div>
+            <label style="margin-top:0;">Start Frame</label>
+            <div class="row" style="align-items:center;">
+              <input id="analysisStartFrameRange" type="range" value="1" min="1" max="1" step="1"/>
+              <input id="analysisStartFrame" type="number" value="1" min="1" max="1" step="1"/>
+            </div>
+          </div>
+          <div>
+            <label style="margin-top:0;">End Frame</label>
+            <div class="row" style="align-items:center;">
+              <input id="analysisEndFrameRange" type="range" value="0" min="0" max="1" step="1"/>
+              <input id="analysisEndFrame" type="number" value="0" min="0" max="1" step="1"/>
+            </div>
+          </div>
+        </div>
         <label>Legacy Length (minutes)</label>
         <div class="row" style="align-items:center;">
           <input id="analysisMinutesRange" type="range" value="0" min="0" max="0" step="0.1"/>
           <input id="analysisMinutes" type="number" value="0" min="0" max="0" step="0.1"/>
         </div>
-        <div class="status" id="analysisMinutesHint">Set start/end to inspect a short section fast. End minute 0 means until the file ends. Legacy length is still supported.</div>
+        <div class="status" id="analysisMinutesHint">Set start/end to inspect a short section fast. End minute or end frame 0 means until the file ends. Legacy length is still supported.</div>
         <button id="startBtn">Start Analysis</button>
         <div class="status" id="line">idle</div>
       </div>
@@ -3650,6 +3735,8 @@ ANALYSIS_HTML = r"""
     let timer = null;
     let modelMetaByPath = {};
     let maxAnalysisMinutes = 0;
+    let maxAnalysisFrames = 1;
+    let analysisWindowMode = "time";
     let analysisMode = "analysis";
     const STITCH_STORAGE_KEY = "ballscope-analysis-stitching-v2";
     const DEADPOINT_STORAGE_KEY = "ballscope-analysis-deadpoints-v1";
@@ -3688,6 +3775,22 @@ ANALYSIS_HTML = r"""
 
     const clamp = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
     const formatSeconds = (value) => `${Math.max(0, Number(value || 0)).toFixed(1)}s`;
+    const updateAnalysisWindowHint = () => {
+      const maxTimeText = maxAnalysisMinutes > 0 ? `${maxAnalysisMinutes.toFixed(1)} min detected from upload` : "0 = full file length";
+      const maxFrameText = maxAnalysisFrames > 1 ? `${maxAnalysisFrames} selectable timeline frames` : "0 = until file end";
+      $("analysisMinutesHint").textContent = analysisWindowMode === "frames"
+        ? `Use Start/End Frame for precise short tests. End frame 0 means until file end. Max selectable: ${maxFrameText}.`
+        : `Use Start/End Minute for fast testing. End minute 0 means until file end. Max selectable: ${maxTimeText}.`;
+    };
+    const setAnalysisWindowMode = (mode) => {
+      analysisWindowMode = mode === "frames" ? "frames" : "time";
+      const frameMode = analysisWindowMode === "frames";
+      $("windowTimeBtn").classList.toggle("active", !frameMode);
+      $("windowFrameBtn").classList.toggle("active", frameMode);
+      $("timeWindowFields").classList.toggle("hidden", frameMode);
+      $("frameWindowFields").classList.toggle("hidden", !frameMode);
+      updateAnalysisWindowHint();
+    };
     const setAnalysisMode = (mode) => {
       analysisMode = mode === "stitch_only" ? "stitch_only" : "analysis";
       const stitchOnly = analysisMode === "stitch_only";
@@ -4222,24 +4325,35 @@ ANALYSIS_HTML = r"""
 
     const setAnalysisMinutesLimits = (minutes) => {
       maxAnalysisMinutes = Math.max(0, Number.isFinite(minutes) ? minutes : 0);
+      maxAnalysisFrames = Math.max(1, Math.round(maxAnalysisMinutes * 60 * 120));
       $("analysisMinutesRange").max = String(maxAnalysisMinutes);
       $("analysisMinutes").max = String(maxAnalysisMinutes);
       $("analysisStartRange").max = String(maxAnalysisMinutes);
       $("analysisStart").max = String(maxAnalysisMinutes);
       $("analysisEndRange").max = String(maxAnalysisMinutes);
       $("analysisEnd").max = String(maxAnalysisMinutes);
+      $("analysisStartFrameRange").max = String(maxAnalysisFrames);
+      $("analysisStartFrame").max = String(maxAnalysisFrames);
+      $("analysisEndFrameRange").max = String(maxAnalysisFrames);
+      $("analysisEndFrame").max = String(maxAnalysisFrames);
       const current = Math.max(0, Math.min(Number($("analysisMinutes").value || 0), maxAnalysisMinutes));
       const currentStart = Math.max(0, Math.min(Number($("analysisStart").value || 0), maxAnalysisMinutes));
       const currentEndRaw = Number($("analysisEnd").value || 0);
       const currentEnd = currentEndRaw <= 0 ? maxAnalysisMinutes : Math.max(currentStart, Math.min(currentEndRaw, maxAnalysisMinutes));
+      const currentStartFrame = Math.max(1, Math.min(Math.round(Number($("analysisStartFrame").value || 1)), maxAnalysisFrames));
+      const currentEndFrameRaw = Math.round(Number($("analysisEndFrame").value || 0));
+      const currentEndFrame = currentEndFrameRaw <= 0 ? 0 : Math.max(currentStartFrame, Math.min(currentEndFrameRaw, maxAnalysisFrames));
       $("analysisMinutesRange").value = String(current);
       $("analysisMinutes").value = String(current);
       $("analysisStartRange").value = String(currentStart);
       $("analysisStart").value = String(currentStart);
       $("analysisEndRange").value = String(currentEnd);
       $("analysisEnd").value = String(currentEndRaw <= 0 ? 0 : currentEnd);
-      const maxText = maxAnalysisMinutes > 0 ? `${maxAnalysisMinutes.toFixed(1)} min detected from upload` : "0 = full file length";
-      $("analysisMinutesHint").textContent = `Use Start/End Minute for fast testing. End minute 0 means until file end. Max selectable: ${maxText}.`;
+      $("analysisStartFrameRange").value = String(currentStartFrame);
+      $("analysisStartFrame").value = String(currentStartFrame);
+      $("analysisEndFrameRange").value = String(currentEndFrame > 0 ? currentEndFrame : currentStartFrame);
+      $("analysisEndFrame").value = String(currentEndFrame);
+      updateAnalysisWindowHint();
     };
 
     const syncAnalysisMinutes = (source) => {
@@ -4261,6 +4375,20 @@ ANALYSIS_HTML = r"""
       $("analysisStart").value = String(start);
       $("analysisEndRange").value = String(end > 0 ? end : start);
       $("analysisEnd").value = String(end);
+    };
+
+    const syncAnalysisFrameWindow = (source, kind) => {
+      const maxValue = maxAnalysisFrames || 1;
+      let start = Math.round(Number($("analysisStartFrame").value || 1));
+      let end = Math.round(Number($("analysisEndFrame").value || 0));
+      if (kind === "start") start = Math.round(Number(source.value || 1));
+      if (kind === "end") end = Math.round(Number(source.value || 0));
+      start = Math.max(1, Math.min(Number.isFinite(start) ? start : 1, maxValue));
+      if (end > 0) end = Math.max(start, Math.min(Number.isFinite(end) ? end : 0, maxValue));
+      $("analysisStartFrameRange").value = String(start);
+      $("analysisStartFrame").value = String(start);
+      $("analysisEndFrameRange").value = String(end > 0 ? end : start);
+      $("analysisEndFrame").value = String(end);
     };
 
     const readFileDurationMinutes = (file) => new Promise((resolve) => {
@@ -4442,9 +4570,12 @@ ANALYSIS_HTML = r"""
         crop_y: $("cropY").value,
         crop_w: $("cropW").value,
         crop_h: $("cropH").value,
+        analysis_window_mode: analysisWindowMode,
         analysis_start_min: $("analysisStart").value,
 	        analysis_end_min: $("analysisEnd").value,
 	        analysis_minutes: $("analysisMinutes").value,
+            analysis_start_frame: $("analysisStartFrame").value,
+            analysis_end_frame: $("analysisEndFrame").value,
 	        stitching_config: JSON.stringify(getSavedStitching()),
             sync_offset_sec: String(getSavedStitching().sync_offset_sec || 0),
 	      });
@@ -4494,6 +4625,8 @@ ANALYSIS_HTML = r"""
 
     $("modeAnalysisBtn").addEventListener("click", () => setAnalysisMode("analysis"));
     $("modeStitchOnlyBtn").addEventListener("click", () => setAnalysisMode("stitch_only"));
+    $("windowTimeBtn").addEventListener("click", () => setAnalysisWindowMode("time"));
+    $("windowFrameBtn").addEventListener("click", () => setAnalysisWindowMode("frames"));
     $("modelPath").onchange = loadClasses;
     $("analysisMinutesRange").oninput = (ev) => syncAnalysisMinutes(ev.target);
     $("analysisMinutes").oninput = (ev) => syncAnalysisMinutes(ev.target);
@@ -4501,6 +4634,10 @@ ANALYSIS_HTML = r"""
     $("analysisStart").oninput = (ev) => syncAnalysisWindow(ev.target, "start");
     $("analysisEndRange").oninput = (ev) => syncAnalysisWindow(ev.target, "end");
     $("analysisEnd").oninput = (ev) => syncAnalysisWindow(ev.target, "end");
+    $("analysisStartFrameRange").oninput = (ev) => syncAnalysisFrameWindow(ev.target, "start");
+    $("analysisStartFrame").oninput = (ev) => syncAnalysisFrameWindow(ev.target, "start");
+    $("analysisEndFrameRange").oninput = (ev) => syncAnalysisFrameWindow(ev.target, "end");
+    $("analysisEndFrame").oninput = (ev) => syncAnalysisFrameWindow(ev.target, "end");
 	    $("videoFileLeft").onchange = async () => {
 	      pauseStitchPlayback();
 	      resetStitchPreviewSession();
@@ -4632,6 +4769,7 @@ ANALYSIS_HTML = r"""
     });
     setAnalysisMinutesLimits(0);
     setAnalysisMode("analysis");
+    setAnalysisWindowMode("time");
     setStitchControls(getSavedStitching());
     updateStitchSummary();
     updateDeadpointSummary();
@@ -6695,9 +6833,12 @@ async def analysis_upload(
     crop_y: float = 0.0,
     crop_w: float = 1.0,
     crop_h: float = 1.0,
+    analysis_window_mode: str = "time",
     analysis_start_min: float = 0.0,
     analysis_end_min: float = 0.0,
     analysis_minutes: float = 0.0,
+    analysis_start_frame: int = 1,
+    analysis_end_frame: int = 0,
     stitching_config: Optional[str] = None,
     ignore_zones: Optional[str] = Form(default=None),
     sync_offset_sec: float = 0.0,
@@ -6708,6 +6849,9 @@ async def analysis_upload(
     analysis_mode = str(analysis_mode or "analysis").strip().lower()
     if analysis_mode not in {"analysis", "stitch_only"}:
         analysis_mode = "analysis"
+    analysis_window_mode = str(analysis_window_mode or "time").strip().lower()
+    if analysis_window_mode not in {"time", "frames"}:
+        analysis_window_mode = "time"
     available_models = set(_analysis_list_model_files())
     if model_path not in available_models:
         model_path = ANALYSIS_DEFAULT_MODEL
@@ -6788,9 +6932,12 @@ async def analysis_upload(
             "zoom": 1.25,
             "allow_switch": len(sources) > 1,
             "crop": crop,
+            "analysis_window_mode": analysis_window_mode,
             "analysis_start_min": max(0.0, float(analysis_start_min)),
             "analysis_end_min": max(0.0, float(analysis_end_min)),
             "analysis_minutes": max(0.0, float(analysis_minutes)),
+            "analysis_start_frame": max(1, int(analysis_start_frame or 1)),
+            "analysis_end_frame": max(0, int(analysis_end_frame or 0)),
             "stitching": stitching,
             "ignore_zones": analysis_ignore_zones,
             "sync_offset_sec": float(sync_offset_sec or 0.0),
@@ -6946,6 +7093,9 @@ def analysis_status(session_id: str):
             "analysis_start_min": sess.get("analysis_start_min"),
             "analysis_end_min": sess.get("analysis_end_min"),
             "analysis_minutes": sess.get("analysis_minutes"),
+            "analysis_window_mode": sess.get("analysis_window_mode", "time"),
+            "analysis_start_frame": sess.get("analysis_start_frame"),
+            "analysis_end_frame": sess.get("analysis_end_frame"),
             "analysis_limit_sec": sess.get("analysis_limit_sec"),
             "sync_offset_sec": sess.get("sync_offset_sec"),
             "sync_score": sess.get("sync_score"),

@@ -84,7 +84,7 @@ Notes:
 - Dual-source analysis advances each upload by playback time, not by matching decoded frame numbers, so variable-frame-rate left/right files do not drift apart during longer analysis runs.
 - If the clip starts are still offset on a specific pair, use the `Right Delay (sec)` control in the Stitching modal. Positive values mean the right upload should be read later than the left upload.
 - Final analysis export trims audio to the same effective aligned start time used by the render pipeline, which avoids large delayed-audio remux errors.
-- You can limit analysis to the first N minutes with a slider / numeric input, which is useful for testing 90-minute source files quickly.
+- You can limit analysis with time-based start/end minute controls, or switch the same window control to frame mode and provide start/end frames on the shared analysis timeline. End value `0` means continue to the file end.
 - Model selection is automatic by checkpoint type. BallScope distinguishes YOLO checkpoints from RF-DETR checkpoints and uses the matching backend.
 - `models/ballscope-ai.pt` is the default analysis model and is treated as RF-DETR.
 - Dual-camera analysis runs per-camera detection first, fuses ball hypotheses in master-canvas space, and renders the final output from the master canvas.
